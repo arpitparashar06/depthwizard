@@ -1,0 +1,12 @@
+.venv/
+jobs/
+__pycache__/
+*.pyc
+web/node_modules/
+web/dist/
+.DS_Store
+dem_coarse.tif
+benchmark/scenes/
+benchmark/results/
+.env
+*.bak

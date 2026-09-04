@@ -1,0 +1,69 @@
+:root{
+  --bg:#0d0f12; --panel:#14181d; --line:#242b33;
+  --ink:#e6edf5; --dim:#8e9cad; --key:#7fd1ff; --danger:#ff9a9a;
+  --radius:10px;
+}
+*{box-sizing:border-box}
+body{margin:0;background:var(--bg);color:var(--ink);
+  font:14px/1.6 ui-sans-serif,system-ui,-apple-system,"Segoe UI",sans-serif}
+h1{font-size:22px;font-weight:600;margin:0}
+h3{font-size:13px;letter-spacing:.08em;text-transform:uppercase;color:var(--dim);
+  margin:20px 0 10px;font-weight:600}
+.app{max-width:1600px;margin:0 auto;padding:22px}
+header p{color:var(--dim);margin:6px 0 18px}
+.dim{color:var(--dim)} .small{font-size:12px}
+.error{color:var(--danger);font-size:13px}
+
+.grid{display:grid;grid-template-columns:330px 1fr;gap:18px;align-items:start}
+@media (max-width:1000px){.grid{grid-template-columns:1fr}}
+
+.panel{background:var(--panel);border:1px solid var(--line);border-radius:var(--radius);
+  padding:16px;margin-bottom:16px}
+aside.panel{position:sticky;top:18px;max-height:calc(100vh - 40px);overflow:auto}
+
+.field{display:block;margin-bottom:14px}
+.field .label{display:block;font-size:12px;color:var(--dim);margin-bottom:5px}
+.field .hint{display:block;font-size:11px;color:var(--dim);margin-top:4px;line-height:1.45}
+input[type=number],input[type=file],select{width:100%;background:#0f1318;color:var(--ink);
+  border:1px solid var(--line);border-radius:6px;padding:8px 10px;font:inherit;font-size:13px}
+input[type=range]{width:100%;accent-color:var(--key)}
+button.primary{width:100%;margin-top:10px;padding:11px;border-radius:8px;border:0;
+  background:var(--key);color:#062033;font-weight:600;font-size:14px;cursor:pointer}
+button.primary:disabled{opacity:.45;cursor:default}
+
+.viewer{position:relative;height:560px;background:#0b0d10;border:1px solid var(--line);
+  border-radius:var(--radius);overflow:hidden}
+.viewer.empty{display:flex;align-items:center;justify-content:center;color:var(--dim)}
+.viewer canvas{display:block;width:100%;height:100%}
+.hud{position:absolute;top:14px;left:14px;background:rgba(12,15,20,.86);
+  border:1px solid var(--line);border-radius:10px;padding:12px 14px;min-width:210px;
+  pointer-events:none;font-family:ui-monospace,Menlo,monospace}
+.hud .k{color:var(--dim);font-size:11px;letter-spacing:.08em;text-transform:uppercase}
+.hud .v{color:var(--key);font-size:17px}
+.hud hr{border:0;border-top:1px solid var(--line);margin:9px 0}
+.cross{position:absolute;left:50%;top:50%;width:16px;height:16px;margin:-8px 0 0 -8px;
+  pointer-events:none}
+.cross:before,.cross:after{content:"";position:absolute;background:var(--key)}
+.cross:before{left:7px;top:0;width:2px;height:16px}
+.cross:after{top:7px;left:0;height:2px;width:16px}
+.overlay{position:absolute;inset:0;display:flex;align-items:center;justify-content:center;
+  background:rgba(8,10,13,.86);text-align:center;cursor:pointer}
+.overlay b{color:var(--key);font-size:19px;letter-spacing:.04em}
+.overlay p{color:var(--dim);margin:14px 0 0;line-height:2.1;font-size:13px}
+kbd{border:1px solid var(--line);border-bottom-width:2px;border-radius:4px;
+  padding:1px 6px;margin:0 2px;font-family:ui-monospace,monospace;font-size:12px}
+
+.run .bar{height:4px;background:#0f1318;border-radius:3px;overflow:hidden;margin-bottom:10px}
+.run .bar div{height:100%;background:var(--key);transition:width .35s}
+.log{margin:0;max-height:130px;overflow:auto;font:12px/1.6 ui-monospace,Menlo,monospace;
+  color:var(--dim);white-space:pre-wrap}
+
+table.kv{width:100%;border-collapse:collapse;margin-bottom:10px}
+table.kv td{padding:6px 0;border-bottom:1px solid var(--line);font-size:13px;vertical-align:top}
+table.kv td:first-child{color:var(--dim);width:38%}
+.note{font-size:12px;color:var(--dim);border-left:2px solid var(--key);padding-left:10px}
+.downloads{display:flex;flex-wrap:wrap;gap:8px;margin-top:12px}
+.downloads a{font-size:12px;padding:5px 10px;border:1px solid var(--line);border-radius:6px;
+  color:var(--key);text-decoration:none}
+.figs{display:grid;grid-template-columns:repeat(auto-fit,minmax(220px,1fr));gap:10px;margin-top:12px}
+.figs img{width:100%;border:1px solid var(--line);border-radius:8px;background:#fff}

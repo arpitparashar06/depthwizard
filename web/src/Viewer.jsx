@@ -12,6 +12,13 @@ import { PointerLockControls } from 'three/examples/jsm/controls/PointerLockCont
  * Getting this wrong is not cosmetic — reading heights off the model is a
  * deliverable, and at the default 1.5x every measurement would be 50% high.
  */
+const FLIGHT_KEYS = new Set([
+  'KeyW', 'KeyA', 'KeyS', 'KeyD',   // move
+  'Space', 'KeyC',                  // altitude
+  'ShiftLeft', 'ShiftRight',        // boost
+  'KeyR'                            // clear probes
+])
+
 export default function Viewer({ url, exaggeration = 1, baseM = 0, units = 'm' }) {
   const mount = useRef(null)
   const lockRef = useRef(null)
@@ -25,8 +32,9 @@ export default function Viewer({ url, exaggeration = 1, baseM = 0, units = 'm' }
     const host = mount.current
     const toReal = (y) => y / (exaggeration || 1) + baseM
 
+    const keys = {}
     const scene = new THREE.Scene()
-    scene.background = new THREE.Color(0x0d0f12)
+    scene.background = new THREE.Color(0x07090c)
     const camera = new THREE.PerspectiveCamera(70, 1, 0.5, 60000)
     const renderer = new THREE.WebGLRenderer({ antialias: true })
     renderer.setPixelRatio(Math.min(devicePixelRatio, 2))
@@ -40,7 +48,12 @@ export default function Viewer({ url, exaggeration = 1, baseM = 0, units = 'm' }
     const controls = new PointerLockControls(camera, renderer.domElement)
     scene.add(controls.getObject())
     controls.addEventListener('lock', () => setLocked(true))
-    controls.addEventListener('unlock', () => setLocked(false))
+    controls.addEventListener('unlock', () => {
+      setLocked(false)
+      // Release every held key. Pressing Esc mid-flight otherwise leaves the
+      // key latched true, and the camera drifts the moment you lock back in.
+      for (const k of Object.keys(keys)) keys[k] = false
+    })
     lockRef.current = () => controls.lock()
 
     let terrain = null
@@ -54,7 +67,7 @@ export default function Viewer({ url, exaggeration = 1, baseM = 0, units = 'm' }
         const box = new THREE.Box3().setFromObject(terrain)
         const size = box.getSize(new THREE.Vector3())
         const mid = box.getCenter(new THREE.Vector3())
-        scene.fog = new THREE.Fog(0x0d0f12, size.length() * 0.3, size.length() * 1.8)
+        scene.fog = new THREE.Fog(0x07090c, size.length() * 0.3, size.length() * 1.8)
         camera.position.set(mid.x - size.x * 0.55,
                             box.max.y + size.y * 0.8 + size.z * 0.25,
                             mid.z + size.z * 0.75)
@@ -69,9 +82,31 @@ export default function Viewer({ url, exaggeration = 1, baseM = 0, units = 'm' }
       () => { setErr('Could not load the mesh'); setLoading(false) }
     )
 
-    const keys = {}
-    const onDown = (e) => { keys[e.code] = true; if (e.code === 'KeyR') clearPins() }
-    const onUp = (e) => { keys[e.code] = false }
+    // Space scrolls the page and W/A/S/D type into whatever is focused, so the
+    // flight keys have to be claimed with preventDefault. But this listener is
+    // on window, so claiming them unconditionally would swallow keystrokes
+    // while someone is filling in the form. Only take them while the pointer
+    // is actually locked - which is exactly when the viewer owns the input.
+    // Two sources of truth for "the viewer owns the keyboard": three.js's own
+    // flag, and the browser's. They agree in practice, but the browser's is
+    // authoritative and costs nothing to check, so a lag in the three.js
+    // listener can never let Space through to scroll the page.
+    const owned = () => controls.isLocked ||
+      document.pointerLockElement === renderer.domElement
+
+    const onDown = (e) => {
+      if (!owned() || !FLIGHT_KEYS.has(e.code)) return
+      e.preventDefault()
+      keys[e.code] = true
+      if (e.code === 'KeyR') clearPins()
+    }
+    // Key-up always clears, locked or not: if the lock drops between press and
+    // release the key would otherwise stay down forever.
+    const onUp = (e) => {
+      if (!FLIGHT_KEYS.has(e.code)) return
+      if (owned()) e.preventDefault()
+      keys[e.code] = false
+    }
     addEventListener('keydown', onDown)
     addEventListener('keyup', onUp)
 
@@ -118,7 +153,7 @@ export default function Viewer({ url, exaggeration = 1, baseM = 0, units = 'm' }
       if (!hit) { setHud((h) => ({ ...h, probe: 'no surface under crosshair' })); return }
       const m = new THREE.Mesh(
         new THREE.SphereGeometry(Math.max(1, hit.distance * 0.006), 12, 8),
-        new THREE.MeshBasicMaterial({ color: 0x7fd1ff }))
+        new THREE.MeshBasicMaterial({ color: 0x5fd3f5 }))
       m.position.copy(hit.point)
       pinGroup.add(m)
       pins.push(hit.point.clone())
@@ -191,32 +226,44 @@ export default function Viewer({ url, exaggeration = 1, baseM = 0, units = 'm' }
     }
   }, [url, exaggeration, baseM, units])
 
-  if (!url) {
-    return <div className="viewer empty">Run a job and the terrain appears here.</div>
-  }
+  if (!url) return null
 
   return (
-    <div className="viewer" ref={mount}>
+    <div style={{ position: 'absolute', inset: 0 }} ref={mount}>
       <div className="hud">
         <div className="k">altitude</div>
-        <div><span className="v">{hud.alt}</span> {units}</div>
+        <div className="v">{hud.alt} <small>{units}</small></div>
         <hr />
         <div className="k">crosshair</div>
-        <div><span className="v">{hud.ht}</span> {units} <span className="dim">{hud.slope}</span></div>
+        <div className="v">{hud.ht} <small>{units}{hud.slope ? ` · ${hud.slope}` : ''}</small></div>
         <hr />
         <div className="k">probe</div>
-        <div className="dim">{hud.probe}</div>
+        <div className="probe">{hud.probe}</div>
       </div>
+
       {locked && <div className="cross" />}
+
+      {locked && (
+        <p className="viewer-note">
+          Readouts are true metres — the vertical exaggeration is divided back out.
+        </p>
+      )}
+
       {!locked && (
         <div className="overlay" onClick={() => lockRef.current?.()}>
-          <div>
-            <b>{loading ? 'LOADING MESH' : err || 'CLICK TO FLY'}</b>
-            <p>
-              <kbd>W</kbd><kbd>A</kbd><kbd>S</kbd><kbd>D</kbd> move · mouse look ·
-              <kbd>Shift</kbd> boost · <kbd>Space</kbd>/<kbd>C</kbd> altitude<br />
-              <kbd>click</kbd> drop a probe · <kbd>R</kbd> clear · <kbd>Esc</kbd> release
-            </p>
+          <span className="cta">
+            {loading ? 'Loading mesh…' : err || 'Click to fly'}
+          </span>
+          <div className="keys">
+            <span><kbd>W</kbd><kbd>A</kbd><kbd>S</kbd><kbd>D</kbd> move</span>
+            <span>mouse look</span>
+            <span><kbd>Shift</kbd> boost</span>
+            <span><kbd>Space</kbd><kbd>C</kbd> altitude</span>
+          </div>
+          <div className="keys">
+            <span><kbd>click</kbd> drop a probe</span>
+            <span><kbd>R</kbd> clear probes</span>
+            <span><kbd>Esc</kbd> release cursor</span>
           </div>
         </div>
       )}

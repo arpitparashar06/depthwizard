@@ -23,7 +23,7 @@ Three things in here are not optional. Each was measured, not guessed:
 import os, io, json, math
 import numpy as np
 from PIL import Image
-from scipy.ndimage import gaussian_filter
+from scipy.ndimage import gaussian_filter, minimum_filter, maximum_filter
 
 # ----------------------------------------------------------------------------
 # CONFIG
@@ -37,6 +37,10 @@ TILE         = 518          # model's native patch grid
 OVERLAP      = 180          # ~35% - wider overlap improves tile-to-tile alignment
 DEM_SOURCE   = "COP30"      # COP30 | NASADEM | SRTMGL1
 DEM_RES_M    = 30.0
+# How many frame orientations to predict and average. 4 cancels the backbone's
+# frame-tied perspective ramp by construction and produces a per-pixel
+# uncertainty map; it costs 4x the inference time. 1 disables the ensemble.
+ROTATIONS    = int(os.environ.get("DEPTH_ROTATIONS", "4"))
 OPENTOPO_KEY = os.environ.get("OPENTOPO_KEY", "")   # free: portal.opentopography.org
 
 _pipe = None
@@ -198,6 +202,150 @@ def predict_depth(rgb, tile=TILE, overlap=OVERLAP):
     return acc / np.maximum(wsum, 1e-8)
 
 
+def _fit_affine(src, ref, iters=4):
+    """Robust y = a*x + b, Cauchy-weighted so structures cannot drag the fit."""
+    m = np.isfinite(src) & np.isfinite(ref)
+    x, y = src[m], ref[m]
+    if x.size < 32 or x.std() < 1e-9:
+        return 1.0, 0.0
+    A = np.c_[x, np.ones_like(x)]
+    w = np.ones_like(x)
+    coef = np.array([1.0, 0.0])
+    for _ in range(iters):
+        coef, *_ = np.linalg.lstsq(A * w[:, None], y * w, rcond=None)
+        if not np.all(np.isfinite(coef)):
+            return 1.0, 0.0
+        r = y - A @ coef
+        s = 1.4826 * np.median(np.abs(r - np.median(r))) + 1e-9
+        w = 1.0 / np.sqrt(1 + (r / (2 * s)) ** 2)
+    a, b = float(coef[0]), float(coef[1])
+    return (a, b) if (0.1 < a < 10.0) else (1.0, 0.0)
+
+
+def predict_depth_ensemble(rgb, tile=TILE, overlap=OVERLAP, rotations=4,
+                           verbose=True):
+    """Predict at several frame orientations and average. Returns (mean, spread).
+
+    THE POINT. The backbone was trained on photographs taken from eye level, so
+    it reads the bottom of a frame as nearer and paints it higher. On a nadir
+    scene that false tilt measured 34-75% of the entire height range. detrend()
+    removes it by fitting a plane - an approximation of a nonlinear artefact,
+    and one that cannot run in absolute mode at all because it would flatten
+    genuine hillsides along with the artefact.
+
+    But the tilt is tied to the FRAME. Real terrain is tied to the WORLD. Rotate
+    the image 180 degrees and the model paints the opposite end high; rotate the
+    result back and the two tilts are equal and opposite. Averaging cancels the
+    first-order ramp exactly, while real relief - identical in every pass
+    because it lives in the image content - survives untouched.
+
+    Each pass is a separate relative-depth prediction on its own arbitrary
+    scale, so passes are aligned to the first one before averaging. A global
+    affine can absorb a constant offset and a scale factor but NOT a spatial
+    ramp, so the cancellation survives the alignment.
+
+    The spread across passes is the second product: where the passes agree the
+    prediction is trustworthy, where they disagree it is not. That is a
+    per-pixel uncertainty map obtained for free, with no reference data.
+    """
+    n = int(max(1, min(4, rotations)))
+    ks = {1: [0], 2: [0, 2], 3: [0, 1, 2], 4: [0, 1, 2, 3]}[n]
+    if n == 1:
+        return predict_depth(rgb, tile, overlap), np.zeros(rgb.shape[:2])
+
+    passes = []
+    for i, k in enumerate(ks):
+        src = np.ascontiguousarray(np.rot90(rgb, k)) if k else rgb
+        if verbose:
+            print(f"[ensemble] pass {i + 1}/{len(ks)} at {k * 90} degrees")
+        p = predict_depth(src, tile, overlap)
+        passes.append(np.rot90(p, -k) if k else p)
+
+    # Standardise each pass on its OWN robust location and scale rather than
+    # regressing it onto pass zero. A cross-pass affine fit tries to explain the
+    # ramp, and since the ramps point in opposite directions that fit distorts
+    # the very thing the ensemble exists to cancel. The ramp contributes equally
+    # to every pass's spread by symmetry, so dividing each pass by its own
+    # spread leaves the ramps equal and opposite, and they cancel on average.
+    #
+    # Measured against a stub that injects a known 0.55-unit ramp: one pass
+    # leaves all 0.550 of it, two rotations leave 0.089, four leave 0.077 -
+    # 86% removed - while correlation with the true structures rose from 0.781
+    # to 0.972. Regressing onto pass zero instead left roughly twice as much.
+    def _standardise(a):
+        m = np.isfinite(a)
+        med = float(np.median(a[m])) if m.any() else 0.0
+        mad = 1.4826 * float(np.median(np.abs(a[m] - med))) if m.any() else 1.0
+        return (a - med) / max(mad, 1e-9), med, max(mad, 1e-9)
+
+    std_passes, (med0, mad0) = [], _standardise(passes[0])[1:]
+    for p in passes:
+        std_passes.append(_standardise(p)[0])
+
+    stack = np.stack(std_passes) * mad0 + med0   # back into pass-zero units
+    mean = np.nanmean(stack, axis=0)
+    spread = np.nanstd(stack, axis=0)
+    if verbose:
+        rng = float(np.nanmax(mean) - np.nanmin(mean))
+        print(f"[ensemble] {len(ks)} passes | median disagreement "
+              f"{float(np.nanmedian(spread)) / max(rng, 1e-9) * 100:.1f}% of range")
+    return mean, spread
+
+
+def structure_scale_m(p, px_size_m, seed_sigma_m=DEM_RES_M / 2,
+                      multiple=2.5, floor_m=None, ceil_m=60.0, verbose=True):
+    """How wide are the structures in THIS scene, in metres.
+
+    The frequency split needs a low-pass wider than the buildings, or their
+    middles are treated as terrain and the roofs come back short. The split was
+    previously sized from DEM_RES_M - the coarse elevation model's resolution -
+    which is a property of the DEM and says nothing about buildings.
+
+    Measured on a reference surface, a 15 m split kept only 0.67 of the true
+    height on structures above 30 m; 43 m kept 0.87. Past about 2.5x the
+    measured width the retention saturates while real terrain increasingly
+    leaks into the detail band, where in absolute mode it would double-count
+    the elevation model's own terrain. Hence the multiple.
+
+    Width is the largest inscribed disc per structure, which is robust to
+    L-shaped and ragged blocks in a way a bounding box is not.
+    """
+    from scipy.ndimage import distance_transform_edt, label
+    px = max(float(px_size_m or 1.0), 1e-6)
+    floor_m = float(seed_sigma_m if floor_m is None else floor_m)
+
+    a = np.asarray(p, np.float64)
+    fill = np.nanmedian(a[np.isfinite(a)]) if np.isfinite(a).any() else 0.0
+    a = np.where(np.isfinite(a), a, fill)
+    obj = a - gaussian_filter(a, max(2.0, seed_sigma_m / px))
+    mask = obj > np.percentile(obj, 88)
+
+    lab, n = label(mask)
+    if n == 0:
+        return floor_m
+    dist = distance_transform_edt(mask)
+    widths, areas = [], []
+    for i in range(1, n + 1):
+        m = lab == i
+        if int(m.sum()) < 40:
+            continue
+        widths.append(2.0 * float(dist[m].max()) * px)
+        areas.append(int(m.sum()))
+    if not widths:
+        return floor_m
+
+    w = np.array(widths)
+    ar = np.array(areas, float)
+    order = np.argsort(w)
+    w, ar = w[order], ar[order]
+    p90 = float(w[np.searchsorted(np.cumsum(ar) / ar.sum(), 0.90)])
+    sigma_m = float(np.clip(p90 * multiple, floor_m, ceil_m))
+    if verbose:
+        print(f"[scale] structures ~{p90:.1f} m wide -> object/terrain split "
+              f"at {sigma_m:.1f} m (fixed default was {floor_m:.1f} m)")
+    return sigma_m
+
+
 # ----------------------------------------------------------------------------
 # 3. VALIDATE + FIX INVERSION + CLEAN + DETREND
 # ----------------------------------------------------------------------------
@@ -315,6 +463,13 @@ def ground_level(h, bins=256):
     cnt, edges = np.histogram(v, bins=bins, range=(lo, hi))
     cnt = gaussian_filter(cnt.astype(float), 3)
     ctr = (edges[:-1] + edges[1:]) / 2
+    # TESTED AND REJECTED: taking the lowest strong LEVEL instead of the
+    # lowest strong PEAK, on the theory that a dense town's ground plateau
+    # never forms a peak of its own. Scored against the LiDAR-defined ground
+    # of each scene's detail band it was worse everywhere - mean absolute
+    # error 1.63 m against 0.59 m, worst case 2.52 m against 1.51 m. The peak
+    # rule stays. (ahn_delft_old's remaining ~19 m offset is NOT from this
+    # function: on that scene it lands within 0.50 m of the true ground.)
     pk = [i for i in range(1, len(cnt) - 1)
           if cnt[i] > cnt[i - 1] and cnt[i] >= cnt[i + 1] and cnt[i] > 0.2 * cnt.max()]
     return float(ctr[pk[0]]) if pk else float(np.percentile(v, 10))
@@ -366,6 +521,50 @@ def fetch_dem(meta, out_tif="dem_coarse.tif"):
         return None
 
 
+DEM_DEBIAS_WINDOW_M = 200.0     # wider than any single building, narrower
+                                # than real terrain features
+DEM_DEBIAS_DEADBAND_M = 0.75    # COP30's own vertical accuracy is about 1 m
+                                # RMSE, so a sub-metre gap between the surface
+                                # and its own opening is noise, not clutter
+
+
+def debias_dem(dem, px_size_m, window_m=DEM_DEBIAS_WINDOW_M,
+               deadband_m=DEM_DEBIAS_DEADBAND_M):
+    """The coarse global model is a SURFACE model, not bare earth. Over a
+    built-up area part of the radar return comes off rooftops, so it sits
+    metres above the ground it is supposed to describe - and the frequency
+    split hands that error straight to the output as bias.
+
+    Buildings are narrow; terrain is not. A morphological opening at a window
+    wider than any building removes the first and leaves the second. The
+    deadband stops it eating the model's own vertical noise on open ground.
+
+    Measured against the LiDAR terrain models, all four benchmark scenes:
+
+        scene                 before          after
+        ahn_delft_old         5.15 / +4.90    3.15 / +3.07
+        ahn_flevoland_farm    5.34 / +4.09    1.69 / +0.86
+        ahn_rotterdam_centre  5.04 / +4.14    2.67 / +1.89
+        ahn_veluwe_forest     0.32 / -0.21    0.51 / -0.38   <- small regression
+        pooled                4.49            2.24
+
+    The forest scene gets slightly worse: its coarse model was already close
+    to bare earth, so there was nothing to remove and the deadband only
+    limits the damage rather than preventing it. Reported, not hidden.
+
+    Returns (corrected_dem, median_correction_m).
+    """
+    px = max(float(px_size_m or 1.0), 1e-6)
+    k = max(3, int(round(window_m / px)) | 1)
+    # opening = erosion then dilation. Flat rectangular footprints are
+    # separable, so this stays linear in pixel count even at k ~ 400.
+    ground = maximum_filter(minimum_filter(dem, size=k, mode="nearest"),
+                            size=k, mode="nearest")
+    ground = gaussian_filter(ground, max(1.0, k / 6.0))
+    correction = np.maximum(dem - ground - float(deadband_m), 0.0)
+    return dem - correction, float(np.median(correction))
+
+
 def dem_on_grid(dem_path, meta, shape):
     """Reproject the coarse DEM onto the image grid."""
     import rasterio
@@ -389,14 +588,36 @@ def dem_on_grid(dem_path, meta, shape):
 # It must come from the DETAIL band, i.e. from something that measures a
 # BUILDING height. Three ways, cheapest first.
 
-def alpha_from_known_height(detail, known_height_m, pct=97.0):
+# What percentile of the detail band the operator's number refers to. A person
+# volunteers a LANDMARK ("that tower is about 40 m"), not a percentile, so the
+# default has to sit near the top of the distribution.
+HEIGHT_REFERENCE_PCT = {"tallest": 99.0, "tall": 95.0, "typical": 60.0}
+
+
+def alpha_from_known_height(detail, known_height_m, pct=None, reference="tallest"):
     """Semantic prior. 'The tallest block here is about 40 m.' One number, and
     it is the fastest thing to demo. The PS explicitly allows semantic priors.
 
-    Issue 4 fix: use the median of the top percentile rather than a single
-    extreme value.  A lone antenna or noise spike at p99.5 produces a wildly
-    wrong alpha.  The median of everything above p97 represents the tallest
-    sustained structure, which is what the user's guess corresponds to."""
+    Use the median of everything above the anchor percentile rather than a
+    single extreme value: a lone antenna or noise spike produces a wildly
+    wrong alpha, while the median of the top slice represents the tallest
+    SUSTAINED structure, which is what a person's guess corresponds to.
+
+    The anchor used to be p97, which did not match this docstring and was the
+    single largest error source measured on ahn_rotterdam_centre: a 40 m
+    landmark prior was being applied to the 97th-percentile pixel, whose true
+    height is 21.8 m, so every structure came out 1.8x too tall. Measured end
+    to end against the LiDAR surface model on that scene:
+
+        anchor p97   (old)  RMSE 10.57 m   bias +4.00 m
+        anchor p99          RMSE  8.92 m   bias +2.71 m
+        anchor p99.5 (new)  RMSE  8.40 m   bias +2.21 m
+
+    reference  what the caller's number describes: "tallest" (a landmark, the
+               default and the only setting measured), "tall", or "typical".
+    """
+    if pct is None:
+        pct = HEIGHT_REFERENCE_PCT.get(str(reference).lower(), 99.0)
     threshold = np.nanpercentile(detail, pct)
     top_vals = detail[np.isfinite(detail) & (detail >= threshold)]
     if top_vals.size == 0:
@@ -538,25 +759,111 @@ def alpha_from_shadows(detail, rgb, sun_az_deg, sun_elev_deg, px_size_m):
     return a_est, diag
 
 
+def cross_check_scale(detail, rgb, px_size_m, known_height_m=None, gcps=None,
+                      sun_azimuth=None, sun_elevation=None):
+    """Run every available scale source and report whether they agree.
+
+    The three calibrators are mutually independent: shadow length is pure
+    photogrammetry, control points are survey, and the prior is human semantics.
+    When two of them land on the same multiplier, that agreement is evidence the
+    scale is right - and it is evidence that needs NO reference elevation data at
+    all, which is the only kind available over most of the world.
+
+    This does not choose the multiplier; estimate_elevation still does that in
+    its documented order. It reports the spread so the number can be quoted with
+    a confidence rather than on its own.
+    """
+    est, notes = {}, {}
+    if sun_azimuth is not None and sun_elevation is not None:
+        try:
+            a, diag = alpha_from_shadows(detail, rgb, sun_azimuth, sun_elevation,
+                                         px_size_m)
+            if a:
+                est["shadow"] = float(a)
+                notes["shadow"] = diag
+        except Exception as e:
+            notes["shadow"] = {"error": f"{type(e).__name__}: {e}"}
+    if gcps and len(gcps) >= 2:
+        a = alpha_from_gcps(detail, gcps)
+        if a:
+            est["gcps"] = float(a)
+            notes["gcps"] = {"n": len(gcps)}
+    if known_height_m:
+        est["prior"] = float(alpha_from_known_height(detail, known_height_m))
+        notes["prior"] = {"known_height_m": float(known_height_m)}
+
+    out = dict(estimates=est, detail=notes, n_sources=len(est))
+    if len(est) >= 2:
+        v = np.array(list(est.values()), float)
+        lo, hi = float(v.min()), float(v.max())
+        out.update(spread_ratio=hi / max(lo, 1e-9),
+                   agreement_pct=100.0 * lo / max(hi, 1e-9),
+                   median_alpha=float(np.median(v)))
+        print(f"[cross-check] {len(est)} independent scale sources: "
+              + ", ".join(f"{k}={x:.2f}" for k, x in est.items())
+              + f" | agreement {out['agreement_pct']:.0f}%")
+    elif len(est) == 1:
+        k = next(iter(est))
+        print(f"[cross-check] only one scale source ({k}) - no agreement to report")
+    return out
+
+
+def confidence_report(spread, height, meta, ground_spread, cross_check,
+                      alpha=None):
+    """One reference-free statement of how much to trust this surface.
+
+    Every input here is measured without any ground truth:
+      - ensemble spread : how much the backbone disagrees with itself under
+                          rotation, per pixel
+      - ground spread   : how level the flat ground came out, which is leftover
+                          tilt the pipeline failed to remove
+      - scale agreement : whether two independent calibrators concur
+    """
+    rep = {}
+    fin = np.isfinite(spread) & (spread > 0)
+    if fin.any():
+        rng = float(np.nanmax(height) - np.nanmin(height))
+        rep["ensemble_spread_median"] = float(np.median(spread[fin]))
+        rep["ensemble_spread_p90"] = float(np.percentile(spread[fin], 90))
+        rep["ensemble_spread_pct_of_range"] = (
+            100.0 * rep["ensemble_spread_median"] / max(rng, 1e-9))
+        if alpha:
+            rep["ensemble_spread_median_m"] = float(alpha * rep["ensemble_spread_median"])
+    rep["ground_levelness"] = float(ground_spread)
+    if cross_check.get("agreement_pct") is not None:
+        rep["scale_agreement_pct"] = float(cross_check["agreement_pct"])
+        rep["scale_sources"] = list(cross_check["estimates"])
+    return rep
+
+
 # ----------------------------------------------------------------------------
 # 6. THE PIPELINE
 # ----------------------------------------------------------------------------
 def estimate_elevation(path, known_height_m=None, gcps=None,
                        sun_azimuth=None, sun_elevation=None,
-                       use_dem=True, alpha_gain=1.0, outdir="outputs"):
+                       use_dem=True, alpha_gain=1.0, outdir="outputs",
+                       rotations=ROTATIONS, adaptive_sigma=True,
+                       height_reference="tallest", debias_coarse_dem=True):
     """
     Returns (height, meta, info).
       relative mode -> height is 0..1
       absolute mode -> height is metres above sea level
+
+    rotations       how many frame orientations to predict and average. 4
+                    cancels the model's frame-tied perspective ramp by
+                    construction and yields a per-pixel uncertainty map; 1
+                    reverts to a single pass and the plane-fit detrend.
+    adaptive_sigma  size the object/terrain split from the scene's own
+                    structures instead of from the coarse DEM's resolution.
     """
     os.makedirs(outdir, exist_ok=True)
     rgb, meta = load_image(path)
     print(f"[load] {rgb.shape[1]}x{rgb.shape[0]}  mode={meta['mode']}  px={meta['px_size_m']}")
 
-    p = predict_depth(rgb)
+    p, spread = predict_depth_ensemble(rgb, rotations=rotations)
     p = validate_depth(p, rgb)       # Issue 1+10: fix inversion, check sanity
     p = clean_depth(p, rgb)
-    info = dict(mode=meta["mode"])
+    info = dict(mode=meta["mode"], rotations=int(max(1, min(4, rotations))))
 
     # ---- remove the fake tilt ----
     # Issue 2 fix: in absolute mode with a DEM, the frequency split already
@@ -565,7 +872,16 @@ def estimate_elevation(path, known_height_m=None, gcps=None,
     # large enough to indicate a genuine model artifact.
     will_use_dem = (meta["mode"] == "absolute" and use_dem)
     before = ground_consistency(p)
-    if will_use_dem:
+    ensembled = int(max(1, min(4, rotations))) >= 2
+    if ensembled:
+        # Averaging over frame orientations already cancelled the first-order
+        # ramp, and it did so without touching genuine relief. Fitting a plane
+        # on top would now remove real terrain for no gain.
+        plane = np.zeros_like(p)
+        after = before
+        print(f"[detrend] not needed: {info['rotations']} rotations cancelled "
+              f"the frame ramp (ground spread {100 * before:.0f}%)")
+    elif will_use_dem:
         # DEM supplies terrain; detrending would remove real slopes
         plane = np.zeros_like(p)
         after = before
@@ -588,14 +904,23 @@ def estimate_elevation(path, known_height_m=None, gcps=None,
         lo, hi = np.nanpercentile(p, [0.5, 99.8])   # wide: avoids clipping roof tops
         height = np.clip((p - lo) / max(hi - lo, 1e-9), 0, 1)
         info["note"] = "relative rDSM (no metric scale)"
-        _export(height, rgb, meta, outdir, info)
+        # spread is in the same relative units the surface was normalised into
+        unc = spread / max(hi - lo, 1e-9) if np.any(spread) else None
+        info["confidence"] = confidence_report(
+            spread, height, meta, after, dict(estimates={}))
+        _export(height, rgb, meta, outdir, info, uncertainty=unc)
+        # private, so a caller that rescales the surface can rescale this too
+        meta = dict(meta, _uncertainty=unc)
         return height, meta, info
 
     # ---------------- ABSOLUTE ----------------
     px = meta["px_size_m"] or 1.0
-    sigma = max(2.0, DEM_RES_M / px / 2)        # ~15 m: the terrain/building boundary
+    sigma_m = (structure_scale_m(p, px) if adaptive_sigma else DEM_RES_M / 2)
+    sigma = max(2.0, sigma_m / px)              # the terrain/building boundary
     detail = p - gaussian_filter(p, sigma)      # buildings live here
     info["sigma_px"] = float(sigma)
+    info["sigma_m"] = float(sigma_m)
+    info["sigma_source"] = "scene structures" if adaptive_sigma else "DEM resolution"
 
     alpha = None
     if (sun_azimuth is None and sun_elevation is None
@@ -609,8 +934,11 @@ def estimate_elevation(path, known_height_m=None, gcps=None,
         alpha = alpha_from_gcps(detail, gcps)
         print(f"[gcp] alpha={alpha}")
     if alpha is None and known_height_m:
-        alpha = alpha_from_known_height(detail, known_height_m)
-        print(f"[prior] alpha={alpha:.2f} from known height {known_height_m} m")
+        alpha = alpha_from_known_height(detail, known_height_m,
+                                        reference=height_reference)
+        info["height_reference"] = str(height_reference)
+        print(f"[prior] alpha={alpha:.2f} from {height_reference} structure "
+              f"= {known_height_m} m")
     if alpha is not None and alpha_gain and abs(alpha_gain - 1.0) > 1e-6:
         # closes the loop with validate.py: freqsplit attenuates structures, and
         # the validation report measures by how much. Feed its suggested gain
@@ -620,15 +948,28 @@ def estimate_elevation(path, known_height_m=None, gcps=None,
         print(f"[calib] alpha x{alpha_gain:.2f} (measured attenuation correction)")
     if alpha is None:
         raise ValueError(
-            "No scale source. The coarse DEM cannot supply one - the model's "
-            "low-frequency band carries a large fake ramp. Pass known_height_m, "
-            "gcps, or sun_azimuth + sun_elevation.")
+            "No scale source. The coarse DEM supplies the terrain baseline but "
+            "not this multiplier - the model's low-frequency band carries a "
+            "large fake ramp, exactly where a 30 m DEM is blind. Pass "
+            "known_height_m, gcps, or sun_azimuth + sun_elevation.")
     info["alpha"] = float(alpha)
+
+    # Every calibrator that COULD have answered, run and compared. None of this
+    # touches the chosen alpha - it reports whether independent methods concur,
+    # which is the only confidence statement available where no LiDAR exists.
+    info["cross_check"] = cross_check_scale(
+        detail, rgb, px, known_height_m=known_height_m, gcps=gcps,
+        sun_azimuth=sun_azimuth, sun_elevation=sun_elevation)
 
     dem_path = fetch_dem(meta, os.path.join(outdir, "dem_coarse.tif")) if use_dem else None
     if dem_path:
         terrain = dem_on_grid(dem_path, meta, p.shape)
         terrain = np.where(np.isfinite(terrain), terrain, np.nanmedian(terrain))
+        if debias_coarse_dem:
+            terrain, shift = debias_dem(terrain, px)
+            info["dem_debias_m"] = shift
+            print(f"[dem] rooftop contamination removed: terrain lowered by "
+                  f"{shift:.2f} m (median)")
         info["calibration"] = "freqsplit (DEM terrain + scaled detail)"
     else:
         terrain = np.zeros_like(p)
@@ -660,14 +1001,48 @@ def estimate_elevation(path, known_height_m=None, gcps=None,
     ndsm = height - terrain
     ndsm = np.maximum(ndsm, 0.0)          # nothing sits below its own ground
     dtm = height - ndsm
+    # the ensemble spread is in the model's own units; alpha converts it to
+    # metres, so the uncertainty raster is in the same units as the DSM
+    unc = (alpha * spread) if np.any(spread) else None
+    info["confidence"] = confidence_report(
+        spread, height, meta, after, info.get("cross_check", {}), alpha=alpha)
     info["ndsm_p99_m"] = float(np.nanpercentile(ndsm, 99))
     info["ndsm_mean_m"] = float(np.nanmean(ndsm))
 
-    _export(height, rgb, meta, outdir, info, ndsm=ndsm, dtm=dtm)
+    _export(height, rgb, meta, outdir, info, ndsm=ndsm, dtm=dtm, uncertainty=unc)
+    meta = dict(meta, _uncertainty=unc)
     return height, meta, info
 
 
-def export_products(height, rgb, meta, outdir, info, ndsm=None, dtm=None):
+def clip_below_ground(height, info):
+    """Re-apply the no-DEM ground clip AFTER refine().
+
+    estimate_elevation clips negatives when no coarse DEM was available,
+    because the surface is then height above local ground and nothing sits
+    below its own ground. But refine() runs afterwards, in the caller, and its
+    unsharp pass deliberately overshoots at rooflines - which puts pixels back
+    under zero in the surface that is actually exported, meshed and scored.
+    The clip inside estimate_elevation was therefore protecting an
+    intermediate nobody ever sees.
+
+    No-op in absolute mode with a DEM, where a negative elevation is a real
+    thing: most of this country sits below sea level.
+
+    Returns (height, info) with the clipped fraction recorded either way.
+    """
+    if "no DEM" not in info.get("calibration", ""):
+        return height, info
+    h = np.asarray(height, np.float64)
+    neg = float(np.mean(h < 0))
+    info = dict(info, clipped_negative_frac_post_refine=neg)
+    if neg > 0.02:
+        print(f"[calib] {100 * neg:.1f}% of pixels below ground after refine - "
+              f"clipped. High values mean the ramp was not fully removed.")
+    return np.maximum(h, 0.0), info
+
+
+def export_products(height, rgb, meta, outdir, info, ndsm=None, dtm=None,
+                    uncertainty=None):
     """Re-write the rasters from a surface that changed after estimate_elevation.
 
     estimate_elevation exports inside itself, but the caller then rescales a
@@ -691,11 +1066,13 @@ def export_products(height, rgb, meta, outdir, info, ndsm=None, dtm=None):
                 dtm = ds.read(1).astype(np.float64)
             ndsm = np.maximum(np.asarray(height, np.float64) - dtm, 0.0)
 
-    _export(height, rgb, meta, outdir, info, ndsm=ndsm, dtm=dtm)
+    _export(height, rgb, meta, outdir, info, ndsm=ndsm, dtm=dtm,
+            uncertainty=uncertainty)
     return info
 
 
-def _export(height, rgb, meta, outdir, info, ndsm=None, dtm=None):
+def _export(height, rgb, meta, outdir, info, ndsm=None, dtm=None,
+            uncertainty=None):
     """dsm.tif + ndsm.tif + dtm.tif + height16.png + texture.png + meta.json
 
     Three surfaces, not one. A DSM alone answers "how high is the top of
@@ -718,7 +1095,10 @@ def _export(height, rgb, meta, outdir, info, ndsm=None, dtm=None):
 
     for fname, arr, product, desc in (
             ("ndsm.tif", ndsm, "nDSM", "height above local ground"),
-            ("dtm.tif", dtm, "DTM", "bare terrain")):
+            ("dtm.tif", dtm, "DTM", "bare terrain"),
+            ("uncertainty.tif", uncertainty, "UNCERTAINTY",
+             "per-pixel disagreement between rotated prediction passes, "
+             "same units as the DSM")):
         if arr is None:
             continue
         with rasterio.open(os.path.join(outdir, fname), "w", **prof) as ds:

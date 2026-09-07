@@ -24,6 +24,20 @@ from scipy.ndimage import binary_opening, binary_closing, gaussian_filter
 
 
 # ---------------------------------------------------------------------------
+def _lstsq(A, y):
+    """Least squares that neither prints spurious warnings nor returns inf.
+
+    macOS/Accelerate raises floating-point flags for the unused lanes of its
+    vectorised matmul, so a healthy solve prints "divide by zero", "overflow"
+    and "invalid" at once - noise that trains you to ignore the real thing. A
+    genuinely singular design matrix returns inf/nan coefficients, which would
+    propagate silently into the result; None lets the caller fall back.
+    """
+    with np.errstate(all="ignore"):
+        coef, *_ = np.linalg.lstsq(A, y, rcond=None)
+    return coef if np.all(np.isfinite(coef)) else None
+
+
 def ground_surface(dsm, px_size_m=0.5, max_building_m=45.0, smooth_m=8.0):
     """Bare-ground estimate by morphological opening.
 
@@ -254,8 +268,12 @@ def extract_footprints(ndsm, rgb=None, px_size_m=0.5, min_height_m=2.5,
         ys, xs = np.nonzero(region)
         vals = n[region]
         A = np.c_[xs, ys, np.ones(xs.size)]
-        coef, *_ = np.linalg.lstsq(A, vals, rcond=None)
-        planar_resid = float(np.std(vals - A @ coef))       # a roof is a plane
+        coef = _lstsq(A, vals)
+        with np.errstate(all="ignore"):
+            # a roof is a plane; a degenerate fit falls back to raw spread,
+            # which is the conservative answer (more likely to be rejected)
+            planar_resid = (float(np.std(vals - A @ coef)) if coef is not None
+                            else float(np.std(vals)))
         veg_mean = float(np.mean(veg[region]))
         if veg_mean > veg_ref and planar_resid > 1.0:
             rejected += 1

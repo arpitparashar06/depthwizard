@@ -26,6 +26,24 @@ from scipy.ndimage import (uniform_filter, gaussian_filter, label,
 
 
 # ---------------------------------------------------------------------------
+
+def _lstsq(A, y):
+    """Least squares that neither prints spurious warnings nor returns inf.
+
+    Two separate problems, one wrapper. macOS/Accelerate raises floating-point
+    flags for the unused lanes of its vectorised matmul, so a perfectly healthy
+    solve prints "divide by zero", "overflow" and "invalid" all at once - noise
+    that trains you to ignore the real thing. And a genuinely singular design
+    matrix (a one-pixel-wide region, every pixel collinear, one distinct value)
+    returns coefficients that are inf or nan, which would then propagate
+    silently into the surface. Returns None in that case so the caller can fall
+    back to something safe.
+    """
+    with np.errstate(all="ignore"):
+        coef, *_ = np.linalg.lstsq(A, y, rcond=None)
+    return coef if np.all(np.isfinite(coef)) else None
+
+
 def _box(a, r):
     return uniform_filter(a, size=2 * int(r) + 1, mode="nearest")
 
@@ -119,18 +137,26 @@ def flatten_structures(height, px_size_m=1.0, object_sigma_m=15.0,
             continue
         vals = h[sl][sub]
 
+        coef = None
         if plane and sub.sum() >= 30:
             yy, xx = np.nonzero(sub)
             A = np.c_[xx, yy, np.ones(xx.size)]
-            coef, *_ = np.linalg.lstsq(A, vals, rcond=None)
-            # one robust pass: drop the tails, refit. Chimneys and edge pixels
-            # otherwise tilt the whole roof.
-            r = vals - A @ coef
-            keep = np.abs(r) < 2.5 * (1.4826 * np.median(np.abs(r - np.median(r))) + 1e-6)
-            if keep.sum() >= 20:
-                coef, *_ = np.linalg.lstsq(A[keep], vals[keep], rcond=None)
-            fit = A @ coef
+            coef = _lstsq(A, vals)
+        if coef is not None:
+            with np.errstate(all="ignore"):
+                # one robust pass: drop the tails, refit. Chimneys and edge
+                # pixels otherwise tilt the whole roof.
+                r = vals - A @ coef
+                keep = np.abs(r) < 2.5 * (1.4826 * np.median(np.abs(r - np.median(r))) + 1e-6)
+                if keep.sum() >= 20:
+                    refit = _lstsq(A[keep], vals[keep])
+                    if refit is not None:
+                        coef = refit
+                fit = A @ coef
+            if not np.all(np.isfinite(fit)):
+                fit = np.full(vals.size, np.median(vals))
         else:
+            # no plane, or a degenerate one: a flat median is always safe
             fit = np.full(vals.size, np.median(vals))
 
         blk = out[sl]

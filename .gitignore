@@ -1,5 +1,6 @@
 .venv/
 jobs/
+outputs/
 __pycache__/
 *.pyc
 web/node_modules/
@@ -10,3 +11,6 @@ benchmark/scenes/
 benchmark/results/
 .env
 *.bak
+
+# experiment outputs - the script regenerates them
+benchmark/mode_comparison/

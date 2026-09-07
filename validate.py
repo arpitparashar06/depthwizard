@@ -39,6 +39,20 @@ NODATA_SENTINELS = (-9999.0, -32767.0, -32768.0, -3.4028234663852886e+38)
 # ----------------------------------------------------------------------------
 # 1. LOAD + PUT BOTH RASTERS ON ONE GRID
 # ----------------------------------------------------------------------------
+def _lstsq(A, y):
+    """Least squares that neither prints spurious warnings nor returns inf.
+
+    macOS/Accelerate raises floating-point flags for the unused lanes of its
+    vectorised matmul, so a healthy solve prints "divide by zero", "overflow"
+    and "invalid" at once - noise that trains you to ignore the real thing. A
+    genuinely singular design matrix returns inf/nan coefficients, which would
+    propagate silently into the result; None lets the caller fall back.
+    """
+    with np.errstate(all="ignore"):
+        coef, *_ = np.linalg.lstsq(A, y, rcond=None)
+    return coef if np.all(np.isfinite(coef)) else None
+
+
 def _sanitise(a):
     """float64 with every flavour of nodata turned into NaN."""
     a = np.asarray(a, np.float64)
@@ -114,10 +128,16 @@ def _robust_affine(x, y, iters=5):
     w = np.ones_like(x)
     coef = np.array([1.0, 0.0])
     for _ in range(iters):
-        coef, *_ = np.linalg.lstsq(A * w[:, None], y * w, rcond=None)
-        r = y - A @ coef
-        s = 1.4826 * np.median(np.abs(r - np.median(r))) + 1e-9
-        w = 1.0 / np.sqrt(1 + (r / (2 * s)) ** 2)
+        nxt = _lstsq(A * w[:, None], y * w)
+        if nxt is None:                 # degenerate reweighting - keep the last
+            break
+        coef = nxt
+        with np.errstate(all="ignore"):
+            r = y - A @ coef
+            s = 1.4826 * np.median(np.abs(r - np.median(r))) + 1e-9
+            w = 1.0 / np.sqrt(1 + (r / (2 * s)) ** 2)
+        if not np.all(np.isfinite(w)):
+            break
     return float(coef[0]), float(coef[1])
 
 
@@ -187,32 +207,75 @@ def object_height(surface, sigma_px):
     return np.where(ok, a - gaussian_filter(a, sigma_px), np.nan)
 
 
-def attenuation(pred_obj, ref_obj, min_h=2.0):
+def attenuation(pred_obj, ref_obj, min_h=2.0, materiality=0.01):
     """How short (or tall) predicted structures come out, and the fix.
 
-    alpha is a pure multiplier, so the correction has to be a THROUGH-ORIGIN
-    gain. An affine fit hides part of the scale error in its intercept: on a
-    surface built to be exactly 0.70x, the affine slope reads 1.30 while the
-    true answer is 1/0.70 = 1.43. The median ratio has no intercept to hide in,
-    so that is the number reported as the correction.
+    alpha is a pure multiplier, so the correction is a THROUGH-ORIGIN gain, and
+    the only gain worth recommending is the one that minimises object-band
+    error. That is exactly sum(p*r) / sum(p*p) over every finite pixel: least
+    squares through the origin IS the argmin of squared error, so there is
+    nothing to search and no other single multiplier can beat it.
 
-    Fitted only where the reference says a real structure exists, so flat
-    ground cannot drag the estimate towards 1.
+    WHAT THIS USED TO DO, AND WHY IT WAS WRONG. It reported median(r / p) over
+    a mask that required the REFERENCE to clear min_h but the PREDICTION only
+    0.25 * min_h. That mask keeps every pixel the model MISSED - where r/p
+    explodes - and drops every false positive, where the ratio would collapse.
+    So the statistic measured miss rate, not scale, and was biased upward by
+    construction. Measured on the Rotterdam tile:
+
+        estimator                      gain    object-band RMSE after applying
+        median(r/p)      (old)         2.825   10.83 m
+        median(r)/median(p)            2.366    9.23 m
+        LSQ on the masked pixels       1.102    6.16 m
+        LSQ on the full band  (new)    0.736    5.95 m
+        ---------------------------------------------------------------
+        leaving alpha alone            1.000    6.06 m
+
+    The old answer was not merely imprecise: taking its advice nearly doubled
+    the error, and it pointed the wrong way - these structures are slightly too
+    TALL, not 65% too short. The pooled report inherited the same bias and told
+    every scene to rescale by 1.85.
+
+    The height RATIO is still reported, because "are the buildings the right
+    height" is a fair question - but it is measured only where BOTH surfaces
+    agree a structure exists, and it is no longer used as the multiplier.
+
+    Returns `improves` = False when the best possible gain does not beat 1.0 by
+    `materiality`, which is the signal that the error is in WHERE the height
+    sits rather than how much of it there is. Rescaling cannot fix that.
     """
-    m = (np.isfinite(pred_obj) & np.isfinite(ref_obj)
-         & (ref_obj > min_h) & (pred_obj > 0.25 * min_h))
-    if m.sum() < 50:
-        return dict(n=int(m.sum()), note="not enough structure pixels")
+    p_all = np.asarray(pred_obj, np.float64)
+    r_all = np.asarray(ref_obj, np.float64)
+    fin = np.isfinite(p_all) & np.isfinite(r_all)
+    if fin.sum() < 50:
+        return dict(n=int(fin.sum()), note="not enough finite pixels")
 
-    p, r = pred_obj[m], ref_obj[m]
-    gain = float(np.median(r / p))                  # multiply alpha by this
-    a, b = _robust_affine(p, r)
-    return dict(n=int(m.sum()),
-                height_ratio=float(1.0 / gain),     # predicted / true
-                suggested_alpha_gain=gain,
-                affine_slope=a, affine_intercept=b,
-                pred_p99=float(np.percentile(p, 99)),
-                ref_p99=float(np.percentile(r, 99)))
+    p, r = p_all[fin], r_all[fin]
+    denom = float(np.dot(p, p))
+    gain = float(np.dot(p, r) / denom) if denom > 1e-12 else 1.0
+
+    def _rmse(g):
+        return float(np.sqrt(np.mean((g * p - r) ** 2)))
+
+    rmse_1, rmse_g = _rmse(1.0), _rmse(gain)
+    out = dict(n=int(fin.sum()),
+               suggested_alpha_gain=gain,
+               gain_estimator="through-origin least squares over the full object band",
+               rmse_at_gain_1=rmse_1,
+               rmse_at_suggested=rmse_g,
+               improves=bool(rmse_g < rmse_1 * (1.0 - materiality)))
+
+    # descriptive only: how tall are the structures both sides agree exist
+    m = fin & (p_all > min_h) & (r_all > min_h)
+    if m.sum() >= 50:
+        pm, rm = p_all[m], r_all[m]
+        pp, rp = float(np.percentile(pm, 99)), float(np.percentile(rm, 99))
+        a, b = _robust_affine(pm, rm)
+        out.update(n_structure=int(m.sum()),
+                   height_ratio=pp / max(rp, 1e-9),   # predicted / true
+                   pred_p99=pp, ref_p99=rp,
+                   affine_slope=a, affine_intercept=b)
+    return out
 
 
 # ----------------------------------------------------------------------------
@@ -388,10 +451,25 @@ def to_markdown(rep, units="m"):
     if "height_ratio" in at:
         d = 100 * (at["height_ratio"] - 1)
         word = "short" if d < 0 else "tall"
-        L.append(f"Structures come out **{abs(d):.0f}% too {word}** "
-                 f"(ratio {at['height_ratio']:.2f} over {at['n']:,} structure pixels; "
-                 f"p99 {at['pred_p99']:.1f} vs {at['ref_p99']:.1f} {units}). "
-                 f"Multiply alpha by **{at['suggested_alpha_gain']:.2f}** to correct.\n")
+        L.append(f"Where both surfaces agree a structure exists "
+                 f"({at['n_structure']:,} px), predicted heights run "
+                 f"**{abs(d):.0f}% too {word}** "
+                 f"(p99 {at['pred_p99']:.1f} vs {at['ref_p99']:.1f} {units}).")
+    if at.get("suggested_alpha_gain") is not None:
+        g = at["suggested_alpha_gain"]
+        if at.get("improves"):
+            L.append(f"Best single multiplier on alpha: **{g:.2f}** - it takes "
+                     f"object-band RMSE from {at['rmse_at_gain_1']:.2f} to "
+                     f"{at['rmse_at_suggested']:.2f} {units}. This is least "
+                     f"squares through the origin, which is the argmin of "
+                     f"squared error, so no other single gain does better.\n")
+        else:
+            L.append(f"**Do not rescale.** The best possible multiplier is "
+                     f"{g:.2f} and it does not meaningfully beat leaving alpha "
+                     f"alone ({at['rmse_at_suggested']:.2f} vs "
+                     f"{at['rmse_at_gain_1']:.2f} {units}). The error here is in "
+                     f"WHERE the height sits, not how much of it there is, and "
+                     f"a multiplier cannot move it.\n")
 
     if rep["by_landscape"]:
         L += ["| Landscape | share | RMSE | MAE | Bias | NMAD | r |",

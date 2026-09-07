@@ -276,25 +276,49 @@ def run_scene(scene, outdir, args):
         gcps = cfg["gcps"]
         rec["gcps_used"] = gcps
     elif src == "known-height":
-        # Match the statistic the calibrator actually anchors on.
-        # alpha_from_known_height sets alpha so that the MEDIAN OF EVERYTHING
-        # ABOVE p97 equals the prior. Handing it p99.5 anchors a different,
-        # higher statistic, so every scene came out systematically too tall -
-        # on Rotterdam p99.5 is 49.6 m against a p97 anchor of 21.8 m, and the
-        # scene was scaled more than twice too high. Measured pooled RMSE:
-        # 6.57 m with p99.5, 5.28 m with the matching anchor, 4.96 m ideal.
+        # Match the statistic the calibrator actually anchors on. This pairing
+        # has bitten us twice in opposite directions, so it is now derived
+        # from ONE constant that lives in inference.py rather than a literal
+        # repeated here:
+        #   - hand it p99.5 while the calibrator anchored p97 and every scene
+        #     came out more than twice too tall (pooled 6.57 m vs 5.28 m);
+        #   - leave p97 here after the calibrator moved to p99 and every scene
+        #     comes out too SHORT by the same factor.
+        # If HEIGHT_REFERENCE_PCT changes again, this follows it automatically.
+        #
+        # We deliberately do NOT tune this percentile. Sweeping the stand-in
+        # percentile against the calibrator anchor (de-biased DEM, shift
+        # aligned) gives a surface that is monotonic toward smaller
+        # structures - p90/p99 scores 5.40 m against p99/p99's 6.81 m - but
+        # only because shrinking every structure walks the prediction toward
+        # the do-nothing baseline. Picking that corner would be optimising
+        # for the metric rather than for height estimation. The stand-in
+        # stays matched to what the calibrator's number MEANS.
         kh = cfg.get("known_height_m")
-        if kh:
-            kh = float(kh)
-        else:
-            t = np.percentile(ndsm_ref, 97)
-            top = ndsm_ref[np.isfinite(ndsm_ref) & (ndsm_ref >= t)]
-            kh = float(np.median(top)) if top.size else float(
-                np.percentile(ndsm_ref, 99.5))
-            rec["known_height_source"] = (
-                "median of reference nDSM above p97 - the same anchor "
-                "alpha_from_known_height uses (no prior in scene.json)")
+        if not kh:
+            # THIS USED TO FALL BACK TO THE REFERENCE, and that quietly
+            # invalidated every headline number in the report: the prior that
+            # sets metres-per-unit for the whole scene was read out of the
+            # ground truth the scene is then scored against. A reader who
+            # spots it discounts the entire accuracy table, and rightly.
+            #
+            # It is also unnecessary. Scored with a prior read off the ortho
+            # instead (40 m for Rotterdam, against the p99-of-reference value
+            # this branch used to supply), RMSE went from 9.36 m to 8.45 m -
+            # the honest number was the BETTER one.
+            rec["error"] = (
+                "no known_height_m in scene.json. Add the height of the "
+                "tallest structure you can identify in the ortho - it must "
+                "come from the imagery or an external source, never from the "
+                "reference raster this scene is scored against. Or pass "
+                "--scale-source gcps-from-ref to measure the pipeline's "
+                "ceiling with a deliberately leaky prior, which is a diagnostic "
+                "and never a headline.")
+            return rec
+        kh = float(kh)
         rec["known_height_m"] = kh
+        rec["known_height_source"] = cfg.get(
+            "known_height_source", "scene.json (operator-supplied prior)")
     elif src == "shadow":
         az = cfg.get("sun_azimuth")
         el = cfg.get("sun_elevation")
@@ -309,13 +333,37 @@ def run_scene(scene, outdir, args):
         height, meta2, info = I.estimate_elevation(
             scene["rgb"], known_height_m=kh, gcps=gcps,
             sun_azimuth=az, sun_elevation=el,
-            use_dem=args.use_dem, alpha_gain=args.alpha_gain, outdir=out)
+            use_dem=args.use_dem, alpha_gain=args.alpha_gain, outdir=out,
+            debias_coarse_dem=not args.no_debias)
     except Exception as e:
         traceback.print_exc()
         rec["error"] = f"{type(e).__name__}: {e}"
         return rec
 
     rec["inference_s"] = round(time.time() - t0, 1)
+
+    # ---- score the surface the product actually ships ----------------------
+    # This harness used to validate the raw estimate while both the CLI and the
+    # web UI export a REFINED dsm.tif. That means the published accuracy figure
+    # described a surface no user ever receives. refine() self-checks and
+    # declines when it makes things worse, so running it here costs little and
+    # removes the mismatch. --no-refine reproduces the old behaviour.
+    if not args.no_refine:
+        import refine as R
+        height, rinfo = R.refine(
+            height, rgb, px_size_m=(meta2.get("px_size_m") or 1.0),
+            object_sigma_m=float(info.get("sigma_m") or args.sigma_m),
+            flatten=args.flatten, sharpen=args.sharpen, verbose=False)
+        height, info = I.clip_below_ground(height, info)
+        # meta2 is what estimate_elevation returned: same CRS and transform as
+        # meta, plus the uncertainty raster, which has to be re-exported with
+        # the surface it belongs to
+        info = I.export_products(height, rgb, meta2, out, info,
+                                 uncertainty=meta2.get("_uncertainty"))
+        rec["refine"] = {k: v for k, v in rinfo.items()
+                         if not isinstance(v, np.ndarray)}
+    rec["refined"] = not args.no_refine
+
     rec["info"] = {k: (float(v) if isinstance(v, (int, float, np.floating)) else v)
                    for k, v in info.items() if not isinstance(v, np.ndarray)}
 
@@ -352,6 +400,14 @@ def run_scene(scene, outdir, args):
         return rec
 
     rec["headline_alignment"] = rep.get("headline_alignment")
+    # The headline may be SHIFT-aligned, i.e. a constant vertical offset
+    # computed FROM THE REFERENCE has been removed. That is standard practice
+    # when comparing elevation products on different vertical datums, but it
+    # is not the accuracy of the un-touched output and must never be reported
+    # as if it were. Keep the raw figures beside it.
+    rec["raw_alignment"] = {k: rep.get("alignment", {}).get("raw", {}).get(k)
+                            for k in HEADLINE_KEYS
+                            if k in rep.get("alignment", {}).get("raw", {})}
     rec["headline"] = {k: rep["headline"].get(k) for k in HEADLINE_KEYS
                        if k in rep["headline"]}
     rec["object_band"] = {k: rep["object_band"].get(k) for k in HEADLINE_KEYS
@@ -406,7 +462,32 @@ def build_report(records, args):
           f"Scale source: `{args.scale_source}`"
           + (f" ({args.n_gcps} control points per scene)" if args.scale_source == "gcps-from-ref" else "")
           + f"  \nCoarse DEM terrain baseline: `{'on' if args.use_dem else 'off'}`  ",
-          f"Object/terrain split: {args.sigma_m:g} m  ", ""]
+          f"Object/terrain split: sized per scene from the imagery "
+          f"(the {args.sigma_m:g} m setting is the fallback when that is off)  \n"
+          f"Scored surface: `{'refined - the same dsm.tif the CLI and UI export' if not args.no_refine else 'raw estimate, pre-refine'}`  ", ""]
+
+    # -- how the headline was aligned, stated before any number is shown ------
+    aligns = sorted({r.get("headline_alignment") for r in ok
+                     if r.get("headline_alignment")})
+    if aligns:
+        praw = pool([r["raw_alignment"] for r in ok if r.get("raw_alignment")])
+        L += ["> ### Read this before quoting any figure",
+              "> ",
+              f"> Headline alignment used: {', '.join('`%s`' % a for a in aligns)}. "
+              "`shift` means a single constant vertical offset, **computed from "
+              "the reference**, was subtracted before scoring. Elevation "
+              "products routinely sit on different vertical datums, so removing "
+              "one constant is normal practice - but it is not the accuracy of "
+              "the untouched output, and a figure quoted without this sentence "
+              "is misleading.",
+              "> "]
+        if praw and praw.get("rmse") is not None:
+            L += [f"> Pooled RMSE **with** that offset removed: "
+                  f"**{fmt(pool([r['headline'] for r in ok])['rmse'])} m**.  ",
+                  f"> Pooled RMSE of the raw output, **no alignment at all**: "
+                  f"**{fmt(praw['rmse'])} m**.",
+                  "> "]
+        L += ["> Quote both, or quote the raw one.", ""]
 
     datums = sorted({r.get("scored_against") for r in ok if r.get("scored_against")})
     if datums:
@@ -424,17 +505,20 @@ def build_report(records, args):
         L += ["## Per-scene accuracy", "",
               "All values in metres. `r` is Pearson correlation against the reference; ",
               "`NSE` is Nash-Sutcliffe, which unlike `r` penalises bias and wrong scale.", "",
-              "| Scene | px (m) | RMSE | MAE | MedAE | Bias | NMAD | LE90 | r | NSE |",
-              "|---|--:|--:|--:|--:|--:|--:|--:|--:|--:|"]
+              "| Scene | px (m) | RMSE | RMSE raw | MAE | MedAE | Bias | NMAD | LE90 | r | NSE |",
+              "|---|--:|--:|--:|--:|--:|--:|--:|--:|--:|--:|"]
         for r in ok:
             h = r["headline"]
             L.append(f"| {r['scene']} | {fmt(r.get('px_size_m'))} | "
-                     f"{fmt(h.get('rmse'))} | {fmt(h.get('mae'))} | {fmt(h.get('medae'))} | "
+                     f"{fmt(h.get('rmse'))} | {fmt(r.get('raw_alignment', {}).get('rmse'))} | "
+                     f"{fmt(h.get('mae'))} | {fmt(h.get('medae'))} | "
                      f"{fmt(h.get('bias'))} | {fmt(h.get('nmad'))} | {fmt(h.get('le90'))} | "
                      f"{fmt(h.get('r'), 3)} | {fmt(h.get('nash_sutcliffe'), 3)} |")
         p = pool([r["headline"] for r in ok])
         if p:
-            L.append(f"| **pooled** | | **{fmt(p['rmse'])}** | **{fmt(p.get('mae'))}** | "
+            _praw = pool([r["raw_alignment"] for r in ok if r.get("raw_alignment")])
+            L.append(f"| **pooled** | | **{fmt(p['rmse'])}** | "
+                     f"**{fmt((_praw or {}).get('rmse'))}** | **{fmt(p.get('mae'))}** | "
                      f"{fmt(p.get('medae'))} | {fmt(p.get('bias'))} | {fmt(p.get('nmad'))} | "
                      f"{fmt(p.get('le90'))} | {fmt(p.get('r'), 3)} | |")
         L.append("")
@@ -453,12 +537,23 @@ def build_report(records, args):
                      f"{fmt(a.get('pred_p99'))} | {fmt(a.get('ref_p99'))} | "
                      f"{fmt(a.get('height_ratio'), 3)} | {fmt(a.get('suggested_alpha_gain'), 3)} |")
         L.append("")
-        gains = [(r.get("attenuation") or {}).get("suggested_alpha_gain")
-                 for r in ok]
-        gains = [g for g in gains if g and np.isfinite(g)]
-        if gains:
+        # Only scenes where the best possible multiplier actually beats 1.0
+        # get a vote. The previous version averaged a biased estimator over
+        # every scene and told you to rescale by 1.85; measured, that made
+        # things worse everywhere. See validate.attenuation for the arithmetic.
+        helpful = [(r.get("attenuation") or {}) for r in ok]
+        gains = [a["suggested_alpha_gain"] for a in helpful
+                 if a.get("improves") and np.isfinite(a.get("suggested_alpha_gain", np.nan))]
+        if gains and len(gains) >= max(1, len(ok) // 2):
             L += [f"Median suggested `--alpha-gain`: **{np.median(gains):.3f}** "
-                  f"(re-run with this to close the attenuation loop).", ""]
+                  f"({len(gains)} of {len(ok)} scenes improve under a pure "
+                  f"multiplier; the rest are misplaced height, which no gain "
+                  f"can fix).", ""]
+        else:
+            L += [f"**No alpha-gain is recommended.** Only {len(gains)} of "
+                  f"{len(ok)} scenes improve under any single multiplier, so "
+                  f"the dominant error is WHERE height sits, not how much of "
+                  f"it there is. Rescaling would trade one error for another.", ""]
 
         # -- stratified -------------------------------------------------------
         L += ["## Stability across landscape types", "",
@@ -531,9 +626,16 @@ def build_report(records, args):
               "point heights cannot fake across a whole scene.", ""]
     elif args.scale_source == "known-height":
         L += ["Each scene was calibrated from **one semantic prior** - roughly how "
-              "tall the tallest sustained structure is. Where `scene.json` did not "
-              "supply one, the p99.5 of the reference nDSM stood in, which is noted "
-              "per scene in `results.json`.", ""]
+              "tall the tallest sustained structure is - read off the ortho and "
+              "stored in `scene.json`. No reference elevation enters the "
+              "calibration. A scene without a prior is reported as a failure "
+              "rather than silently borrowing one from the ground truth, which "
+              "is what this harness used to do.", ""]
+        L += ["| Scene | prior | where it came from |", "|---|--:|---|"]
+        for r in ok:
+            L.append(f"| {r['scene']} | {fmt(r.get('known_height_m'), 0)} m | "
+                     f"{r.get('known_height_source', 'scene.json')} |")
+        L.append("")
     elif args.scale_source == "shadow":
         L += ["Scale came from **shadow length** against the sun angles, so no "
               "reference elevation entered the calibration at all. This is the only "
@@ -580,6 +682,16 @@ def main():
     g.add_argument("--no-dem", dest="use_dem", action="store_false",
                    help="skip the DEM; output is height above local ground and "
                         "is scored against the reference nDSM")
+    ap.add_argument("--no-debias", action="store_true",
+                    help="ablation: leave rooftop contamination in the coarse "
+                         "elevation model")
+    ap.add_argument("--no-refine", action="store_true",
+                    help="score the raw estimate instead of the refined surface "
+                         "the CLI and UI actually export (the old behaviour)")
+    ap.add_argument("--flatten", type=float, default=0.8,
+                    help="refine: structure plane-fit strength")
+    ap.add_argument("--sharpen", type=float, default=0.4,
+                    help="refine: object-band unsharp amount")
     ap.add_argument("--no-figures", action="store_true")
     ap.add_argument("--limit", type=int, default=0, help="score only the first N scenes")
     ap.add_argument("--only", default=None, help="comma-separated scene names")

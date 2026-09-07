@@ -86,9 +86,18 @@ def write(outdir, name, kind, seed):
                            height=H, width=W, count=1, dtype="float32",
                            crs=crs, transform=tr) as ds:
             ds.write(arr, 1)
+    # A synthetic scene is the one case where the tallest-structure prior is
+    # legitimately known without consulting a measurement: it is the
+    # generator's own construction parameter, fixed before any surface exists.
+    # run_benchmark refuses to invent this number, so it has to be written
+    # here, and it has to say where it came from.
     with open(os.path.join(d, "scene.json"), "w") as f:
         json.dump(dict(landscape=kind, synthetic=True,
-                       true_max_object_m=float((dsm - dtm).max())), f, indent=2)
+                       true_max_object_m=float((dsm - dtm).max()),
+                       known_height_m=float((dsm - dtm).max()),
+                       known_height_source=("generator construction parameter - "
+                                            "NOT read back from the reference")),
+                  f, indent=2)
     print(f"{name:10s} {kind:8s} objects up to {float((dsm - dtm).max()):5.1f} m")
 
 

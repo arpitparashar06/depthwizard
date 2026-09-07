@@ -29,10 +29,37 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 
-from inference import estimate_elevation, load_image, export_products
-from mesh_builder import build_mesh, build_city, export_mesh, slope_map
-from refine import refine
-import validate as V
+
+def _load_env():
+    """Read KEY=value lines from .env BEFORE anything imports inference.
+
+    inference.py binds OPENTOPO_KEY at module import time, so this has to run
+    first or the key reads as empty, fetch_dem is rejected, and every
+    georeferenced run through the UI quietly returns height above local ground
+    while still tagging the GeoTIFF MODE=absolute. run_benchmark.py has always
+    done this - the web path never did, which is why the benchmark had a
+    terrain baseline and the UI did not. Real environment variables still win.
+    """
+    here = os.path.dirname(os.path.abspath(__file__))
+    path = os.path.join(here, ".env")
+    if not os.path.exists(path):
+        return
+    with open(path) as f:
+        for line in f:
+            line = line.strip()
+            if not line or line.startswith("#") or "=" not in line:
+                continue
+            k, v = line.split("=", 1)
+            os.environ.setdefault(k.strip(), v.strip().strip("'\""))
+
+
+_load_env()
+
+from inference import (estimate_elevation, load_image, export_products,  # noqa: E402
+                       clip_below_ground)
+from mesh_builder import build_mesh, build_city, export_mesh, slope_map  # noqa: E402
+from refine import refine                                               # noqa: E402
+import validate as V                                                    # noqa: E402
 
 ROOT = os.path.dirname(os.path.abspath(__file__))
 JOBS_DIR = os.path.join(ROOT, "jobs")
@@ -78,7 +105,28 @@ def _run(job_id, src_path, params):
         if mode == "absolute":
             src = params.get("scale_source", "known_height")
             if src == "known_height":
-                kh = float(params.get("known_height_m") or 40)
+                # No default here. alpha is metres per model unit and this one
+                # number sets it for the whole scene, so quietly falling back to
+                # 40 m rescales every elevation in the output while the UI still
+                # reports metres. A GeoTIFF carrying sun angles can calibrate
+                # itself; anything else has to be told.
+                raw = params.get("known_height_m")
+                kh = float(raw) if raw not in (None, "") else 0.0
+                if kh <= 0:
+                    if (meta.get("sun_azimuth") is not None
+                            and meta.get("sun_elevation") is not None):
+                        kh = None
+                        _log(job_id, "no height prior given - calibrating from "
+                                     "the sun angles in the GeoTIFF tags")
+                    else:
+                        raise ValueError(
+                            "This image is georeferenced, so the output is in "
+                            "metres - and metres need a scale anchor. Enter the "
+                            "height of the tallest structure you can identify "
+                            "in the scene, or supply ground control points or "
+                            "sun angles. There is no way to turn relative depth "
+                            "into metres without one, and a guessed value "
+                            "rescales every elevation in the scene.")
             elif src == "gcps":
                 gcps = params.get("gcps") or []
                 if len(gcps) < 2:
@@ -91,10 +139,34 @@ def _run(job_id, src_path, params):
         _log(job_id, f"running depth backbone ({os.environ.get('DEPTH_MODEL', 'Large')})")
         height, meta, info = estimate_elevation(
             src_path, known_height_m=kh, gcps=gcps,
+            rotations=int(params.get("rotations") or 4),
+            adaptive_sigma=bool(params.get("adaptive_sigma", True)),
+            height_reference=params.get("height_reference") or "tallest",
+            debias_coarse_dem=bool(params.get("debias_coarse_dem", True)),
             sun_azimuth=az, sun_elevation=el,
             use_dem=bool(params.get("use_dem", True)),
             alpha_gain=float(params.get("alpha_gain") or 1.0),
             outdir=out)
+
+        # The coarse-DEM fetch happens deep inside estimate_elevation and its
+        # failure is caught there, so without this the only trace is the
+        # server's stdout. It matters: with no DEM the surface is height above
+        # LOCAL GROUND while dsm.tif still carries MODE=absolute and
+        # UNITS=metres. Anyone scoring that against a sea-level reference sees
+        # a datum-sized error and blames the depth model.
+        if mode == "absolute":
+            calib = info.get("calibration", "")
+            if "no DEM" in calib:
+                _log(job_id, "WARNING: coarse DEM unavailable - the surface is "
+                             "height above LOCAL GROUND, not above sea level. "
+                             "Score it against an nDSM, not an absolute DSM.")
+            else:
+                dbg = info.get("dem_debias_m")
+                _log(job_id, "terrain baseline from COP30" +
+                     (f", rooftop bias removed ({dbg:.2f} m)"
+                      if isinstance(dbg, (int, float)) else ""))
+            if isinstance(info.get("alpha"), (int, float)):
+                _log(job_id, f"scale: alpha={info['alpha']:.3f} m per model unit")
 
         px = meta.get("px_size_m") or float(params.get("gsd_m") or 0.5)
         if mode == "relative":
@@ -104,24 +176,40 @@ def _run(job_id, src_path, params):
             height = height * scale
             meta = dict(meta, px_size_m=px)
             info["relative_full_scale_m"] = scale
+            if meta.get("_uncertainty") is not None:
+                # the uncertainty is in the same units as the surface, so it
+                # has to travel with it through the rescale
+                meta["_uncertainty"] = meta["_uncertainty"] * scale
             _log(job_id, f"relative mode scaled to {scale:.0f} m full range")
 
         _set(job_id, progress=0.6)
         rinfo = {}
         if params.get("flatten", 0.8) or params.get("sharpen", 0.4):
             _log(job_id, "refining against image edges")
+            # Use the split the pipeline measured for THIS scene. refine's own
+            # 15 m default is narrower than the buildings in a dense tile, so
+            # the middle of a large footprint reads as terrain and never gets
+            # flattened - the exact failure inference.py's frequency split
+            # exists to avoid. refine still self-checks and declines if the
+            # result is less crisp than what it was handed.
             height, rinfo = refine(height, rgb, px_size_m=px,
+                                   object_sigma_m=float(info.get("sigma_m") or 15.0),
                                    flatten=float(params.get("flatten", 0.8)),
                                    sharpen=float(params.get("sharpen", 0.4)))
             if rinfo.get("applied") is False:
                 _log(job_id, "refinement declined - it reduced edge crispness")
+
+        # refine's unsharp pass overshoots at rooflines, so the no-DEM clip has
+        # to be re-applied to the surface that actually gets exported
+        height, info = clip_below_ground(height, info)
 
         # The surface has moved since estimate_elevation exported it: a relative
         # scene was rescaled into metres, and refine may have altered it. Write
         # the rasters again so dsm.tif, ndsm.tif, height16.png and the mesh are
         # all the SAME surface - otherwise the elevation map on disk and the 3D
         # model disagree, and validation scores a raster nobody ever sees.
-        info = export_products(height, rgb, meta, out, info)
+        info = export_products(height, rgb, meta, out, info,
+                               uncertainty=meta.get("_uncertainty"))
         _log(job_id, "products re-exported from the final surface")
 
         _set(job_id, progress=0.75)
@@ -160,6 +248,10 @@ def _run(job_id, src_path, params):
         result = dict(
             mode=mode, width=int(rgb.shape[1]), height=int(rgb.shape[0]),
             px_size_m=float(px),
+            # what the numbers are measured FROM - the one fact a reader needs
+            # before quoting any elevation out of this run
+            datum=("local ground" if "no DEM" in info.get("calibration", "")
+                   else "sea level" if mode == "absolute" else "relative"),
             min_m=float(np.nanmin(height)), max_m=float(np.nanmax(height)),
             relief_m=float(np.nanmax(height) - np.nanmin(height)),
             median_slope_deg=float(np.nanmedian(slope)),

@@ -1,3 +1,27 @@
+> # SUPERSEDED - DO NOT QUOTE THESE NUMBERS
+>
+> This report was generated before two defects were fixed, and both of them
+> affect the figures below.
+>
+> 1. **The scale prior leaked from the ground truth.** No `scene.json` carried
+>    a `known_height_m`, so the harness fell back to a percentile of the
+>    reference nDSM - the very raster each scene is then scored against. Every
+>    headline number here was calibrated with the answer. The scenes now ship
+>    priors read off the ortho, and the harness refuses to invent one.
+> 2. **The suggested `--alpha-gain` of 1.853 is wrong and would make things
+>    worse.** The estimator behind it measured miss rate rather than scale.
+>    Measured on Rotterdam: it advised x2.83 where the error-minimising gain
+>    was x0.74, taking object-band RMSE from 6.06 m to 10.83 m.
+>
+> Regenerate before quoting anything:
+>
+> ```bash
+> python benchmark/run_benchmark.py --scenes benchmark/scenes --out benchmark/results
+> ```
+>
+> For reference, Rotterdam re-run by hand with an honest 40 m prior scored
+> **RMSE 8.45 m** against the 9.36 m below - the leak was not even helping.
+
 # DepthWizard - DSM accuracy against reference LiDAR
 
 Scenes attempted: **4**, scored: **4**, failed: **0**  
@@ -5,6 +29,15 @@ Depth backbone: `depth-anything/Depth-Anything-V2-Large-hf`
 Scale source: `known-height`  
 Coarse DEM terrain baseline: `on`  
 Object/terrain split: 15 m  
+
+> ### Read this before quoting any figure
+> 
+> Headline alignment used: `shift`. `shift` means a single constant vertical offset, **computed from the reference**, was subtracted before scoring. Elevation products routinely sit on different vertical datums, so removing one constant is normal practice - but it is not the accuracy of the untouched output, and a figure quoted without this sentence is misleading.
+> 
+> Pooled RMSE **with** that offset removed: **6.79 m**.  
+> Pooled RMSE of the raw output, **no alignment at all**: **11.96 m**.
+> 
+> Quote both, or quote the raw one.
 
 Scored against: `absolute DSM (metres above sea level)`.  
 When no coarse DEM supplies the terrain baseline the pipeline emits height above local ground, so it is scored against the reference nDSM rather than the absolute surface - otherwise the terrain the prediction never claimed to know would dominate the error.
@@ -14,13 +47,13 @@ When no coarse DEM supplies the terrain baseline the pipeline emits height above
 All values in metres. `r` is Pearson correlation against the reference; 
 `NSE` is Nash-Sutcliffe, which unlike `r` penalises bias and wrong scale.
 
-| Scene | px (m) | RMSE | MAE | MedAE | Bias | NMAD | LE90 | r | NSE |
-|---|--:|--:|--:|--:|--:|--:|--:|--:|--:|
-| ahn_delft_old | 0.50 | 6.02 | 4.73 | 3.94 | -0.25 | 5.85 | 9.65 | 0.744 | -0.440 |
-| ahn_flevoland_farm | 0.50 | 6.37 | 4.71 | 3.39 | 0.26 | 5.03 | 10.97 | 0.551 | -1.567 |
-| ahn_rotterdam_centre | 0.50 | 7.42 | 4.76 | 3.17 | -0.31 | 4.70 | 10.55 | 0.533 | 0.153 |
-| ahn_veluwe_forest | 0.50 | 1.70 | 1.05 | 0.48 | -0.34 | 0.71 | 3.02 | 0.678 | 0.260 |
-| **pooled** | | **5.80** | **3.80** | 2.72 | -0.17 | 4.04 | 8.52 | 0.625 | |
+| Scene | px (m) | RMSE | RMSE raw | MAE | MedAE | Bias | NMAD | LE90 | r | NSE |
+|---|--:|--:|--:|--:|--:|--:|--:|--:|--:|--:|
+| ahn_delft_old | 0.50 | 7.40 | 21.04 | 5.61 | 4.25 | -1.43 | 6.30 | 13.12 | 0.706 | -1.177 |
+| ahn_flevoland_farm | 0.50 | 4.96 | 6.05 | 3.55 | 2.36 | 0.28 | 3.51 | 8.32 | 0.557 | -0.551 |
+| ahn_rotterdam_centre | 0.50 | 9.36 | 9.43 | 5.42 | 3.13 | 0.81 | 4.64 | 10.75 | 0.409 | -0.349 |
+| ahn_veluwe_forest | 0.50 | 4.08 | 4.09 | 2.55 | 1.19 | -0.67 | 1.76 | 7.07 | -0.183 | -3.257 |
+| **pooled** | | **6.79** | **11.96** | **4.27** | 2.72 | -0.24 | 4.03 | 9.78 | 0.366 | |
 
 ## Structure heights only (object band)
 
@@ -30,12 +63,12 @@ number that reflects the depth model rather than the DEM.
 
 | Scene | RMSE | MAE | Bias | r | pred p99 | ref p99 | height ratio | suggested alpha gain |
 |---|--:|--:|--:|--:|--:|--:|--:|--:|
-| ahn_delft_old | 5.48 | 4.29 | 0.84 | 0.715 | 17.06 | 9.16 | 1.769 | 0.565 |
-| ahn_flevoland_farm | 4.31 | 2.89 | 0.19 | 0.430 | 15.42 | 17.96 | 0.910 | 1.098 |
-| ahn_rotterdam_centre | 5.97 | 3.87 | -0.07 | 0.560 | 24.73 | 35.60 | 0.561 | 1.783 |
-| ahn_veluwe_forest | 1.35 | 0.79 | 0.04 | 0.525 | 6.38 | 6.49 | 0.936 | 1.068 |
+| ahn_delft_old | 5.47 | 4.34 | 0.84 | 0.718 | 16.32 | 9.08 | 1.817 | 0.550 |
+| ahn_flevoland_farm | 3.04 | 1.86 | 0.16 | 0.405 | 6.83 | 17.96 | 0.453 | 2.209 |
+| ahn_rotterdam_centre | 6.18 | 3.96 | -0.07 | 0.520 | 26.79 | 35.73 | 0.496 | 2.018 |
+| ahn_veluwe_forest | 2.30 | 1.30 | -0.02 | -0.499 | 4.08 | 5.55 | 0.592 | 1.688 |
 
-Median suggested `--alpha-gain`: **1.083** (re-run with this to close the attenuation loop).
+Median suggested `--alpha-gain`: **1.853** (re-run with this to close the attenuation loop).
 
 ## Stability across landscape types
 
@@ -44,21 +77,21 @@ Classes are proxies derived from the reference surface and the imagery
 
 | Landscape | scenes | share % | RMSE | MAE | Bias | NMAD | r |
 |---|--:|--:|--:|--:|--:|--:|--:|
-| urban | 4 | 27.8 | 7.50 | 5.58 | 0.17 | 6.45 | 0.507 |
-| sparse | 4 | 58.8 | 4.66 | 2.88 | -0.21 | 3.07 | 0.638 |
-| hilly | 1 | 4.9 | 3.39 | 2.11 | -0.70 | 1.88 | 0.834 |
-| forest | 4 | 12.2 | 6.29 | 4.11 | -0.67 | 4.45 | 0.553 |
+| urban | 4 | 27.8 | 7.61 | 5.40 | 0.21 | 6.06 | 0.456 |
+| sparse | 4 | 58.8 | 5.87 | 3.36 | 0.06 | 3.41 | 0.608 |
+| hilly | 1 | 4.9 | 3.60 | 2.23 | -1.79 | 1.70 | 0.935 |
+| forest | 4 | 12.2 | 8.75 | 6.16 | -2.48 | 6.20 | 0.070 |
 
-Spread: **4.11 m** between `hilly` (3.39 m) and `urban` (7.50 m), a ratio of **2.21x**.
+Spread: **5.15 m** between `hilly` (3.60 m) and `forest` (8.75 m), a ratio of **2.43x**.
 
 ## Accuracy by structure height
 
 | Height band | scenes | share % | RMSE | MAE | Bias |
 |---|--:|--:|--:|--:|--:|
-| ground (<2 m) | 4 | 75.1 | 3.86 | 2.37 | 0.48 |
-| low (2-10 m) | 4 | 18.5 | 5.81 | 4.51 | 0.50 |
-| mid (10-30 m) | 3 | 3.3 | 8.45 | 7.20 | -7.11 |
-| high (>30 m) | 1 | 0.5 | 32.67 | 30.46 | -30.46 |
+| ground (<2 m) | 4 | 75.1 | 3.61 | 2.14 | 0.66 |
+| low (2-10 m) | 4 | 18.5 | 5.97 | 4.80 | -0.21 |
+| mid (10-30 m) | 3 | 3.3 | 9.29 | 8.41 | -8.32 |
+| high (>30 m) | 1 | 0.5 | 31.93 | 30.11 | -30.11 |
 
 ## How scale was set
 

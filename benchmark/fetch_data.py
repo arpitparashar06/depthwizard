@@ -57,13 +57,13 @@ UA = {"User-Agent": "depthwizard-benchmark/1.0"}
 AOIS = {
     "ahn": {
         "rotterdam_centre": ("EPSG:28992", 92600, 436700, "urban",
-                             "high-rise core, the hardest urban case"),
+                             "mid-rise perimeter blocks around a park, 6-10 storeys"),
         "delft_old":        ("EPSG:28992", 84400, 447300, "urban",
                              "dense low-rise, narrow streets"),
         "flevoland_farm":   ("EPSG:28992", 165000, 502000, "sparse",
-                             "flat reclaimed farmland, almost no structure"),
+                             "motorway and canal corridor with deciduous shelter belts"),
         "veluwe_forest":    ("EPSG:28992", 185500, 464000, "forest",
-                             "closed canopy; DSM returns treetops"),
+                             "a third conifer plantation, the rest open heath and a pond"),
     },
     "swisstopo": {
         "zurich_centre":    ("EPSG:2056", 2683400, 1247500, "urban",
@@ -473,6 +473,16 @@ def main():
                 with open(os.path.join(d, "scene.json"), "w") as f:
                     json.dump(info, f, indent=2)
                 print(f"    -> {d}")
+                # run_benchmark refuses to invent the scale prior, and it must
+                # never come from the reference raster this scene is scored
+                # against. So a freshly fetched scene is not runnable until a
+                # human looks at the ortho and writes the number down.
+                print(f"       ACTION NEEDED: open {os.path.join(d, 'rgb.tif')} "
+                      f"and add to scene.json:")
+                print(f'         "known_height_m": <height of the tallest '
+                      f'structure you can identify, in metres>,')
+                print(f'         "known_height_source": "read off the ortho - '
+                      f'NOT from the reference"')
                 made.append(scene)
             except Exception as e:
                 print(f"    FAILED  {type(e).__name__}: {str(e)[:200]}")

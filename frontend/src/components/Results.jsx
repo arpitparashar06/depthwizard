@@ -51,10 +51,15 @@ function Datum ({ res }) {
   )
 }
 
-export default function Results ({ res, job, fileUrl }) {
+export default function Results ({ res, job, fileUrl, extraFiles = [] }) {
   if (!res) return null
   const u = res.datum === 'relative' ? 'm*' : 'm'
-  const files = (res.files || []).filter((f) => !f.startsWith('source'))
+  // res.files is the folder listing as it stood when the run finished. The
+  // validator writes five more files into it afterwards, so they are merged in
+  // here rather than being undownloadable until the page is reloaded.
+  const files = [...new Set([...(res.files || []), ...extraFiles])]
+    .filter((f) => !f.startsWith('source'))
+    .sort()
 
   return (
     <>
@@ -108,6 +113,17 @@ export default function Results ({ res, job, fileUrl }) {
             <tr>
               <td>Tallest extruded</td>
               <td className="mono">{Number(res.info.height_max_m || 0).toFixed(0)} m</td>
+            </tr>
+          )}
+          {res.info?.depth_inverted === true && (
+            <tr>
+              <td>Depth flipped</td>
+              <td className="mono">
+                yes · luma-depth r {Number(res.info.luma_depth_r ?? 0).toFixed(2)}
+                <span style={{ color: 'var(--faint)' }}> · the backbone read this
+                  scene upside down and it was corrected. If buildings look like
+                  pits, this is the reason.</span>
+              </td>
             </tr>
           )}
           {res.info?.self_check?.rmse_m != null && (

@@ -32,8 +32,10 @@ sys.path.insert(0, REPO)
 
 # inference.py reads OPENTOPO_KEY from the environment and nothing loads .env
 # for it, so do that here rather than making the caller remember.
-_envf = os.path.join(REPO, ".env")
-if os.path.exists(_envf):
+for _envf in (os.path.join(os.path.dirname(REPO), ".env"),   # repo root
+              os.path.join(REPO, ".env")):                   # mathsandml/
+    if not os.path.exists(_envf):
+        continue
     for _line in open(_envf):
         _line = _line.strip()
         if _line and not _line.startswith("#") and "=" in _line:

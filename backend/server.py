@@ -1,22 +1,48 @@
 """
-server.py - FastAPI backend. Replaces the Gradio app entirely.
+server.py - the web API. Takes an upload, runs the pipeline, serves the results.
 
-Gradio was doing three jobs badly at once: HTTP server, UI framework, and file
-host. Splitting them means the React front end owns the interface, this file
-owns the pipeline, and the 3D viewer stops being an iframe pointing at a second
-localhost port.
+===========================================================================
+READ THIS FIRST
+===========================================================================
+Five endpoints, and one function that does all the work:
 
-    uvicorn server:app --reload --port 8000
+    POST /api/jobs                  upload an image + settings -> {job_id}
+                                    starts _run() on a background thread and
+                                    returns immediately
+    GET  /api/jobs/{id}             status, progress 0..1, log lines, result
+                                    the browser polls this about once a second
+    GET  /api/jobs/{id}/files/{n}   download dsm.tif, terrain.glb, a figure...
+    POST /api/jobs/{id}/validate    upload reference LiDAR -> accuracy report
+    GET  /api/health                which model checkpoint is loaded
 
-Nothing in inference.py, buildings.py, mesh_builder.py or validate.py changed
-to support this - they were already plain functions. Only the shell moved.
+    _run(job_id, path, params)      THE WHOLE PIPELINE, in order:
+        load_image()                 what did we just get, and does it have
+                                     coordinates
+        [decide the scale source]    landmark height / control points / sun
+                                     angles - and REFUSE to run a georeferenced
+                                     image without one
+        estimate_elevation()         inference.py: the elevation map
+        [rescale]                    a PNG has no metres, so stretch 0..1 onto
+                                     a nominal full-scale height
+        refine()                     refine.py: domes -> flat roofs
+        clip_below_ground()          nothing sits below its own ground
+        export_products()            rewrite the rasters from the FINAL surface
+        build_city()                 mesh_builder.py: the .glb
+        [write result.json]          so a server restart does not lose the job
 
-Jobs run on a worker thread with a progress log, because a Large-backbone run
-on CPU takes minutes and a blocking request would time out in the browser.
+WHY A BACKGROUND THREAD. A Large-backbone run on a laptop CPU takes minutes.
+An HTTP request that waits for it times out in the browser, so the job runs on
+a worker thread and the browser watches its progress log instead.
+
+WHY THE JOB FOLDER IS THE DATABASE. Every product lands in jobs/<id>/, result
+included. There is nothing to set up, and a finished run survives a restart.
+
+    Run it:  python backend/server.py       (or: uvicorn server:app --reload)
 """
 
 import os
 import io
+import logging
 import json
 import shutil
 import uuid
@@ -30,30 +56,14 @@ from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 
 
-def _load_env():
-    """Read KEY=value lines from .env BEFORE anything imports inference.
+# _bootstrap puts ../mathsandml on the import path and reads the repo-root
+# .env. It has to come first: inference binds OPENTOPO_KEY at import time, so
+# a late .env read leaves the key empty, fetch_dem is refused, and every
+# georeferenced run quietly returns height above local ground while still
+# tagging the GeoTIFF MODE=absolute.
+from _bootstrap import ROOT, JOBS_DIR, FRONTEND_DIST, load_env  # noqa: E402
 
-    inference.py binds OPENTOPO_KEY at module import time, so this has to run
-    first or the key reads as empty, fetch_dem is rejected, and every
-    georeferenced run through the UI quietly returns height above local ground
-    while still tagging the GeoTIFF MODE=absolute. run_benchmark.py has always
-    done this - the web path never did, which is why the benchmark had a
-    terrain baseline and the UI did not. Real environment variables still win.
-    """
-    here = os.path.dirname(os.path.abspath(__file__))
-    path = os.path.join(here, ".env")
-    if not os.path.exists(path):
-        return
-    with open(path) as f:
-        for line in f:
-            line = line.strip()
-            if not line or line.startswith("#") or "=" not in line:
-                continue
-            k, v = line.split("=", 1)
-            os.environ.setdefault(k.strip(), v.strip().strip("'\""))
-
-
-_load_env()
+load_env()
 
 from inference import (estimate_elevation, load_image, export_products,  # noqa: E402
                        clip_below_ground)
@@ -61,8 +71,6 @@ from mesh_builder import build_mesh, build_city, export_mesh, slope_map  # noqa:
 from refine import refine                                               # noqa: E402
 import validate as V                                                    # noqa: E402
 
-ROOT = os.path.dirname(os.path.abspath(__file__))
-JOBS_DIR = os.path.join(ROOT, "jobs")
 os.makedirs(JOBS_DIR, exist_ok=True)
 
 RELATIVE_FULL_SCALE_M = 60.0
@@ -79,9 +87,70 @@ JOBS = {}
 LOCK = threading.Lock()
 
 
+class _QuietPolling(logging.Filter):
+    """Drop the status-poll requests from uvicorn's access log.
+
+    The browser polls GET /api/jobs/{id} roughly once a second for the whole
+    run, so a five-minute job buries every line of real pipeline progress under
+    three hundred identical 200 OKs. Everything else still logs normally, and
+    DEPTHWIZARD_LOG_POLLS=1 puts them back for debugging.
+    """
+    def filter(self, record):
+        if os.environ.get("DEPTHWIZARD_LOG_POLLS"):
+            return True
+        msg = record.getMessage()
+        return not ('GET /api/jobs/' in msg and 'files/' not in msg)
+
+
+logging.getLogger("uvicorn.access").addFilter(_QuietPolling())
+
+
 def _set(job_id, **kw):
     with LOCK:
         JOBS[job_id].update(kw)
+
+
+# Measured: a 600x600 tile is 9 tiles, 4 passes, ~64 s end to end on a laptop
+# CPU with the Large backbone - so about 1.5 s per model run once the mesh and
+# refine stages are accounted for separately.
+SECONDS_PER_TILE = 1.5
+
+
+def _tile_count(H, W, tile=518, overlap=180):
+    """Same arithmetic predict_depth uses, so the estimate matches reality."""
+    if H <= tile and W <= tile:
+        return 1
+    step = tile - overlap
+    # clamp then dedupe, exactly as predict_depth does - see the note there
+    rows = {min(r, max(0, H - tile))
+            for r in (*range(0, max(1, H - overlap), step), max(0, H - tile))}
+    cols = {min(c, max(0, W - tile))
+            for c in (*range(0, max(1, W - overlap), step), max(0, W - tile))}
+    return len(rows) * len(cols)
+
+
+def _parse_gcps(raw):
+    """[[row, col, height_m], ...] or [{row, col, height_m}, ...] -> tuples.
+
+    The browser sends JSON, so a control point arrives as a list or an object
+    depending on who wrote the form. alpha_from_gcps unpacks three values per
+    entry, so normalise here rather than making the science module guess.
+    """
+    out = []
+    for g in (raw or []):
+        if isinstance(g, dict):
+            r = g.get("row"); c = g.get("col")
+            h = g.get("height_m", g.get("h", g.get("height")))
+        else:
+            try:
+                r, c, h = g
+            except (TypeError, ValueError):
+                raise ValueError(f"a ground control point needs row, col and "
+                                 f"height - got {g!r}")
+        if r in (None, "") or c in (None, "") or h in (None, ""):
+            continue
+        out.append((int(float(r)), int(float(c)), float(h)))
+    return out
 
 
 def _log(job_id, msg):
@@ -100,6 +169,19 @@ def _run(job_id, src_path, params):
         rgb, meta = load_image(src_path)
         mode = meta["mode"]
         _log(job_id, f"{rgb.shape[1]}x{rgb.shape[0]} px, mode={mode}")
+
+        # Cost scales with tile count, not pixel count, and people quite
+        # reasonably assume a stalled-looking terminal means a crash. A
+        # 2352x1222 image is 40 tiles against a 600x600 tile's 9, so the same
+        # settings take minutes rather than one. Say so before it starts.
+        rots = int(params.get("rotations") or 4)
+        n_tiles = _tile_count(rgb.shape[0], rgb.shape[1])
+        est = n_tiles * rots * SECONDS_PER_TILE
+        _log(job_id, f"{n_tiles} tiles x {rots} passes = {n_tiles * rots} model "
+                     f"runs, roughly {est / 60:.0f}-{est * 1.6 / 60:.0f} min on CPU")
+        if est > 180:
+            _log(job_id, "large image - drop rotations to 1, or use the Small "
+                         "backbone (DEPTH_MODEL=...-Small-hf), to go faster")
 
         kh = gcps = az = el = None
         if mode == "absolute":
@@ -128,12 +210,31 @@ def _run(job_id, src_path, params):
                             "into metres without one, and a guessed value "
                             "rescales every elevation in the scene.")
             elif src == "gcps":
-                gcps = params.get("gcps") or []
+                gcps = _parse_gcps(params.get("gcps"))
                 if len(gcps) < 2:
-                    raise ValueError("ground control points need at least two entries")
+                    raise ValueError(
+                        "Ground control points need at least two entries, each "
+                        "row / column / height-above-ground in metres. Two "
+                        "points fix the multiplier; more only make it steadier.")
+                _log(job_id, f"scale from {len(gcps)} ground control points")
+            elif src == "sun":
+                az, el = params.get("sun_azimuth"), params.get("sun_elevation")
+                if az in (None, "") or el in (None, ""):
+                    az, el = meta.get("sun_azimuth"), meta.get("sun_elevation")
+                if az is None or el is None:
+                    raise ValueError(
+                        "Shadow calibration needs the sun azimuth and elevation. "
+                        "Landsat, Sentinel and most commercial products carry "
+                        "them in the GeoTIFF tags; this file does not, so enter "
+                        "them or pick another scale source.")
+                az, el = float(az), float(el)
+                if not (0.0 <= az <= 360.0 and 1.0 <= el <= 89.0):
+                    raise ValueError(f"sun angles out of range: azimuth {az}, "
+                                     f"elevation {el}")
+                _log(job_id, f"scale from shadows, sun at {az:g} / {el:g}")
             else:
-                az = float(params.get("sun_azimuth") or 0)
-                el = float(params.get("sun_elevation") or 45)
+                raise ValueError(f"unknown scale_source {src!r} - expected "
+                                 f"'known_height', 'gcps' or 'sun'")
 
         _set(job_id, progress=0.15)
         _log(job_id, f"running depth backbone ({os.environ.get('DEPTH_MODEL', 'Large')})")
@@ -264,6 +365,13 @@ def _run(job_id, src_path, params):
                   if not isinstance(v, np.ndarray)},
             files=[f for f in sorted(os.listdir(out)) if not f.startswith(".")],
         )
+        # JOBS is an in-memory dict, so a server restart used to lose every
+        # finished job while the browser kept polling its id forever. The
+        # products are all on disk already; writing the result beside them
+        # makes the job recoverable.
+        with open(os.path.join(out, "result.json"), "w") as f:
+            json.dump(result, f, default=float)
+
         _set(job_id, status="done", progress=1.0, result=result)
         _log(job_id, "done")
 
@@ -303,9 +411,29 @@ async def create_job(file: UploadFile = File(...), params: str = Form("{}")):
 def job_status(job_id: str):
     with LOCK:
         j = JOBS.get(job_id)
-    if j is None:
-        raise HTTPException(404, "no such job")
-    return j
+    if j is not None:
+        return j
+
+    # Not in memory. Either this process was restarted, or the id is wrong.
+    # A finished run left result.json behind, so it can still be served.
+    out = os.path.join(JOBS_DIR, job_id)
+    done = os.path.join(out, "result.json")
+    if os.path.exists(done):
+        with open(done) as f:
+            result = json.load(f)
+        return dict(id=job_id, status="done", progress=1.0, result=result,
+                    error=None, log=["recovered from disk after a restart"],
+                    source=next((n for n in sorted(os.listdir(out))
+                                 if n.startswith("source")), None))
+
+    # The folder exists but there is no result: the run was interrupted before
+    # it finished. Say so, rather than 404ing forever while the browser polls.
+    if os.path.isdir(out):
+        raise HTTPException(410, "This run was interrupted before it finished - "
+                                 "the server stopped while it was working. "
+                                 "Upload the image again to restart it.")
+
+    raise HTTPException(404, "no such job")
 
 
 @app.get("/api/jobs/{job_id}/files/{name}")
@@ -351,9 +479,8 @@ def health():
 
 
 # Serve the built front end if it exists, so production is one process.
-_dist = os.path.join(ROOT, "web", "dist")
-if os.path.isdir(_dist):
-    app.mount("/", StaticFiles(directory=_dist, html=True), name="web")
+if os.path.isdir(FRONTEND_DIST):
+    app.mount("/", StaticFiles(directory=FRONTEND_DIST, html=True), name="web")
 
 
 if __name__ == "__main__":

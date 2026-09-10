@@ -1,9 +1,38 @@
 """
 refine.py - make the height map look like buildings instead of hills.
 
-Depth-Anything returns a smooth field. Nothing in it knows that a roof is flat
-or that a wall is vertical, so a 30 m tower arrives as a 30 m dome and the mesh
-reads as terrain. Three passes fix most of it, in this order:
+===========================================================================
+READ THIS FIRST
+===========================================================================
+One function matters: refine(). The rest are its three passes.
+
+THE PROBLEM. Depth-Anything returns a smooth field. Nothing in it knows that a
+roof is flat or that a wall is vertical, so a 30 m tower arrives as a 30 m
+DOME and the mesh reads as terrain instead of a city.
+
+    refine(height, rgb)
+        1. guided_filter()       snap the height edges onto the PHOTO's edges.
+                                 The depth map is blurry at a roofline; the
+                                 photo is not
+        2. flatten_structures()  find each structure and replace it with its
+                                 own best-fit plane. Domes become roofs. This
+                                 is the biggest visual change in the mesh
+        3. sharpen_objects()     put back the contrast the first two shaved
+                                 off - and only on the object band, so flat
+                                 ground is never touched
+        4. _crispness()          measure whether all that actually helped, and
+                                 THROW THE RESULT AWAY IF IT DID NOT
+
+Step 4 is the unusual one. On a dense downtown tile these settings took edge
+definition DOWN by 33%, and that softer surface was what got meshed and
+scored. So the chain now measures itself and declines when it loses.
+
+NOTHING HERE INVENTS DETAIL. It redistributes height the depth model already
+produced into shapes that match the image.
+
+===========================================================================
+
+Three passes fix most of it, in this order:
 
   1. guided filter   - snap height edges onto image edges. The depth map is
                        blurry at building boundaries; the photo is not. Using
@@ -97,8 +126,18 @@ def object_band(height, sigma_px):
 def flatten_structures(height, px_size_m=1.0, object_sigma_m=15.0,
                        min_height_m=2.5, min_area_m2=40.0, strength=0.8,
                        plane=True):
-    """Fit a plane to each connected structure and blend it in.
+    """Turn each dome back into a flat roof.
 
+    IN PLAIN ENGLISH: find every structure standing above the local ground, fit
+    the best flat plane through it, and blend that plane back in. A roof IS
+    planar; the blurry mound the depth model returned is not. Strength 0.8
+    keeps a little of the original texture so the result does not look
+    CAD-generated.
+
+    It is a strong assumption, which is why it is a dial: buildings love it,
+    tree canopy does not.
+
+    ---------------------------------------------------------------------
     A roof is planar. A dome is not. Finding the structures and replacing each
     with its own best-fit plane is a much stronger statement than any amount of
     filtering, and it is the single biggest visual change in the mesh.

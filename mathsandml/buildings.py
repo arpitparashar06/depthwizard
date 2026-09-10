@@ -1,5 +1,41 @@
 """
-buildings.py - turn the nDSM into actual buildings.
+buildings.py - find the buildings in a height map and turn them into solids.
+
+===========================================================================
+READ THIS FIRST
+===========================================================================
+mesh_builder.build_city() calls into here in this order:
+
+    1. ground_surface()       what the ground would be if the buildings were
+                              not there - a morphological opening, i.e. "slide
+                              a plate wider than any building under the
+                              surface and see where it rests"
+    2. normalised_height()    nDSM = surface - that ground. Now every value is
+                              "how tall is the thing standing here"
+    3. extract_footprints()   the outline and height of each building
+       - _segment_by_height()   split a block of touching roofs into buildings
+       - _merge_touching()      put the pieces of ONE roof back together
+       - _regularise_contour()  turn a blobby outline into an architectural one
+    4. flatten_ground()       delete the buildings from the ground surface, so
+                              nothing gets drawn twice
+    5. building_meshes()      extrude each outline into a prism: a flat roof
+                              cap textured from the photo, and vertical walls
+                              textured procedurally
+       - earclip()              triangulate the roof polygon
+
+WHY BOTHER, when the height map alone already has the buildings in it: a
+height map has no OBJECTS. A tower is a bump, its sides are stretched roof
+pixels, and nothing in the file knows where one building ends and the next
+begins. Extruding footprints fixes all three at once.
+
+A nadir photo never saw a wall, so those pixels do not exist and have to be
+generated - facade_texture() draws them.
+
+No new dependencies: the polygon triangulation is ear clipping, written out
+below, because shapely and mapbox_earcut are not worth another install
+problem.
+
+===========================================================================
 
 The heightfield is the reason the scene reads as terrain rather than a city.
 A grid surface has no separate objects: a tower is a bump, its sides are
@@ -39,12 +75,23 @@ def _lstsq(A, y):
 
 
 def ground_surface(dsm, px_size_m=0.5, max_building_m=45.0, smooth_m=8.0):
-    """Bare-ground estimate by morphological opening.
+    """Where would the ground be if the buildings were not there?
 
-    Subtracting a Gaussian low-pass is the obvious way to get height above
-    ground and it fails exactly where it matters. In a dense scene the blur
-    window is mostly roof, so the "ground" it returns floats up inside the
-    buildings. Measured on a synthetic block city at 54% built coverage:
+    IN PLAIN ENGLISH: imagine sliding a flat plate, wider than any building,
+    underneath the surface from below. It touches the streets and the parks and
+    passes straight under the rooftops. Where it rests is the ground. That is
+    all a morphological opening is - an erosion (take the lowest point in the
+    window, which lands on the street) followed by a dilation (restore the
+    shape without lifting it back up). Its result can never be higher than the
+    input, which is exactly what a ground surface must satisfy.
+
+    Blurring the surface instead is the obvious approach and it fails where it
+    matters most: in a dense scene the blur window is mostly ROOF, so the
+    "ground" it returns floats up inside the buildings and every building comes
+    out short.
+
+    ---------------------------------------------------------------------
+    Measured on a synthetic block city at 54% built coverage:
 
         gaussian low-pass       ground +7.88 m too high,  36% of height recovered
         morphological opening   ground +0.09 m,           92% recovered
@@ -172,8 +219,18 @@ def _regularise_contour(contour, eps_px, rect_fill=0.72):
 def _segment_by_height(ndsm, min_height_m, step_m, px_size_m, min_px,
                        peak_window_m=15.0, merge_tol_m=2.5,
                        roof_percentile=75):
-    """Split touching buildings by roof height.
+    """Separate buildings that touch each other, using their roof heights.
 
+    IN PLAIN ENGLISH: in a city centre every roof touches its neighbour, so
+    "find the connected blobs above 2.5 m" returns ONE blob for the whole
+    block - a real downtown tile came back with 3 buildings in it. But
+    neighbours differ in HEIGHT even when they share a wall. So: mark the flat
+    top of each roof (a pixel within one step of the tallest thing near it),
+    then grow those marks outward until they meet. Each roof top claims its own
+    building, and the blurry edges get pulled back into the roof they came
+    from.
+
+    ---------------------------------------------------------------------
     Connected components on a height mask fails in any dense centre: every roof
     touches its neighbour, so the whole block floods into one region. On the
     downtown tile it returned 3 footprints for a scene with a hundred buildings.

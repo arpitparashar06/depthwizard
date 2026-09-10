@@ -5,6 +5,37 @@ Optical RGB → depth → metric elevation → extruded buildings → three.js f
 **PNG / JPG** (no coordinates) → relative surface model.
 **GeoTIFF** (has a CRS) → absolute DSM in metres.
 
+## Where things live
+
+Three folders, so you can find the part you are looking for without reading
+the rest:
+
+```
+backend/       the HTTP API and the command line - FastAPI, jobs, files
+mathsandml/    the science - depth, calibration, geometry, scoring, benchmark
+frontend/      React + Vite + three.js: upload, controls, flythrough, report
+```
+
+The traffic is one-way. `mathsandml/` imports nothing from `backend/`, so every
+piece of the science runs, tests and benchmarks on its own; `backend/` puts
+`mathsandml/` on the import path (`backend/_bootstrap.py`) and calls into it;
+`frontend/` only ever speaks HTTP.
+
+| folder | file | role |
+|---|---|---|
+| `backend/` | `server.py` | FastAPI: jobs, progress, files, validation |
+| | `run_geotiff.py` | one-command CLI: image in, DSM + nDSM + DTM + glTF out |
+| | `_bootstrap.py` | finds `mathsandml/`, reads `.env` before anything imports it |
+| `mathsandml/` | `inference.py` | load → depth → detrend → calibrate → DSM / nDSM / DTM |
+| | `buildings.py` | morphological ground, footprints, extrusion, facades |
+| | `mesh_builder.py` | heightfield and city meshes, glTF export |
+| | `refine.py` | guided filter, structure flattening, edge sharpening |
+| | `validate.py` | RMSE / MAE / r against reference LiDAR, split by landscape |
+| | `benchmark/` | scene fetcher, harness, report, and the regression tests |
+| `frontend/` | `src/App.jsx` | controls: scale source, geometry, the run itself |
+| | `src/Viewer.jsx` | three.js flythrough, click-to-measure, true-metre readouts |
+| | `src/components/` | dropzone, progress, results, validation panel |
+
 ## Run
 
 Two processes in development, one in production.
@@ -16,13 +47,13 @@ Two processes in development, one in production.
 
 
 ```bash
-# 1. backend
+# 1. backend  (from the repo root)
 pip install -r requirements.txt
 # http://127.0.0.1:8000
-python server.py
+python backend/server.py
 
 # 2. front end (separate terminal)
-cd web
+cd frontend
 npm install
 # http://localhost:5173
 npm run dev
@@ -34,20 +65,21 @@ no CORS dance.
 Or skip the browser entirely — one image, one command:
 
 ```bash
-python run_geotiff.py benchmark/scenes/ahn_rotterdam_centre/rgb.tif --tallest 40
+python backend/run_geotiff.py \
+    mathsandml/benchmark/scenes/ahn_rotterdam_centre/rgb.tif --tallest 40
 ```
 
 It writes the same products the UI does, prints what the heights are measured
 from, and takes `--reference <lidar.tif>` to score the result in the same run.
 `--help` lists the calibration flags (`--tallest`, `--gcp`, `--sun`).
 
-For a single process, build the front end once — `server.py` mounts `web/dist`
-at `/` when it exists:
+For a single process, build the front end once — `server.py` mounts
+`frontend/dist` at `/` when it exists:
 
 ```bash
-cd web && npm run build && cd ..
+cd frontend && npm run build && cd ..
 # serves UI + API on http://127.0.0.1:8000
-python server.py
+python backend/server.py
 ```
 
 Or the container, which bakes in both the model weights and the built bundle:
@@ -66,21 +98,6 @@ worth the minutes. To go back:
 ```bash
 export DEPTH_MODEL=depth-anything/Depth-Anything-V2-Small-hf
 ```
-
-## Files
-
-| file | role |
-|---|---|
-| `run_geotiff.py` | one-command CLI: image in, DSM + nDSM + DTM + glTF out, no browser |
-| `server.py` | FastAPI: jobs, progress, files, validation. Replaces the Gradio app |
-| `inference.py` | load → depth → detrend → calibrate → DSM / nDSM / DTM |
-| `buildings.py` | morphological ground, footprint extraction, extrusion, facades |
-| `mesh_builder.py` | heightfield and city meshes, glTF export |
-| `refine.py` | guided filter, structure flattening, edge sharpening |
-| `validate.py` | RMSE / MAE / r against reference LiDAR, split by landscape |
-| `web/` | React + Vite front end with the three.js viewer |
-| `benchmark/test_datum_guard.py` | regression test: a georeferenced run must refuse to guess its scale, and must say what its heights are measured from |
-| `benchmark/test_regressions.py` | regression test: the alpha-gain estimator, the singular-fit guards, the leakage refusal, the post-refine clip |
 
 ## API
 
@@ -132,16 +149,58 @@ Each of these was measured, not assumed.
 7. **Real vertical walls.** A grid mesh cannot represent a vertical face, so
    every roofline becomes a 45° ramp. Stepped geometry emits a flat quad per
    cell joined by true vertical faces, quantised so the surface stays watertight.
+8. **Shadows measured ray by ray, and read off the roof.** The shadow
+   calibrator returned *zero* usable control points on a scene built to order.
+   Three reasons, all now fixed and all covered by `benchmark/tests.py`: it
+   required shadows to be elongated along the sun, so a wide block casting a
+   shorter shadow (ratio 0.74) was rejected as "too circular"; it read the
+   depth at the shadow's object end, which is the pavement at the foot of the
+   wall and reads exactly 0 m above ground; and it measured length across the
+   whole shadow blob, which includes the building's own depth along the sun
+   direction (+71% at azimuth 135°, +108% at 315°). It now bins the shadow
+   across the sun direction and takes the median run, then probes back towards
+   the sun for the roof. On synthetic scenes with the answer built in it
+   recovers a known scale of 3.0 to within 4% at every sun angle tested.
+
+## Reproducing the accuracy numbers
+
+`mathsandml/benchmark/results/report.md` is **stale and says so in its own first
+line** — it predates the calibration-leak fix and the corrected alpha-gain
+estimator, and the three swisstopo scenes (including the only genuinely *hilly*
+one) were downloaded after it was written and have never been scored. Nothing
+in it should be quoted. Regenerate over every scene before showing accuracy to
+anyone:
+
+```bash
+bash mathsandml/benchmark/run_all.sh            # fetch + score + write the report
+SOURCE=all bash mathsandml/benchmark/run_all.sh # AHN + swisstopo + USGS
+FAST=1 bash mathsandml/benchmark/run_all.sh     # Small backbone, first pass
+```
+
+It takes minutes per scene on a CPU with the Large backbone. The report quotes
+both the raw RMSE and the datum-shifted one, and the raw number is the honest
+one.
 
 ## Tests
 
 Neither needs the model weights or the network; both run in seconds.
 
 ```bash
-python benchmark/test_datum_guard.py    # 13 checks
-python benchmark/test_regressions.py    # 34 checks
-python benchmark/selftest.py            # the whole harness on synthetic scenes
+python mathsandml/benchmark/tests.py       # 65 checks, two parts, one exit code
+python mathsandml/benchmark/selftest.py    # the whole harness on synthetic scenes
 ```
+
+`tests.py` is part A, the regressions - every bug found in review, each check
+named after the failure it prevents - and part B, the datum guard, which stubs
+the pipeline and drives the real server to prove an absolute run refuses to
+guess its scale and says what its heights are measured from. It skips the
+per-scene prior checks when `mathsandml/benchmark/scenes/` is absent (that
+folder is gitignored - hundreds of megabytes of LiDAR) and runs everything
+else.
+
+`selftest.py` carries its own synthetic scenes and a stub backbone that
+reproduces the real model's failure modes, so it exercises the whole benchmark
+without downloading 1.3 GB of weights.
 
 ## Known limits
 

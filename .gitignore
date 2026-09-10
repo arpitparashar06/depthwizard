@@ -3,14 +3,14 @@ jobs/
 outputs/
 __pycache__/
 *.pyc
-web/node_modules/
-web/dist/
+frontend/node_modules/
+frontend/dist/
 .DS_Store
 dem_coarse.tif
-benchmark/scenes/
-benchmark/results/
+mathsandml/benchmark/scenes/
+mathsandml/benchmark/results/
 .env
 *.bak
 
 # experiment outputs - the script regenerates them
-benchmark/mode_comparison/
+mathsandml/benchmark/mode_comparison/

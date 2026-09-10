@@ -6,7 +6,8 @@ const ALIGN = {
   affine: ['Robust affine', 'offset and scale removed']
 }
 
-export default function Validation ({ job, report, busy, error, onFile, fileUrl }) {
+export default function Validation ({ job, report, busy, error, onFile, fileUrl,
+                                      datum, stamp }) {
   const inputRef = useRef(null)
   const [over, setOver] = useState(false)
   if (!job) return null
@@ -24,6 +25,19 @@ export default function Validation ({ job, report, busy, error, onFile, fileUrl 
         ground and scoring it raw against a sea-level reference measures the datum
         rather than the model.
       </p>
+
+      {datum === 'local ground' && (
+        <p className="datum risk" style={{ marginTop: 0 }}>
+          <span>
+            <b>Raw RMSE will be meaningless for this run.</b> No coarse DEM was
+            available, so this surface is height above local ground while a reference
+            DSM is metres above sea level. The gap between them is a constant of
+            hundreds of metres, and it will swamp the raw score. Read the{' '}
+            <b>datum shift</b> row — that removes exactly the offset you are missing —
+            or score against an nDSM instead.
+          </span>
+        </p>
+      )}
 
       <div className={`drop${over ? ' over' : ''}`} style={{ padding: '16px 12px' }}
            onDragOver={(e) => { e.preventDefault(); setOver(true) }}
@@ -53,7 +67,9 @@ export default function Validation ({ job, report, busy, error, onFile, fileUrl 
                 const [label, sub] = ALIGN[k]
                 return (
                   <tr key={k} className={report.headline_alignment === k ? 'headline' : ''}>
-                    <td>{label}<br /><span style={{ fontSize: 11, color: 'var(--faint)' }}>{sub}</span></td>
+                    <td>{label}<br /><span style={{ fontSize: 11, color: 'var(--faint)' }}>
+                      {k === 'raw' && datum === 'local ground' ? 'datum offset, not model error' : sub}
+                    </span></td>
                     <td>{m.rmse?.toFixed(2)}</td>
                     <td>{m.mae?.toFixed(2)}</td>
                     <td>{m.bias >= 0 ? '+' : ''}{m.bias?.toFixed(2)}</td>
@@ -86,8 +102,8 @@ export default function Validation ({ job, report, busy, error, onFile, fileUrl 
 
           <div className="figs">
             {['error_map.png', 'scatter.png', 'stability.png'].map((f) => (
-              <a key={f} href={fileUrl(job.id, f)} target="_blank" rel="noreferrer">
-                <img src={fileUrl(job.id, f)} alt={f} loading="lazy" />
+              <a key={f} href={fileUrl(job.id, f, stamp)} target="_blank" rel="noreferrer">
+                <img src={fileUrl(job.id, f, stamp)} alt={f} loading="lazy" />
               </a>
             ))}
           </div>

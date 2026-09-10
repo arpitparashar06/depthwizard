@@ -13,9 +13,9 @@
 # ---------------------------------------------------------------------------
 FROM node:20-slim AS web
 WORKDIR /web
-COPY web/package*.json ./
+COPY frontend/package*.json ./
 RUN npm ci --no-audit --no-fund || npm install --no-audit --no-fund
-COPY web/ ./
+COPY frontend/ ./
 RUN npm run build
 
 # ---------------------------------------------------------------------------
@@ -43,8 +43,12 @@ COPY requirements.txt .
 # torch is installed above; installing it again from PyPI would pull the CUDA build
 RUN grep -viE '^torch' requirements.txt > /tmp/req.txt && pip install -r /tmp/req.txt
 
-COPY *.py ./
-COPY --from=web /web/dist ./web/dist
+# backend/ = API + CLI, mathsandml/ = the science. Nothing else is needed
+# at run time; the benchmark scenes and results are excluded by
+# .dockerignore because they are hundreds of megabytes of LiDAR.
+COPY backend/ ./backend/
+COPY mathsandml/ ./mathsandml/
+COPY --from=web /web/dist ./frontend/dist
 
 # bake the checkpoint in, so the first run needs no network
 RUN python -c "\
@@ -54,4 +58,4 @@ print('checkpoint cached into', os.environ['HF_HOME'])"
 
 EXPOSE 8000
 ENV HOST=0.0.0.0 PORT=8000
-CMD ["python", "server.py"]
+CMD ["python", "backend/server.py"]

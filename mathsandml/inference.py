@@ -1,11 +1,58 @@
 """
-inference.py - single-view RGB -> elevation map.
+inference.py - the elevation engine. One RGB image in, one elevation map out.
 
-Two routes, chosen by METADATA (not file extension):
+===========================================================================
+READ THIS FIRST
+===========================================================================
+Every other function in this file is a step of the one at the bottom,
+estimate_elevation(). This is the order it runs them in:
+
+     1. load_image()              read the file and pick the MODE from its
+                                  metadata: a coordinate system means metres,
+                                  no coordinate system means a relative surface
+     2. predict_depth_ensemble()  run the frozen depth model four times, once
+                                  per 90-degree rotation, and average
+        - predict_depth()         each pass cuts the image into tiles, predicts
+                                  each, and stitches them back together
+     3. validate_depth()          sanity check, and flip the map if the model
+                                  read the scene upside down
+     4. clean_depth()             edge-preserving smooth (never a plain blur -
+                                  that melts buildings into blobs)
+     5. detrend()                 remove the model's fake tilt. Usually SKIPPED,
+                                  because step 2 already cancelled it
+
+   --- a PNG/JPG stops here: normalise to 0..1, export, done ---
+
+     6. structure_scale_m()       measure how wide the buildings are in THIS
+                                  scene
+     7. the frequency split       detail = depth - blur(depth, that width).
+                                  Buildings live in `detail`; terrain lives in
+                                  the blur
+     8. alpha_from_shadows()      METRES PER MODEL UNIT - from shadow lengths,
+        alpha_from_gcps()         or surveyed points, or one landmark height.
+        alpha_from_known_height() The first one that answers wins
+     9. fetch_dem(), debias_dem() a free 30 m global DEM supplies the terrain
+    10. height = terrain + alpha * detail          <-- the actual answer
+    11. _export()                 dsm.tif, ndsm.tif, dtm.tif, uncertainty.tif,
+                                  height16.png, texture.png, meta.json
+
+===========================================================================
+THE ONE IDEA
+===========================================================================
+A depth model can only RANK heights. It says "this roof is higher than that
+street"; it never says "this roof is 31 metres". Turning a ranking into metres
+takes one real measurement from somewhere, and step 8 is that measurement.
+Everything before step 8 makes the ranking trustworthy. Everything after it
+puts the ranking on a datum so the numbers mean something.
+
+Two routes, chosen by METADATA (not by the file extension):
   no CRS  -> relative DSM, normalised 0..1
   has CRS -> absolute DSM, metres
 
-Three things in here are not optional. Each was measured, not guessed:
+===========================================================================
+THREE THINGS IN HERE ARE NOT OPTIONAL
+===========================================================================
+Each was measured, not guessed:
 
   1. TILE SCALE ALIGNMENT. Depth models normalise every input independently,
      so tiles come back on different scales. Blending raw gave correlation
@@ -166,10 +213,16 @@ def predict_depth(rgb, tile=TILE, overlap=OVERLAP):
 
     step = tile - overlap
     acc, wsum = np.zeros((H, W)), np.zeros((H, W))
-    rows = sorted({*range(0, max(1, H - overlap), step), max(0, H - tile)})
-    cols = sorted({*range(0, max(1, W - overlap), step), max(0, W - tile)})
-    rows = [min(r, max(0, H - tile)) for r in rows]
-    cols = [min(c, max(0, W - tile)) for c in cols]
+    # CLAMP FIRST, THEN DEDUPE. The other order lets two distinct starts
+    # collapse onto the same clamped origin and survive as duplicates: a
+    # 600x600 image produced rows [0, 82, 82] and cols [0, 82, 82], so the
+    # backbone ran 9 tiles where 4 cover the image, and a 2352x1222 image ran
+    # 40 where 28 do. Every duplicate is a full forward pass, multiplied again
+    # by the rotation ensemble.
+    rows = sorted({min(r, max(0, H - tile))
+                   for r in (*range(0, max(1, H - overlap), step), max(0, H - tile))})
+    cols = sorted({min(c, max(0, W - tile))
+                   for c in (*range(0, max(1, W - overlap), step), max(0, W - tile))})
     total = len(rows) * len(cols)
 
     for i, r in enumerate(rows):
@@ -202,6 +255,18 @@ def predict_depth(rgb, tile=TILE, overlap=OVERLAP):
     return acc / np.maximum(wsum, 1e-8)
 
 
+def _fill_nan(a, fill=None):
+    """NaN -> the array's own median. Anything that blurs has to do this first:
+    one NaN inside a Gaussian window poisons every pixel the window touches."""
+    a = np.asarray(a, np.float64)
+    ok = np.isfinite(a)
+    if ok.all():
+        return a
+    if fill is None:
+        fill = float(np.median(a[ok])) if ok.any() else 0.0
+    return np.where(ok, a, fill)
+
+
 def _fit_affine(src, ref, iters=4):
     """Robust y = a*x + b, Cauchy-weighted so structures cannot drag the fit."""
     m = np.isfinite(src) & np.isfinite(ref)
@@ -224,8 +289,19 @@ def _fit_affine(src, ref, iters=4):
 
 def predict_depth_ensemble(rgb, tile=TILE, overlap=OVERLAP, rotations=4,
                            verbose=True):
-    """Predict at several frame orientations and average. Returns (mean, spread).
+    """Run the depth model four times - upright, 90, 180, 270 - and average.
 
+    IN PLAIN ENGLISH: the model always paints the bottom of a picture as
+    "close", because it learned from photos taken standing up. Looking straight
+    down, that becomes a fake slope across the scene. Turn the image upside
+    down and the fake slope points the other way. Average the four and it
+    cancels; the real buildings, which live in the image content, survive every
+    pass and do not. The disagreement between the passes is a free
+    confidence map.
+
+    Returns (mean, spread).
+
+    ---------------------------------------------------------------------
     THE POINT. The backbone was trained on photographs taken from eye level, so
     it reads the bottom of a frame as nearer and paints it higher. On a nadir
     scene that false tilt measured 34-75% of the entire height range. detrend()
@@ -349,8 +425,15 @@ def structure_scale_m(p, px_size_m, seed_sigma_m=DEM_RES_M / 2,
 # ----------------------------------------------------------------------------
 # 3. VALIDATE + FIX INVERSION + CLEAN + DETREND
 # ----------------------------------------------------------------------------
-def validate_depth(p, rgb):
+def validate_depth(p, rgb, info=None):
     """Sanity-check the raw depth output and fix inversion if detected.
+
+    Whatever it decides is written into `info` (and from there into meta.json
+    and the results panel) rather than only printed. Flipping the surface is
+    the single largest thing this pipeline can do to a scene - every building
+    becomes a pit - and it used to leave no trace anywhere but stdout, so a
+    misfire on a scene with dark roofs over bright bare ground was invisible
+    to anyone reading the output.
 
     Issue 10 fix: reject degenerate outputs early.
     Issue 1 fix: Depth-Anything-V2 was trained on ground-level perspective
@@ -359,12 +442,15 @@ def validate_depth(p, rgb):
     luminance with predicted depth; a strong negative correlation signals
     inversion.
     """
+    rec = info if info is not None else {}
     finite = np.isfinite(p)
+    rec["depth_finite_frac"] = float(finite.mean())
     if finite.mean() < 0.5:
         print("[depth] WARNING: >50% of depth pixels are NaN")
     if finite.any():
         var = float(np.nanvar(p[finite]))
         if var < 1e-12:
+            rec["depth_degenerate"] = True
             print("[depth] WARNING: depth map has near-zero variance - "
                   "model may have failed on this input")
 
@@ -379,15 +465,25 @@ def validate_depth(p, rgb):
         gs, ps = gray[m][::step], pd[m][::step]
         if gs.std() > 1e-9 and ps.std() > 1e-9:
             r = float(np.corrcoef(gs, ps)[0, 1])
+            rec["luma_depth_r"] = r
             # On a nadir image, bright rooftops should have HIGH depth (they
             # are elevated = closer to sensor).  A negative correlation means
             # the model thinks bright = far away, which is the ground-level
             # bias inverted for a top-down view.
+            #
+            # This is a heuristic on a weak signal, so it is recorded, not just
+            # acted on: dark roofs over bright bare ground correlate the same
+            # way without being inverted at all. If a run comes back with
+            # buildings as pits, `depth_inverted` in meta.json is the first
+            # thing to look at.
             if r < -0.3:
+                rec["depth_inverted"] = True
                 print(f"[depth] depth appears INVERTED (luma-depth r={r:.2f}), "
-                      f"correcting")
+                      f"correcting - check meta.json if the result reads "
+                      f"upside down")
                 p = np.nanmax(p) - p
             else:
+                rec["depth_inverted"] = False
                 print(f"[depth] inversion check ok (luma-depth r={r:.2f})")
     return p
 
@@ -530,15 +626,19 @@ DEM_DEBIAS_DEADBAND_M = 0.75    # COP30's own vertical accuracy is about 1 m
 
 def debias_dem(dem, px_size_m, window_m=DEM_DEBIAS_WINDOW_M,
                deadband_m=DEM_DEBIAS_DEADBAND_M):
-    """The coarse global model is a SURFACE model, not bare earth. Over a
-    built-up area part of the radar return comes off rooftops, so it sits
-    metres above the ground it is supposed to describe - and the frequency
-    split hands that error straight to the output as bias.
+    """Take the rooftops out of the free 30 m DEM, so it describes the ground.
 
-    Buildings are narrow; terrain is not. A morphological opening at a window
-    wider than any building removes the first and leaves the second. The
-    deadband stops it eating the model's own vertical noise on open ground.
+    IN PLAIN ENGLISH: COP30 is a radar SURFACE model - over a town, part of its
+    signal bounced off roofs, so its "ground" floats a few metres too high. We
+    use it as the terrain baseline and then add our own buildings on top, so
+    that float would be added to every elevation as bias.
 
+    Buildings are narrow, terrain is not. Slide a plate 200 m wide under the
+    surface and it rests on the ground, ignoring anything building-sized (that
+    is what an opening does). The deadband stops it also eating the DEM's own
+    sub-metre noise on open ground.
+
+    ---------------------------------------------------------------------
     Measured against the LiDAR terrain models, all four benchmark scenes:
 
         scene                 before          after
@@ -591,18 +691,28 @@ def dem_on_grid(dem_path, meta, shape):
 # What percentile of the detail band the operator's number refers to. A person
 # volunteers a LANDMARK ("that tower is about 40 m"), not a percentile, so the
 # default has to sit near the top of the distribution.
+#
+# These are the CUT, not the anchor. alpha_from_known_height takes the median
+# of everything above the cut, so "tallest": 99.0 puts the effective anchor at
+# about p99.5 - which is the row the docstring's table calls the new setting.
+# Raising this constant to 99.5 would move the anchor to ~p99.75, not to the
+# measured configuration.
 HEIGHT_REFERENCE_PCT = {"tallest": 99.0, "tall": 95.0, "typical": 60.0}
 
 
 def alpha_from_known_height(detail, known_height_m, pct=None, reference="tallest"):
-    """Semantic prior. 'The tallest block here is about 40 m.' One number, and
-    it is the fastest thing to demo. The PS explicitly allows semantic priors.
+    """Scale from one human guess: "the tallest block here is about 40 m".
 
-    Use the median of everything above the anchor percentile rather than a
-    single extreme value: a lone antenna or noise spike produces a wildly
-    wrong alpha, while the median of the top slice represents the tallest
-    SUSTAINED structure, which is what a person's guess corresponds to.
+    IN PLAIN ENGLISH: the model says the tallest thing in the scene is 0.32
+    model-units above the ground. You say it is 40 metres. So one model-unit is
+    40 / 0.32 = 125 metres, and now every other pixel converts too. That single
+    division is the whole idea, and it is the fastest thing to demo.
 
+    "The tallest thing" is the median of everything above the 99th percentile,
+    not the single highest pixel: one antenna or one noise spike would set the
+    scale for the entire city.
+
+    ---------------------------------------------------------------------
     The anchor used to be p97, which did not match this docstring and was the
     single largest error source measured on ahn_rotterdam_centre: a 40 m
     landmark prior was being applied to the 97th-percentile pixel, whose true
@@ -668,7 +778,7 @@ def _cv_ratio(X, Y, folds=5, seed=0):
         return dict(n=int(n), note="too few control points to cross-validate")
 
     idx = np.random.default_rng(seed).permutation(n)
-    res = []
+    res, truth = [], []
     for f in range(folds):
         te = idx[f::folds]
         tr = np.setdiff1d(idx, te)
@@ -676,10 +786,16 @@ def _cv_ratio(X, Y, folds=5, seed=0):
             continue
         a = float(np.median(Y[tr] / X[tr]))
         res.append(a * X[te] - Y[te])
+        # keep each fold's own truth beside its residuals. Reading the truth
+        # back as Y[idx[:e.size]] instead paired every error with an unrelated
+        # control point, because e is concatenated fold by fold (idx[f::folds])
+        # and that slice is in permutation order.
+        truth.append(Y[te])
     if not res:
         return dict(n=int(n), note="cross-validation folds too small")
 
     e = np.concatenate(res)
+    y_te = np.concatenate(truth)
     ratios = Y / X
     q1, q3 = np.percentile(ratios, [25, 75])
     return dict(
@@ -688,24 +804,86 @@ def _cv_ratio(X, Y, folds=5, seed=0):
         mae_m=float(np.mean(np.abs(e))),
         bias_m=float(np.mean(e)),
         p90_abs_m=float(np.percentile(np.abs(e), 90)),
-        median_rel_pct=float(100 * np.median(np.abs(e) / np.maximum(Y[idx[:e.size]], 1e-6))),
+        median_rel_pct=float(100 * np.median(np.abs(e) / np.maximum(y_te, 1e-6))),
         alpha_iqr_ratio=float(q3 / max(q1, 1e-9)),
         basis="held-out shadow control points; not LiDAR validation",
     )
 
 
-def alpha_from_shadows(detail, rgb, sun_az_deg, sun_elev_deg, px_size_m):
-    """h = L * tan(theta). Shadows are self-generated control points: dozens of
-    them, no clicking and no downloads. Complements the DEM exactly - the DEM
-    knows terrain and not buildings; shadows know buildings and not terrain.
+# How far past the object end of a shadow to look for the roof that cast it,
+# in metres. Every one of these is tried and the tallest reading wins, so a
+# narrow chimney and a deep roof plate are both covered.
+ROOF_PROBE_M = (1.0, 2.0, 4.0, 7.0, 11.0)
 
-    Issue 3 fix: adaptive shadow thresholding (Otsu on V-channel instead of a
-    fixed 25th percentile), directional consistency filter (shadow extent must
-    align within +-30 deg of the expected sun azimuth), and shape filter
-    (shadows are elongated, not circular)."""
+
+def alpha_from_shadows(detail, rgb, sun_az_deg, sun_elev_deg, px_size_m):
+    """Scale from the shadows the buildings cast. No input from anyone.
+
+    IN PLAIN ENGLISH: a building's shadow is long when the building is tall and
+    the sun is low, and the relationship is exactly
+
+        height = shadow length x tan(sun elevation)
+
+    The sun angles come free in the GeoTIFF's tags on most satellite products.
+    So: find the dark patches, measure how long each one is in the direction
+    the sun is throwing it, that gives a height in METRES; look up what the
+    depth model said about the roof that cast it, that gives a height in MODEL
+    UNITS; the ratio is the scale. Dozens of control points, no clicking and no
+    downloads.
+
+    It complements the coarse DEM exactly - the DEM knows terrain and not
+    buildings, shadows know buildings and not terrain.
+
+    ---------------------------------------------------------------------
+    TWO THINGS THIS USED TO GET WRONG, both of which stopped it producing any
+    pairs at all. Measured on a synthetic scene built to order - three 40x40 m
+    blocks, sun at azimuth 90 / elevation 45, clean 30 px shadows, a depth
+    field with the answer written into it - the old code returned
+    "only 0 usable pairs":
+
+      1. IT REQUIRED SHADOWS TO BE ELONGATED (ext / ext_perp >= 1.2). A cast
+         shadow is as long as its object is TALL and as wide as its object is
+         WIDE, so a 40 m block casting a 30 m shadow measures 0.74 and was
+         thrown out as "too circular". The filter rejected exactly the
+         buildings a city is made of and kept only narrow towers. There is no
+         aspect test here now: length along the sun azimuth is the measurement,
+         width across it is just the building's width.
+
+      2. IT SAMPLED THE DEPTH ON THE SHADOW. argmin(t) is the shadow's object
+         end, which is GROUND - the pavement the shadow lies on, right at the
+         foot of the wall. On the synthetic scene that pixel read exactly
+         0.000 above ground, so the pair was dropped by `dp > 1e-6`; on real
+         imagery it only ever returned a number when the shadow mask happened
+         to bleed onto the building, i.e. when the number was noise. The roof
+         is what the shadow measures, so the probe now steps from the object
+         end BACK TOWARDS THE SUN and reads the surface there.
+
+    A third error surfaced once the first two were fixed and pairs started
+    coming through: LENGTH WAS MEASURED ACROSS THE WHOLE SHADOW BLOB, which
+    includes the building's own depth along the sun direction. Exact at azimuth
+    90 against axis-aligned blocks, and 71%/108% too tall at azimuth 135/315.
+    It is now the median run length ray by ray - see the loop.
+
+    Kept from before: Otsu on the V channel rather than a fixed percentile, and
+    the low-saturation test, both of which hold up.
+
+    Measured on synthetic scenes with the answer built in (twelve blocks, a
+    depth field scaled by a known alpha of 3.0, shadows cast geometrically):
+
+        azimuth   old code        new code
+        90/45     0 pairs         3.10  (+3%)
+        135/50    0 pairs         2.98  (-1%)
+        200/35    0 pairs         3.06  (+2%)
+        315/60    0 pairs         3.11  (+4%)
+        135/50 with mixed heights and depth noise:  2.99  (-0%)
+    """
     import cv2
     a = np.deg2rad(sun_az_deg)
-    dc, dr = -np.sin(a), np.cos(a)          # 90->west, 180->north (verified)
+    # Direction a shadow EXTENDS, in (col, row): azimuth is clockwise from
+    # north, col grows east, row grows south. 90 -> west, 180 -> north.
+    dc, dr = -np.sin(a), np.cos(a)
+    # ...and back towards the sun, where the object that cast it stands.
+    sc, sr = -dc, -dr
 
     hsv = cv2.cvtColor(rgb, cv2.COLOR_RGB2HSV).astype(np.float32)
     v_chan = (hsv[..., 2] / 255.0 * 255).astype(np.uint8)
@@ -717,39 +895,91 @@ def alpha_from_shadows(detail, rgb, sun_az_deg, sun_elev_deg, px_size_m):
     mask = cv2.morphologyEx((dark_mask.astype(bool) & flat).astype(np.uint8),
                             cv2.MORPH_OPEN, np.ones((3, 3), np.uint8))
 
+    H, W = mask.shape
+    px = max(float(px_size_m or 1.0), 1e-6)
+    probe_px = sorted({max(1, int(round(m / px))) for m in ROOF_PROBE_M})
+
     n, lab = cv2.connectedComponents(mask)
     g = ground_level(detail)          # DETAIL band, same reason as GCPs
     X, Y = [], []
+    drop = dict(speck=0, thin=0, length=0, truncated=0, no_roof=0, flat=0)
     for k in range(1, n):
         ys, xs = np.where(lab == k)
         if ys.size < 6:
+            drop["speck"] += 1
             continue
 
-        # --- directional consistency filter ---
-        # The shadow's principal axis should align with the expected sun
-        # direction.  Shadows perpendicular to the sun are not cast shadows.
-        t = xs * dc + ys * dr
-        ext = t.max() - t.min()
-        # perpendicular extent
-        t_perp = -xs * dr + ys * dc
-        ext_perp = t_perp.max() - t_perp.min()
-        if not (4 <= ext <= 400):
+        # A shadow running off the frame is cut short, so its length is a lower
+        # bound and the height it implies is simply wrong.
+        if xs.min() == 0 or ys.min() == 0 or xs.max() == W - 1 or ys.max() == H - 1:
+            drop["truncated"] += 1
             continue
-        # aspect ratio: real shadows are elongated along the sun direction
-        if ext_perp > 0 and ext / max(ext_perp, 1) < 1.2:
-            continue                            # too circular, not a shadow
 
-        i = int(np.argmin(t))                       # object end of the shadow
-        dp = detail[ys[i], xs[i]] - g
-        h = ext * px_size_m * np.tan(np.deg2rad(sun_elev_deg))
-        if np.isfinite(dp) and dp > 1e-6 and h > 1.5:
-            X.append(dp); Y.append(h)
+        # --- length, measured RAY BY RAY rather than across the whole blob ---
+        # The shadow of a block is the block's outline swept along the sun
+        # direction, so the region's total extent along that direction is the
+        # true length PLUS the block's own depth. That is exact only when the
+        # sun runs along an image axis and the building is square to it; at
+        # azimuth 135 a 30 m block measured 71% too tall, at 315 it measured
+        # 108% too tall. Along any single ray, though, the run of shadow is
+        # exactly h / tan(elev) - so bin the pixels across the sun direction
+        # and take the median run.
+        t = xs * dc + ys * dr                   # distance along the shadow
+        u = -xs * dr + ys * dc                  # distance across it
+        order = np.argsort(np.round(u).astype(np.int64), kind="stable")
+        b_s = np.round(u).astype(np.int64)[order]
+        t_s, y_s, x_s = t[order], ys[order], xs[order]
+        starts = np.flatnonzero(np.r_[True, b_s[1:] != b_s[:-1]])
+        ends = np.r_[starts[1:], b_s.size]
+
+        runs, er, ec = [], [], []
+        for s, e in zip(starts, ends):
+            if e - s < 3:                       # a ray clipping a corner
+                continue
+            seg = t_s[s:e]
+            runs.append(float(seg.max() - seg.min()) + 1.0)
+            i = s + int(np.argmin(seg))         # object end OF THIS RAY
+            er.append(y_s[i])
+            ec.append(x_s[i])
+        if len(runs) < 3:
+            drop["thin"] += 1
+            continue
+
+        length_m = float(np.median(runs)) * px
+        if not (1.0 <= length_m <= 300.0):      # 1 m is noise, 300 m is a cloud
+            drop["length"] += 1
+            continue
+
+        # --- the ROOF standing above each ray's object end ---
+        er, ec = np.array(er), np.array(ec)
+        roof = []
+        for d in probe_px:
+            rr = np.clip(np.round(er + sr * d).astype(int), 0, H - 1)
+            cc = np.clip(np.round(ec + sc * d).astype(int), 0, W - 1)
+            v = detail[rr, cc]
+            lit = (mask[rr, cc] == 0) & np.isfinite(v)   # not another shadow
+            if lit.any():
+                roof.append(float(np.median(v[lit])))
+        if not roof:
+            drop["no_roof"] += 1
+            continue
+
+        dp = float(np.max(roof)) - g            # the roof, not the pavement
+        h = length_m * np.tan(np.deg2rad(sun_elev_deg))
+        if dp > 1e-6 and h > 1.5:
+            X.append(dp)
+            Y.append(h)
+        else:
+            drop["flat"] += 1
+
     if len(X) < 8:
-        print(f"[shadow] only {len(X)} usable pairs - skipping")
-        return None, dict(n=len(X), note="too few shadow pairs")
+        why = ", ".join(f"{v} {k}" for k, v in drop.items() if v)
+        print(f"[shadow] only {len(X)} usable pairs - skipping"
+              + (f" (rejected: {why})" if why else ""))
+        return None, dict(n=len(X), rejected=drop, note="too few shadow pairs")
     # median ratio is robust enough here and needs no sklearn
     a_est = float(np.median(np.array(Y) / np.array(X)))
-    diag = _cv_ratio(X, Y)
+    diag = dict(_cv_ratio(X, Y), rejected=drop)
     if "rmse_m" in diag:
         print(f"[shadow] alpha={a_est:.2f} from {len(X)} pairs | "
               f"held-out RMSE {diag['rmse_m']:.2f} m, "
@@ -844,10 +1074,20 @@ def estimate_elevation(path, known_height_m=None, gcps=None,
                        use_dem=True, alpha_gain=1.0, outdir="outputs",
                        rotations=ROTATIONS, adaptive_sigma=True,
                        height_reference="tallest", debias_coarse_dem=True):
-    """
+    """THE MAIN FUNCTION. Image path in, elevation map out.
+
+    The numbered list at the top of this file is the order of what follows -
+    read that first if you are new to this code. Everything here is either one
+    of those steps or a decision about which step to take.
+
     Returns (height, meta, info).
       relative mode -> height is 0..1
       absolute mode -> height is metres above sea level
+
+    `info` is the run's own record - which calibrator answered, what alpha came
+    out, how much the rotations disagreed, whether the depth was flipped. It
+    ends up in meta.json and in the results panel, so nothing important is
+    decided only in a print().
 
     rotations       how many frame orientations to predict and average. 4
                     cancels the model's frame-tied perspective ramp by
@@ -860,10 +1100,10 @@ def estimate_elevation(path, known_height_m=None, gcps=None,
     rgb, meta = load_image(path)
     print(f"[load] {rgb.shape[1]}x{rgb.shape[0]}  mode={meta['mode']}  px={meta['px_size_m']}")
 
-    p, spread = predict_depth_ensemble(rgb, rotations=rotations)
-    p = validate_depth(p, rgb)       # Issue 1+10: fix inversion, check sanity
-    p = clean_depth(p, rgb)
     info = dict(mode=meta["mode"], rotations=int(max(1, min(4, rotations))))
+    p, spread = predict_depth_ensemble(rgb, rotations=rotations)
+    p = validate_depth(p, rgb, info)  # Issue 1+10: fix inversion, check sanity
+    p = clean_depth(p, rgb)
 
     # ---- remove the fake tilt ----
     # Issue 2 fix: in absolute mode with a DEM, the frequency split already
@@ -917,17 +1157,25 @@ def estimate_elevation(path, known_height_m=None, gcps=None,
     px = meta["px_size_m"] or 1.0
     sigma_m = (structure_scale_m(p, px) if adaptive_sigma else DEM_RES_M / 2)
     sigma = max(2.0, sigma_m / px)              # the terrain/building boundary
-    detail = p - gaussian_filter(p, sigma)      # buildings live here
+    # gaussian_filter smears a single NaN across the whole neighbourhood, and
+    # clean_depth deliberately puts the NaNs back where the input had them, so
+    # fill before blurring and restore afterwards. structure_scale_m already
+    # did this; the split that actually produces the elevations did not.
+    p_fill = _fill_nan(p)
+    detail = p_fill - gaussian_filter(p_fill, sigma)
+    detail = np.where(np.isfinite(p), detail, np.nan)   # buildings live here
     info["sigma_px"] = float(sigma)
     info["sigma_m"] = float(sigma_m)
     info["sigma_source"] = "scene structures" if adaptive_sigma else "DEM resolution"
 
     alpha = None
+    tried_shadows = False
     if (sun_azimuth is None and sun_elevation is None
             and not gcps and not known_height_m):
         # last resort only - an explicit choice by the caller always wins
         sun_azimuth, sun_elevation = meta.get("sun_azimuth"), meta.get("sun_elevation")
     if sun_azimuth is not None and sun_elevation is not None:
+        tried_shadows = True
         alpha, sdiag = alpha_from_shadows(detail, rgb, sun_azimuth, sun_elevation, px)
         info["self_check"] = sdiag
     if alpha is None and gcps:
@@ -946,6 +1194,16 @@ def estimate_elevation(path, known_height_m=None, gcps=None,
         alpha *= float(alpha_gain)
         info["alpha_gain"] = float(alpha_gain)
         print(f"[calib] alpha x{alpha_gain:.2f} (measured attenuation correction)")
+    if alpha is None and tried_shadows:
+        # Do not tell someone who supplied sun angles to supply sun angles.
+        n_pairs = (info.get("self_check") or {}).get("n", 0)
+        raise ValueError(
+            f"Shadow calibration found only {n_pairs} usable shadow/roof pairs "
+            "in this scene, which is not enough to set the metre scale. That "
+            "happens on hazy imagery, on a high sun that casts almost nothing, "
+            "and where shadows fall on other buildings rather than on open "
+            "ground. Pass known_height_m (the height of the tallest structure "
+            "you can identify) or at least two gcps instead.")
     if alpha is None:
         raise ValueError(
             "No scale source. The coarse DEM supplies the terrain baseline but "
@@ -1088,7 +1346,19 @@ def _export(height, rgb, meta, outdir, info, ndsm=None, dtm=None,
                 dtype="float32", nodata=np.nan, compress="deflate")
     if meta["mode"] == "absolute":
         prof.update(crs=meta["crs"], transform=meta["transform"])
-    units = "metres" if meta["mode"] == "absolute" else "relative"
+
+    # Say what is actually in the file. A relative run is re-exported by the
+    # caller AFTER it has been stretched onto a nominal full-scale height, so
+    # the values at that point are metres - just not surveyed ones - and
+    # tagging them "relative" sent anyone reading the raster looking for a 0..1
+    # surface that is no longer there.
+    if meta["mode"] == "absolute":
+        units = "metres"
+    elif info.get("relative_full_scale_m"):
+        units = (f"metres (nominal: no metric datum, scene scaled so the full "
+                 f"range is {float(info['relative_full_scale_m']):.0f} m)")
+    else:
+        units = "relative (0..1)"
     with rasterio.open(os.path.join(outdir, "dsm.tif"), "w", **prof) as ds:
         ds.write(h, 1)
         ds.update_tags(MODE=meta["mode"], UNITS=units, PRODUCT="DSM")

@@ -1,5 +1,47 @@
 """
-validate.py - score an estimated DSM against reference elevation data.
+validate.py - how wrong is it? Score our DSM against real LiDAR.
+
+===========================================================================
+READ THIS FIRST
+===========================================================================
+    validate_files(pred.tif, reference.tif)
+        load_raster()          both files
+        reference_on_grid()    put the reference onto OUR pixel grid, by true
+                               reprojection when both are georeferenced
+        evaluate()             everything below
+            align()            three ways - see THE HONESTY PROBLEM
+            metrics()          RMSE, MAE, bias, NMAD, LE90, r, Nash-Sutcliffe
+            object_height()    split the surface into TERRAIN and OBJECTS and
+                               score each separately
+            attenuation()      are our buildings the right height, and what
+                               single multiplier would fix them
+            landscape_classes()  urban / sparse / hilly / forest, so the
+                               report can show where it is weak
+        to_markdown()          the report a human reads
+        error_figures()        error map, scatter against 1:1, per-class bars
+
+THE HONESTY PROBLEM, and why every number is quoted three times. Our surface
+and a LiDAR DSM often sit on different vertical datums - if no coarse DEM was
+available, ours is height above LOCAL GROUND while theirs is metres above sea
+level. Scoring those raw measures the datum, not the model, and quietly
+subtracting the difference flatters us. So the report shows all three side by
+side and lets the reader pick:
+
+    raw       nothing removed. The honest number
+    shift     one constant offset removed. Normal practice between datums
+    affine    offset AND scale removed. Diagnostic only
+
+TWO MORE TRAPS THIS AVOIDS:
+
+  * RESOLUTION. If the reference is 30 m and we are 0.5 m, we get punished for
+    detail the reference cannot represent. match_resolution low-passes us to
+    their GSD first, and keeps the unmatched score alongside.
+
+  * THE TERRAIN BAND DOMINATES. On a hilly scene r can be 0.98 with every
+    single building wrong, because the landform carries the correlation. That
+    is why object heights are scored on their own.
+
+===========================================================================
 
 The evaluation criteria ask for RMSE, MAE and correlation against LiDAR or
 reference data, and for "performance stability across urban, sparse, hilly and
@@ -208,8 +250,19 @@ def object_height(surface, sigma_px):
 
 
 def attenuation(pred_obj, ref_obj, min_h=2.0, materiality=0.01):
-    """How short (or tall) predicted structures come out, and the fix.
+    """Are our buildings the right height, and what one number would fix them?
 
+    IN PLAIN ENGLISH: suppose every building we produce is 30% too short. That
+    is not a mistake in WHERE the height is, only in HOW MUCH, and one
+    multiplier on alpha fixes the whole scene. This function finds the best
+    possible such multiplier, and - just as important - says whether it is
+    worth using at all. If the best possible multiplier barely helps, the error
+    is in the placement, and rescaling cannot fix placement.
+
+    "Best possible" is not a search: least squares through the origin IS the
+    argmin of squared error, so sum(p*r) / sum(p*p) is provably the answer.
+
+    ---------------------------------------------------------------------
     alpha is a pure multiplier, so the correction is a THROUGH-ORIGIN gain, and
     the only gain worth recommending is the one that minimises object-band
     error. That is exactly sum(p*r) / sum(p*p) over every finite pixel: least

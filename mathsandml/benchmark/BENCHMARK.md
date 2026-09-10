@@ -3,7 +3,7 @@
 The accuracy half of the marking scheme (50%) asks for RMSE, MAE and correlation
 against reference data, and for stability across urban, sparse, hilly and
 forested landscapes. This directory produces exactly that, as
-`benchmark/results/report.md`.
+`mathsandml/benchmark/results/report.md`.
 
 Everything here runs on your Mac. The pipeline needs the Depth-Anything weights
 and the reference services need the open internet, and neither is reachable
@@ -38,8 +38,8 @@ the reference nDSM instead of the reference DSM. Both are legitimate; see §5.
 ## 2. Get the reference data
 
 ```bash
-python fetch_data.py --check       # probe every service, download nothing
-python fetch_data.py --list        # show the built-in areas of interest
+python mathsandml/benchmark/fetch_data.py --check       # probe every service, download nothing
+python mathsandml/benchmark/fetch_data.py --list        # show the built-in areas of interest
 ```
 
 `--check` is the first thing to run. It prints which service answered and which
@@ -50,9 +50,9 @@ regex in the `SOURCES` table at the top of `fetch_data.py`.
 Then fetch:
 
 ```bash
-python fetch_data.py --source ahn        --out benchmark/scenes
-python fetch_data.py --source swisstopo  --out benchmark/scenes
-python fetch_data.py --source usgs       --out benchmark/scenes
+python mathsandml/benchmark/fetch_data.py --source ahn        --out mathsandml/benchmark/scenes
+python mathsandml/benchmark/fetch_data.py --source swisstopo  --out mathsandml/benchmark/scenes
+python mathsandml/benchmark/fetch_data.py --source usgs       --out mathsandml/benchmark/scenes
 ```
 
 Default footprint is 300 m square at 0.5 m GSD, i.e. 600 x 600 px — about the
@@ -100,10 +100,10 @@ reconstruction, not building heights, and `scene.json` records
 Any pair of overlapping rasters works. Drop them in by hand:
 
 ```
-benchmark/scenes/<name>/rgb.tif       georeferenced optical image (must have a CRS)
-benchmark/scenes/<name>/ref_dsm.tif   reference surface model
-benchmark/scenes/<name>/ref_dtm.tif   optional terrain model
-benchmark/scenes/<name>/scene.json    optional: {"landscape": "urban", "known_height_m": 40}
+mathsandml/benchmark/scenes/<name>/rgb.tif       georeferenced optical image (must have a CRS)
+mathsandml/benchmark/scenes/<name>/ref_dsm.tif   reference surface model
+mathsandml/benchmark/scenes/<name>/ref_dtm.tif   optional terrain model
+mathsandml/benchmark/scenes/<name>/scene.json    optional: {"landscape": "urban", "known_height_m": 40}
 ```
 
 Manual sources, no scripting needed:
@@ -130,7 +130,7 @@ number.
 ## 3. Run the benchmark
 
 ```bash
-python run_benchmark.py --scenes benchmark/scenes --out benchmark/results
+python mathsandml/benchmark/run_benchmark.py --scenes mathsandml/benchmark/scenes --out mathsandml/benchmark/results
 ```
 
 On CPU with the Large backbone, budget a few minutes per 600 x 600 scene. To
@@ -138,7 +138,7 @@ sanity-check the plumbing first:
 
 ```bash
 DEPTH_MODEL=depth-anything/Depth-Anything-V2-Small-hf \
-  python run_benchmark.py --limit 1 --no-figures
+  python mathsandml/benchmark/run_benchmark.py --limit 1 --no-figures
 ```
 
 Then the real run. `--use-dem` is on by default and the key is in place, so the
@@ -151,9 +151,9 @@ the report says which datum each scene was scored on.
 Outputs:
 
 ```
-benchmark/results/report.md      the tables below, ready to paste
-benchmark/results/results.json   every metric, plus the control points used
-benchmark/results/<scene>/       dsm.tif, ndsm.tif, dtm.tif, validation.md,
+mathsandml/benchmark/results/report.md      the tables below, ready to paste
+mathsandml/benchmark/results/results.json   every metric, plus the control points used
+mathsandml/benchmark/results/<scene>/       dsm.tif, ndsm.tif, dtm.tif, validation.md,
                                  error_map.png, scatter.png, stability.png
 ```
 

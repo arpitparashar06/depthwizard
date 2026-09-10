@@ -1,0 +1,24 @@
+# Everything here is either rebuilt inside the image, useless to it, or a
+# secret. Without this file Docker ships the whole 1.4 GB folder as build
+# context - .venv alone carries a second copy of torch.
+
+.venv/
+frontend/node_modules/
+frontend/dist/
+__pycache__/
+*.pyc
+.git/
+.gitignore
+
+# secrets - the key is passed at run time with -e, never baked into an image
+.env
+
+# run artefacts
+jobs/
+outputs/
+mathsandml/benchmark/scenes/
+mathsandml/benchmark/results/
+mathsandml/benchmark/mode_comparison/
+dem_coarse.tif
+*.bak
+.DS_Store

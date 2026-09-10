@@ -3,14 +3,32 @@ import * as THREE from 'three'
 import { GLTFLoader } from 'three/examples/jsm/loaders/GLTFLoader.js'
 import { PointerLockControls } from 'three/examples/jsm/controls/PointerLockControls.js'
 
-/*
- * The mesh is vertically exaggerated and its base is offset, so raw world Y is
- * not metres. Every number on screen is put back through
+/* ===========================================================================
+ * Viewer.jsx - the 3D flythrough. Loads terrain.glb and lets you walk it.
+ * ===========================================================================
+ *
+ * READ THIS FIRST. It is one useEffect that builds a three.js world and one
+ * loop() that runs every frame:
+ *
+ *   setup     scene, camera, renderer, two lights, PointerLockControls
+ *   load      GLTFLoader pulls terrain.glb, rotates it Z-up -> Y-up, and puts
+ *             the camera above one corner looking at the middle
+ *   input     WASD moves, mouse looks, Space/C change altitude, Shift boosts.
+ *             The keys are only claimed while the pointer is locked, so they
+ *             do not swallow typing in the form
+ *   measure   a raycast down the crosshair every ~90 ms gives the height under
+ *             the crosshair and the slope of the face there. Clicking drops a
+ *             pin; two pins measure the drop and the grade between them
+ *   loop      move, raycast, render
+ *
+ * THE ONE THING TO GET RIGHT. The mesh is vertically exaggerated and its base
+ * is offset, so raw world Y is NOT metres. Every number on screen goes back
+ * through
  *     true = y / exaggeration + base
  * and slope needs a different inverse:
  *     tan(true) = tan(apparent) / exaggeration
- * Getting this wrong is not cosmetic — reading heights off the model is a
- * deliverable, and at the default 1.5x every measurement would be 50% high.
+ * This is not cosmetic - reading heights off the model is a deliverable, and
+ * at the default 1.5x every measurement would be 50% high.
  */
 const FLIGHT_KEYS = new Set([
   'KeyW', 'KeyA', 'KeyS', 'KeyD',   // move

@@ -1,11 +1,26 @@
 #!/usr/bin/env python
-"""run_geotiff.py - one image in, the whole pipeline out, no browser.
+"""run_geotiff.py - the whole pipeline in one command, no browser involved.
 
-    python run_geotiff.py benchmark/scenes/ahn_rotterdam_centre/rgb.tif --tallest 95
+===========================================================================
+READ THIS FIRST
+===========================================================================
+This is server.py's _run() without the HTTP around it, and it runs the SAME
+sequence, so the CLI and the UI produce the same surface:
 
-inference.py's own __main__ stops at the rasters: no .env, no refine, no mesh.
-This is the same sequence server.py runs for a job, so what you get here and
-what the UI shows are the same surface.
+    load_image -> estimate_elevation -> refine -> clip -> export -> mesh
+                                                            -> optional scoring
+
+    python backend/run_geotiff.py <image> --tallest 40
+    python backend/run_geotiff.py <image> --gcp 120,340,18 --gcp 400,90,25
+    python backend/run_geotiff.py <image> --sun 145 52
+    python backend/run_geotiff.py <image> --tallest 40 --reference lidar.tif
+
+It writes dsm.tif, ndsm.tif, dtm.tif, terrain.glb and the figures, prints what
+the heights are measured FROM, and with --reference scores itself in the same
+run. `--help` lists everything.
+
+Use this, not `python mathsandml/inference.py`: that file's own __main__ stops
+at the rasters - no .env, no refine, no mesh.
 
 Two things it will not do quietly:
 
@@ -26,22 +41,11 @@ import time
 import numpy as np
 
 
-def _load_env():
-    """.env before inference is imported - it binds OPENTOPO_KEY at import."""
-    here = os.path.dirname(os.path.abspath(__file__))
-    path = os.path.join(here, ".env")
-    if not os.path.exists(path):
-        return
-    with open(path) as f:
-        for line in f:
-            line = line.strip()
-            if not line or line.startswith("#") or "=" not in line:
-                continue
-            k, v = line.split("=", 1)
-            os.environ.setdefault(k.strip(), v.strip().strip("'\""))
+# mathsandml/ onto the import path, and the repo-root .env read BEFORE
+# inference is imported - it binds OPENTOPO_KEY at import time.
+from _bootstrap import load_env                                        # noqa: E402
 
-
-_load_env()
+load_env()
 
 from inference import (estimate_elevation, load_image, export_products,  # noqa: E402
                        clip_below_ground)

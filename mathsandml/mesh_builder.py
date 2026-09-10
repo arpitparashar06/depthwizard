@@ -1,5 +1,49 @@
 """
-mesh_builder.py - height map + RGB -> textured 3D mesh (.glb / .obj)
+mesh_builder.py - height map + photo -> a 3D model you can fly through.
+
+===========================================================================
+READ THIS FIRST
+===========================================================================
+Two entry points. Both take the elevation map and the original image and
+return something trimesh can write as a .glb:
+
+    build_mesh(height, rgb, style=...)      ONE surface, three flavours
+        style="smooth"    a plain grid. Every roof edge becomes a 45-degree
+                          ramp, because a shared-vertex grid cannot represent
+                          a vertical face
+        style="stepped"   _stepped_geometry(): every cell gets its own four
+                          corners at its own height, and the gap between two
+                          cells is closed by a real vertical wall
+
+    build_city(dsm, ndsm, rgb)              THE ONE THE UI USES
+        1. buildings.extract_footprints()   find the buildings
+        2. buildings.flatten_ground()       remove them from the ground
+        3. build_mesh() on that ground      the terrain, photo-textured
+        4. buildings.building_meshes()      the buildings, put back as
+                                            separate prisms
+        -> one glTF scene, three materials: ground and roofs wear the
+           satellite photo, walls wear a generated facade
+
+THREE THINGS TO KNOW:
+
+  * DOWNSAMPLING. A 1024x614 image is 628k vertices and 1.25M triangles, which
+    crawls in a browser. Everything is block-reduced to a target grid (~256)
+    first. _block_reduce() takes the median of each block rather than sampling
+    one pixel, because a sharp roofline is 2-3 px wide and stride sampling
+    either lands on it or misses it.
+
+  * VERTICAL EXAGGERATION. At true 1:1 a city looks flat from above - a 30 m
+    building across a 1 km scene is 3% of the width. The mesh is stretched by
+    z_exaggeration and its base is moved to zero, so mesh Z is NOT metres. The
+    numbers needed to undo that ride along in mesh.metadata, and the viewer
+    divides them back out before showing any height:
+        true_metres = mesh_z / z_exaggeration + base_m
+
+  * GLB, not OBJ. One binary file carries geometry AND texture, so three.js
+    loads it with no extra plumbing. OBJ needs a sidecar .mtl plus the image
+    and silently loses the texture if any of the three go missing.
+
+===========================================================================
 
 Design notes for the demo:
 
@@ -284,7 +328,8 @@ if __name__ == "__main__":
 # ---------------------------------------------------------------------------
 def build_city(dsm, ndsm, rgb, px_size_m=None, target_grid=256,
                z_exaggeration=1.5, style="stepped", wall_min_m=0.25,
-               is_relative=False, facade_tile_m=(12.0, 24.0), **kw):
+               is_relative=False, relative_height_m=60.0,
+               facade_tile_m=(12.0, 24.0), **kw):
     """Ground surface + extruded buildings, as one glTF scene.
 
     The heightfield alone is why the render reads as terrain: a tower is a bump
@@ -302,6 +347,17 @@ def build_city(dsm, ndsm, rgb, px_size_m=None, target_grid=256,
     """
     import trimesh
     import buildings as B
+
+    if is_relative:
+        # Stretch BOTH surfaces here, then hand build_mesh something already in
+        # metres. Left to build_mesh, only the ground would be stretched (and
+        # base_m recorded in stretched units) while the prisms below are built
+        # from the raw 0..1 dsm/ndsm - every building would sink into the
+        # terrain by a factor of relative_height_m. Both callers happen to pass
+        # is_relative=False today, which is the only reason this never bit.
+        dsm = np.asarray(dsm, np.float64) * float(relative_height_m)
+        ndsm = np.asarray(ndsm, np.float64) * float(relative_height_m)
+        is_relative = False
 
     px = float(px_size_m or 1.0)
     foot = B.extract_footprints(ndsm, rgb, px_size_m=px, **kw)

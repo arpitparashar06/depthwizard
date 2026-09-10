@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
-# One command to produce benchmark/results/report.md.
+# One command to produce mathsandml/benchmark/results/report.md.
 #
-#   cd ~/Downloads/newest/depthwizard && bash benchmark/run_all.sh
+#   cd <the depthwizard folder> && bash mathsandml/benchmark/run_all.sh
 #
 # Options:
 #   FAST=1     use the Small backbone (~100 MB, 8-10x quicker) for a first pass
@@ -9,13 +9,15 @@
 #   SOURCE=all fetch swisstopo and USGS too, not just AHN
 set -uo pipefail
 
-cd "$(dirname "${BASH_SOURCE[0]}")/.." || exit 1
+cd "$(dirname "${BASH_SOURCE[0]}")/../.." || exit 1   # repo root
 ROOT="$PWD"
+BENCH="mathsandml/benchmark"
 
-for f in benchmark/fetch_data.py benchmark/run_benchmark.py inference.py validate.py; do
+for f in "$BENCH/fetch_data.py" "$BENCH/run_benchmark.py" \
+         mathsandml/inference.py mathsandml/validate.py; do
   [ -f "$f" ] && continue
   echo "Not in the DepthWizard project: $ROOT is missing $f" >&2
-  echo "Run it as:  cd <the depthwizard folder> && bash benchmark/run_all.sh" >&2
+  echo "Run it as:  cd <the depthwizard folder> && bash mathsandml/benchmark/run_all.sh" >&2
   exit 1
 done
 SIZE="${SIZE:-300}"
@@ -62,38 +64,38 @@ EOF
 
 echo
 echo "== 2/4 probing the reference services =="
-"$PY" benchmark/fetch_data.py --check || {
+"$PY" "$BENCH/fetch_data.py" --check || {
   echo
   echo "   A service did not answer. The run can still go ahead with whatever"
-  echo "   scenes already exist under benchmark/scenes, or drop rasters in by"
-  echo "   hand - see benchmark/BENCHMARK.md."
+  echo "   scenes already exist under mathsandml/benchmark/scenes, or drop rasters in by"
+  echo "   hand - see mathsandml/benchmark/BENCHMARK.md."
 }
 
 echo
 echo "== 3/4 fetching scenes (${SOURCE}, ${SIZE} m) =="
-"$PY" benchmark/fetch_data.py --source "$SOURCE" --size-m "$SIZE" \
-      --out benchmark/scenes
+"$PY" "$BENCH/fetch_data.py" --source "$SOURCE" --size-m "$SIZE" \
+      --out "$BENCH/scenes"
 
-if ! ls benchmark/scenes/*/ref_dsm.tif >/dev/null 2>&1; then
+if ! ls "$BENCH"/scenes/*/ref_dsm.tif >/dev/null 2>&1; then
   echo
   echo "   No scenes were built, so there is nothing to score."
-  echo "   See benchmark/BENCHMARK.md for the manual download route."
+  echo "   See mathsandml/benchmark/BENCHMARK.md for the manual download route."
   exit 1
 fi
-echo "   scenes: $(ls -d benchmark/scenes/*/ 2>/dev/null | wc -l | tr -d ' ')"
+echo "   scenes: $(ls -d "$BENCH"/scenes/*/ 2>/dev/null | wc -l | tr -d ' ')"
 
 echo
 echo "== 4/4 running the benchmark =="
-"$PY" benchmark/run_benchmark.py --scenes benchmark/scenes --out benchmark/results
+"$PY" "$BENCH/run_benchmark.py" --scenes "$BENCH/scenes" --out "$BENCH/results"
 rc=$?
 
 echo
-if [ -f benchmark/results/report.md ]; then
+if [ -f "$BENCH/results/report.md" ]; then
   echo "== done =="
-  echo "   report : $ROOT/benchmark/results/report.md"
-  echo "   raw    : $ROOT/benchmark/results/results.json"
+  echo "   report : $ROOT/$BENCH/results/report.md"
+  echo "   raw    : $ROOT/$BENCH/results/results.json"
   echo
-  echo "   Nothing to copy back - Claude can read these from the connected folder."
+  echo "   Both files are plain text - open them, or paste the report into the README."
 else
   echo "== no report was written (exit $rc) =="
   echo "   The console output above says which stage failed."

@@ -58,7 +58,9 @@ def _load_env():
     first or the key is read as empty and the DEM fetch silently degrades to
     height-above-ground. Real environment variables always win.
     """
-    for path in (os.path.join(ROOT, ".env"), os.path.join(HERE, ".env")):
+    # repo root first (that is where .env lives), then mathsandml/, then here
+    for path in (os.path.join(os.path.dirname(ROOT), ".env"),
+                 os.path.join(ROOT, ".env"), os.path.join(HERE, ".env")):
         if not os.path.exists(path):
             continue
         with open(path) as f:

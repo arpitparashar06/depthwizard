@@ -312,6 +312,120 @@ I2.validate_depth(-_p, _rgb, _info2)
 check("a healthy scene records that it was checked and left alone",
       _info2.get("depth_inverted") is False, _info2)
 
+# ===========================================================================
+print("\nA10. fusing scale sources must respect how much each one is worth")
+# The point of inverse-variance fusion is that a measured source beats a guess.
+# A plain average of a validated shadow estimate and a bad landmark guess is
+# WORSE than the shadow estimate alone, which is why this is not an average.
+
+
+def _cc(**kw):
+    """{name: (alpha, sigma_rel)} -> the shape cross_check_scale returns."""
+    return dict(estimates={k: v[0] for k, v in kw.items()},
+                sigma_rel={k: v[1] for k, v in kw.items()})
+
+
+# a tight source and a vague one, 50% apart: the answer must sit near the tight one
+f = I2.fuse_scale_estimates(_cc(shadow=(3.0, 0.05), prior=(4.5, 0.25)))
+check("it fuses when the sources are compatible", f.get("applied") is True, f)
+check("the tight source dominates the vague one",
+      f["alpha"] is not None and abs(f["alpha"] - 3.0) < 0.25,
+      f"fused {f.get('alpha')}, a plain average would be 3.75")
+check("the plain average would have been materially worse",
+      abs(f["alpha"] - 3.0) < abs(3.75 - 3.0) / 2,
+      f"fused {f['alpha']:.3f} vs average 3.75, truth-ish 3.0")
+check("the fused estimate is tighter than either input",
+      f["alpha_sigma_rel"] < 0.05, f.get("alpha_sigma_rel"))
+
+# Equal confidence -> the geometric mean, not the arithmetic one. x2 and x0.5
+# are equally wrong for a SCALE factor, so they must cancel to 1.0; averaging
+# them linearly gives 1.25, which is biased towards the larger. max_z is lifted
+# here because these two would (rightly) trip the disagreement guard - the
+# point of this check is the arithmetic, which the next check covers in a case
+# the guard allows.
+f2 = I2.fuse_scale_estimates(_cc(a=(2.0, 0.10), b=(0.5, 0.10)), max_z=1e9)
+check("equal-weight fusion is multiplicative (x2 and x0.5 cancel to 1.0)",
+      f2.get("alpha") is not None and abs(f2["alpha"] - 1.0) < 1e-9,
+      f"got {f2.get('alpha')}, arithmetic mean would be 1.25")
+f2b = I2.fuse_scale_estimates(_cc(a=(2.0, 0.10), b=(1.8, 0.10)))
+check("...and it holds for a pair the guard actually allows",
+      abs(f2b["alpha"] - np.sqrt(2.0 * 1.8)) < 1e-9,
+      f"got {f2b.get('alpha')}, want {np.sqrt(2.0*1.8):.6f}")
+
+# the guard: a gap too big for the error bars is a broken source, not noise
+f3 = I2.fuse_scale_estimates(_cc(shadow=(3.0, 0.05), prior=(9.0, 0.10)))
+check("it REFUSES when two sources disagree beyond their error bars",
+      f3.get("applied") is False and f3.get("refused") is True, f3)
+check("...and says which pair disagreed",
+      set(f3.get("disagreeing", [])) == {"shadow", "prior"}, f3.get("disagreeing"))
+check("...and names the tightest source to fall back on",
+      f3.get("tightest_source") == "shadow", f3.get("tightest_source"))
+check("...and returns no alpha, so the caller keeps what it had",
+      f3.get("alpha") is None, f3.get("alpha"))
+
+# one source is not a fusion
+f4 = I2.fuse_scale_estimates(_cc(prior=(4.0, 0.25)))
+check("a single source is left alone", f4.get("applied") is False and
+      f4.get("alpha") is None, f4)
+check("...and it says why", "fewer than two" in f4.get("reason", ""), f4.get("reason"))
+
+# guessed sun angles must carry a wider error bar than tags-derived ones
+d, rgb = _shadow_scene(135, 50)
+_, tag_diag = I2.alpha_from_shadows(d, rgb, 135, 50, 1.0, sun_sigma_deg=0.0)
+_, guess_diag = I2.alpha_from_shadows(d, rgb, 135, 50, 1.0,
+                                      sun_sigma_deg=I2.SUN_GUESS_SIGMA_DEG)
+check("angles read from the file's tags are treated as a measurement",
+      tag_diag["alpha_sigma_rel"] < guess_diag["alpha_sigma_rel"],
+      (tag_diag["alpha_sigma_rel"], guess_diag["alpha_sigma_rel"]))
+check("a 5-degree guess costs roughly the 18% the docstring claims",
+      0.12 < guess_diag["alpha_sigma_rel"] < 0.30,
+      guess_diag["alpha_sigma_rel"])
+
+# ---------------------------------------------------------------------------
+# Control points fitted with a free intercept returned a NEGATIVE alpha from two
+# perfectly good points (54.3 m and 30.5 m on a synthetic scene): alpha = -123.3,
+# which inverts the whole surface. alpha multiplies (detail - ground), so a
+# ground pixel has x = 0 and must give y = 0 - the fit belongs through the
+# origin, and with two points a free intercept leaves no degrees of freedom at
+# all.
+print("\nA11. control points must fit through the origin, and never flip the scene")
+_det = np.zeros((64, 64))
+_det[10:20, 10:20] = 0.40          # a tall roof
+_det[40:50, 40:50] = 0.20          # a shorter one
+# true alpha 100: 0.40 -> 40 m, 0.20 -> 20 m
+_a, _s = I2.alpha_from_gcps(_det, [(15, 15, 40.0), (45, 45, 20.0)], with_sigma=True)
+check("two consistent points recover the known scale",
+      _a is not None and abs(_a - 100.0) < 1.0, f"alpha={_a}")
+check("...and it reports an uncertainty for the fusion to weigh",
+      _s is not None and 0 < _s < 1.0, _s)
+# Through the origin, two POSITIVE points can never produce a negative slope -
+# which is the whole point of the change. Points that rank backwards now yield
+# a compromise with an honestly huge error bar, instead of a confident flip.
+_a2, _s2 = I2.alpha_from_gcps(_det, [(15, 15, 20.0), (45, 45, 40.0)],
+                              with_sigma=True)
+check("points that rank backwards can no longer produce a negative alpha",
+      _a2 is None or _a2 > 0, f"got {_a2}")
+check("...and their disagreement shows up as a much wider error bar",
+      _a2 is None or _s2 > 5 * _s, f"consistent {_s:.3f} vs backwards {_s2:.3f}")
+
+# A control point placed BELOW local ground is the case that can still flip the
+# sum, and that one is refused outright rather than inverting the scene.
+_det2 = np.zeros((64, 64))
+_det2[10:20, 10:20] = -0.50        # a pixel the model puts below ground
+_det2[40:50, 40:50] = 0.10
+_flip = I2.alpha_from_gcps(_det2, [(15, 15, 40.0), (45, 45, 5.0)])
+check("a control point that implies a negative scale is REFUSED",
+      _flip is None, f"got {_flip}")
+_cc_neg = dict(estimates={"gcps": -123.0, "prior": 113.0},
+               sigma_rel={"gcps": 0.05, "prior": 0.25})
+check("a negative estimate never reaches the fusion",
+      I2.fuse_scale_estimates(_cc_neg).get("alpha") is None)
+
+# fusion must stay OFF unless asked for
+import inspect  # noqa: E402
+check("fuse_scale defaults to off",
+      inspect.signature(I2.estimate_elevation).parameters["fuse_scale"].default is False)
+
 print()
 print("=" * 62)
 print("PART B - the datum guard")

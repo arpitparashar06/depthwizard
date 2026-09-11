@@ -1,6 +1,26 @@
-// Thin wrapper over the FastAPI backend. Vite proxies /api to :8000 in dev,
-// and in production server.py serves this bundle from the same origin, so the
-// relative paths work in both without a base-URL switch.
+/* ===========================================================================
+ * api.js - the only file that knows the backend's URLs.
+ * ===========================================================================
+ *
+ * Thin wrapper over the FastAPI backend. Vite proxies /api to :8000 in dev, and
+ * in production server.py serves this bundle from the same origin, so the
+ * relative paths work in both without a base-URL switch.
+ *
+ * THE WHOLE CONTRACT, in four calls - these are the only four things the
+ * browser can ask the server to do, and server.py has a route for each:
+ *
+ *   createJob(file, params)      POST /api/jobs                  -> { job_id }
+ *   getJob(id)                   GET  /api/jobs/:id              -> the job record
+ *   fileUrl(id, name, v)         GET  /api/jobs/:id/files/:name  -> an artefact
+ *   validateJob(id, ref)         POST /api/jobs/:id/validate     -> the report
+ *
+ * plus pollJob(), which is getJob() on a loop with a give-up rule.
+ *
+ * A run takes MINUTES on CPU, so nothing here blocks on it: createJob returns
+ * an id immediately and the job is watched by polling. That is also why the
+ * server writes each job to its own folder on disk - the browser can reload
+ * mid-run, or come back later, and pick the job up from result.json.
+ */
 
 export async function createJob (file, params) {
   const fd = new FormData()

@@ -34,7 +34,8 @@ piece of the science runs, tests and benchmarks on its own; `backend/` puts
 | | `benchmark/` | scene fetcher, harness, report, and the regression tests |
 | `frontend/` | `src/App.jsx` | controls: scale source, geometry, the run itself |
 | | `src/Viewer.jsx` | three.js flythrough, click-to-measure, true-metre readouts |
-| | `src/components/` | dropzone, progress, results, validation panel |
+| | `src/components/` | dropzone, progress, results, validation panel, backdrop |
+| | `src/styles.css` | the whole look, in the order the interface is built |
 
 ## Run
 

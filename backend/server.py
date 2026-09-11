@@ -244,6 +244,7 @@ def _run(job_id, src_path, params):
             adaptive_sigma=bool(params.get("adaptive_sigma", True)),
             height_reference=params.get("height_reference") or "tallest",
             debias_coarse_dem=bool(params.get("debias_coarse_dem", True)),
+            fuse_scale=bool(params.get("fuse_scale", False)),
             sun_azimuth=az, sun_elevation=el,
             use_dem=bool(params.get("use_dem", True)),
             alpha_gain=float(params.get("alpha_gain") or 1.0),
@@ -268,6 +269,16 @@ def _run(job_id, src_path, params):
                       if isinstance(dbg, (int, float)) else ""))
             if isinstance(info.get("alpha"), (int, float)):
                 _log(job_id, f"scale: alpha={info['alpha']:.3f} m per model unit")
+            fus = info.get("scale_fusion") or {}
+            if fus.get("applied"):
+                _log(job_id, f"scale fused from {fus['n_sources']} sources "
+                             f"(+/-{fus['alpha_sigma_rel']*100:.0f}%); the "
+                             f"priority path would have used "
+                             f"{info.get('alpha_priority', float('nan')):.3f}")
+            elif fus.get("refused"):
+                _log(job_id, f"WARNING: scale fusion refused - {fus['reason']}. "
+                             f"Kept the tightest single source "
+                             f"({fus.get('tightest_source')}).")
 
         px = meta.get("px_size_m") or float(params.get("gsd_m") or 0.5)
         if mode == "relative":

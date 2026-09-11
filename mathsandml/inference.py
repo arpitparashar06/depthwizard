@@ -699,6 +699,25 @@ def dem_on_grid(dem_path, meta, shape):
 # measured configuration.
 HEIGHT_REFERENCE_PCT = {"tallest": 99.0, "tall": 95.0, "typical": 60.0}
 
+# ---------------------------------------------------------------------------
+# How much to trust each calibrator, as a FRACTION of the alpha it returns.
+# Only fuse_scale_estimates() reads these; the default priority path ignores
+# them entirely.
+#
+# The landmark prior gets no error bar of its own - it is one number from one
+# person, and nothing in the scene can check it - so it carries a stated one.
+# 25% is what "that block is about 40 m" is worth when the truth is 30 or 50.
+PRIOR_SIGMA_REL   = 0.25
+# Two control points fit a line exactly, leaving no residual to measure scatter
+# from. That is not the same as being perfect, so the fit takes a floor.
+GCP_MIN_SIGMA_REL = 0.05
+# Sun angles a person estimated by eye, rather than read from the file's tags.
+SUN_GUESS_SIGMA_DEG = 5.0
+# Refuse to fuse when two sources disagree by more than this many combined
+# sigmas. A gap that large means one of them is broken, not noisy, and the
+# average of a broken estimate and a working one is simply a worse estimate.
+FUSION_MAX_Z = 3.0
+
 
 def alpha_from_known_height(detail, known_height_m, pct=None, reference="tallest"):
     """Scale from one human guess: "the tallest block here is about 40 m".
@@ -737,20 +756,68 @@ def alpha_from_known_height(detail, known_height_m, pct=None, reference="tallest
     return float(known_height_m / max(top, 1e-9))
 
 
-def alpha_from_gcps(detail, gcps):
-    """gcps = [(row, col, height_above_ground_m), ...]. Needs >= 2.
+def alpha_from_gcps(detail, gcps, with_sigma=False):
+    """Scale from points whose height above the ground you already know.
+
+    IN PLAIN ENGLISH: you tell it "the pixel at row 340, column 120 is 18 m
+    above the street beside it", twice or more. Each point pairs a model value
+    with a metre value, and the slope through them is the conversion.
+
+    gcps = [(row, col, height_above_ground_m), ...]. Needs >= 2.
+
     NOTE: takes the DETAIL band, not raw p. alpha is applied to detail, so it
     must be fitted on detail too - fitting on p gave a NEGATIVE alpha in test,
-    because p still carries residual ramp."""
+    because p still carries residual ramp.
+
+    with_sigma=True returns (alpha, sigma_rel) where sigma_rel is the standard
+    error of the slope as a fraction of the slope - what fuse_scale_estimates()
+    needs to weigh this source. With exactly two points there are no degrees of
+    freedom left to estimate scatter from, so it takes a stated floor instead.
+    """
+    fail = (None, None) if with_sigma else None
     if not gcps or len(gcps) < 2:
-        return None
+        return fail
     g = ground_level(detail)
     x = np.array([detail[int(r), int(c)] - g for r, c, _ in gcps], float)
     y = np.array([h for _, _, h in gcps], float)
     ok = np.isfinite(x) & np.isfinite(y) & (np.abs(x) > 1e-9)
     if ok.sum() < 2:
-        return None
-    return float(np.polyfit(x[ok], y[ok], 1)[0])
+        return fail
+    xs, ys = x[ok], y[ok]
+    n = int(ok.sum())
+
+    # THROUGH THE ORIGIN, and this is not a detail. alpha is applied as
+    #     height above ground = alpha * (detail - ground_level(detail))
+    # so a pixel at ground level has x = 0 and MUST give y = 0. A line with a
+    # free intercept does not respect that, and with exactly two points it has
+    # no degrees of freedom left either - the slope is then whatever the two
+    # points demand, including negative. Measured on a synthetic scene with two
+    # correct control points (54.3 m and 30.5 m): the free-intercept fit
+    # returned alpha = -123.3, which inverts the entire surface - every
+    # building becomes a pit - and nothing downstream checked the sign.
+    sxx = float(np.sum(xs * xs))
+    if sxx < 1e-12:
+        return fail
+    alpha = float(np.sum(xs * ys) / sxx)
+
+    # A non-positive alpha means the control points say the model ranks these
+    # structures backwards. That is not a scale, it is a contradiction, and
+    # accepting it would flip the scene. Refuse and let the caller fall through
+    # to another source.
+    if not np.isfinite(alpha) or alpha <= 0:
+        print(f"[gcp] REJECTED: the control points imply alpha={alpha:.2f}, "
+              f"which is not a positive scale. The model ranks these "
+              f"{n} points in the opposite order to their stated heights - "
+              f"check the rows and columns are not swapped.")
+        return fail
+    if not with_sigma:
+        return alpha
+
+    resid = ys - alpha * xs
+    dof = max(n - 1, 1)                    # one parameter, not two
+    s = float(np.sqrt(np.sum(resid ** 2) / dof))
+    sigma_rel = (s / np.sqrt(sxx)) / alpha
+    return alpha, float(np.clip(sigma_rel, GCP_MIN_SIGMA_REL, 2.0))
 
 
 
@@ -798,8 +865,17 @@ def _cv_ratio(X, Y, folds=5, seed=0):
     y_te = np.concatenate(truth)
     ratios = Y / X
     q1, q3 = np.percentile(ratios, [25, 75])
+    # How well is the MEDIAN of these ratios pinned down? A robust spread of the
+    # per-pair ratios, divided by sqrt(n) for the median's standard error, and
+    # expressed as a FRACTION of alpha itself - alpha is a scale factor, so its
+    # error is multiplicative. This is what lets fuse_scale_estimates() weigh
+    # this source against the others instead of averaging them blind.
+    med = float(np.median(ratios))
+    robust_sd = 1.4826 * float(np.median(np.abs(ratios - med)))
+    sigma_rel = (1.253 * robust_sd / max(abs(med), 1e-9)) / max(np.sqrt(n), 1.0)
     return dict(
         n=int(n),
+        alpha_sigma_rel=float(np.clip(sigma_rel, 0.01, 2.0)),
         rmse_m=float(np.sqrt(np.mean(e ** 2))),
         mae_m=float(np.mean(np.abs(e))),
         bias_m=float(np.mean(e)),
@@ -816,7 +892,8 @@ def _cv_ratio(X, Y, folds=5, seed=0):
 ROOF_PROBE_M = (1.0, 2.0, 4.0, 7.0, 11.0)
 
 
-def alpha_from_shadows(detail, rgb, sun_az_deg, sun_elev_deg, px_size_m):
+def alpha_from_shadows(detail, rgb, sun_az_deg, sun_elev_deg, px_size_m,
+                       sun_sigma_deg=0.0):
     """Scale from the shadows the buildings cast. No input from anyone.
 
     IN PLAIN ENGLISH: a building's shadow is long when the building is tall and
@@ -980,6 +1057,26 @@ def alpha_from_shadows(detail, rgb, sun_az_deg, sun_elev_deg, px_size_m):
     # median ratio is robust enough here and needs no sklearn
     a_est = float(np.median(np.array(Y) / np.array(X)))
     diag = dict(_cv_ratio(X, Y), rejected=drop)
+
+    # An error in the SUN ANGLE is not visible to the cross-validation above:
+    # every pair uses the same angle, so a wrong one is self-consistently wrong
+    # and the held-out error still looks excellent. That is precisely the source
+    # that would poison an inverse-variance fusion, so it is accounted for here.
+    #
+    #   h = L * tan(e)   ->   dh/h = de / (sin e * cos e)
+    #
+    # A 5-degree guess at elevation 52 is about 18% on alpha. Pass
+    # sun_sigma_deg=0 when the angles came from the GeoTIFF's own tags, which
+    # is the only case where they are a measurement rather than an estimate.
+    if sun_sigma_deg:
+        e = np.deg2rad(float(sun_elev_deg))
+        denom = max(abs(np.sin(e) * np.cos(e)), 1e-6)
+        sun_rel = float(np.deg2rad(float(sun_sigma_deg)) / denom)
+        stat_rel = float(diag.get("alpha_sigma_rel", 0.1))
+        diag["alpha_sigma_rel"] = float(np.clip(
+            np.hypot(stat_rel, sun_rel), 0.01, 2.0))
+        diag["sun_sigma_deg"] = float(sun_sigma_deg)
+        diag["sun_angle_rel_contribution"] = sun_rel
     if "rmse_m" in diag:
         print(f"[shadow] alpha={a_est:.2f} from {len(X)} pairs | "
               f"held-out RMSE {diag['rmse_m']:.2f} m, "
@@ -990,7 +1087,7 @@ def alpha_from_shadows(detail, rgb, sun_az_deg, sun_elev_deg, px_size_m):
 
 
 def cross_check_scale(detail, rgb, px_size_m, known_height_m=None, gcps=None,
-                      sun_azimuth=None, sun_elevation=None):
+                      sun_azimuth=None, sun_elevation=None, sun_sigma_deg=0.0):
     """Run every available scale source and report whether they agree.
 
     The three calibrators are mutually independent: shadow length is pure
@@ -1003,26 +1100,30 @@ def cross_check_scale(detail, rgb, px_size_m, known_height_m=None, gcps=None,
     its documented order. It reports the spread so the number can be quoted with
     a confidence rather than on its own.
     """
-    est, notes = {}, {}
+    est, notes, sig = {}, {}, {}
     if sun_azimuth is not None and sun_elevation is not None:
         try:
             a, diag = alpha_from_shadows(detail, rgb, sun_azimuth, sun_elevation,
-                                         px_size_m)
-            if a:
+                                         px_size_m, sun_sigma_deg=sun_sigma_deg)
+            if a and a > 0:
                 est["shadow"] = float(a)
                 notes["shadow"] = diag
+                sig["shadow"] = float(diag.get("alpha_sigma_rel", 0.20))
         except Exception as e:
             notes["shadow"] = {"error": f"{type(e).__name__}: {e}"}
     if gcps and len(gcps) >= 2:
-        a = alpha_from_gcps(detail, gcps)
-        if a:
+        a, s = alpha_from_gcps(detail, gcps, with_sigma=True)
+        if a and a > 0:
             est["gcps"] = float(a)
-            notes["gcps"] = {"n": len(gcps)}
+            notes["gcps"] = {"n": len(gcps), "alpha_sigma_rel": s}
+            sig["gcps"] = float(s)
     if known_height_m:
         est["prior"] = float(alpha_from_known_height(detail, known_height_m))
-        notes["prior"] = {"known_height_m": float(known_height_m)}
+        notes["prior"] = {"known_height_m": float(known_height_m),
+                          "alpha_sigma_rel": PRIOR_SIGMA_REL}
+        sig["prior"] = PRIOR_SIGMA_REL
 
-    out = dict(estimates=est, detail=notes, n_sources=len(est))
+    out = dict(estimates=est, sigma_rel=sig, detail=notes, n_sources=len(est))
     if len(est) >= 2:
         v = np.array(list(est.values()), float)
         lo, hi = float(v.min()), float(v.max())
@@ -1036,6 +1137,81 @@ def cross_check_scale(detail, rgb, px_size_m, known_height_m=None, gcps=None,
         k = next(iter(est))
         print(f"[cross-check] only one scale source ({k}) - no agreement to report")
     return out
+
+
+def fuse_scale_estimates(cross_check, max_z=FUSION_MAX_Z):
+    """Combine the independent calibrators into one alpha, by how much each is
+    worth. OFF by default - estimate_elevation(fuse_scale=True) turns it on.
+
+    IN PLAIN ENGLISH: shadows, control points and a landmark guess all answer
+    the same question, and averaging them treats a guess as equal to a
+    measurement. They are combined by INVERSE VARIANCE instead, so the source
+    that knows its own error is small dominates and the vague one only nudges.
+
+        alpha = exp( sum(ln(alpha_i) / sigma_i^2) / sum(1 / sigma_i^2) )
+
+    Two details that matter:
+
+    LOG SPACE. alpha is a scale factor, so its errors are multiplicative - x2
+    and x0.5 are equally wrong. Averaging 2 and 0.5 in linear space gives 1.25,
+    which is biased high; in log space it gives 1.0. The sigmas are relative
+    (a fraction of alpha), which is the same reason.
+
+    THE DISAGREEMENT GUARD. If two sources sit further apart than their own
+    error bars can explain - more than `max_z` combined sigmas - one of them is
+    BROKEN, not noisy, and blending is the wrong response: the result is wrong
+    by roughly half the gap, and the disagreement, which was real evidence,
+    disappears into a plausible-looking number. It refuses instead, keeps the
+    single tightest source, and says so.
+
+    Returns a dict that always records what it decided and why. `alpha` is None
+    when it declined, in which case the caller keeps whatever it had.
+    """
+    est = (cross_check or {}).get("estimates") or {}
+    sig = (cross_check or {}).get("sigma_rel") or {}
+    usable = {k: (float(est[k]), float(sig.get(k, 0.25)))
+              for k in est if np.isfinite(est.get(k, np.nan)) and est[k] > 0}
+
+    if len(usable) < 2:
+        return dict(applied=False, alpha=None, n_sources=len(usable),
+                    reason="fewer than two usable sources - nothing to fuse")
+
+    names = sorted(usable)
+    a = np.array([usable[k][0] for k in names], float)
+    s = np.array([max(usable[k][1], 1e-3) for k in names], float)
+
+    # the guard, pairwise, in the same log space the fusion uses
+    worst_z, worst_pair = 0.0, None
+    for i in range(len(names)):
+        for j in range(i + 1, len(names)):
+            z = abs(np.log(a[i]) - np.log(a[j])) / np.sqrt(s[i] ** 2 + s[j] ** 2)
+            if z > worst_z:
+                worst_z, worst_pair = float(z), (names[i], names[j])
+
+    tightest = names[int(np.argmin(s))]
+    detail = {k: dict(alpha=usable[k][0], sigma_rel=usable[k][1]) for k in names}
+
+    if worst_z > max_z:
+        print(f"[fuse] REFUSED: {worst_pair[0]}={usable[worst_pair[0]][0]:.2f} and "
+              f"{worst_pair[1]}={usable[worst_pair[1]][0]:.2f} disagree by "
+              f"{worst_z:.1f} sigma - one of them is wrong, not noisy. "
+              f"Keeping the tightest single source ({tightest}).")
+        return dict(applied=False, alpha=None, refused=True,
+                    reason=(f"{worst_pair[0]} and {worst_pair[1]} disagree by "
+                            f"{worst_z:.1f} sigma (limit {max_z})"),
+                    worst_z=worst_z, disagreeing=list(worst_pair),
+                    tightest_source=tightest, sources=detail)
+
+    w = 1.0 / s ** 2
+    fused = float(np.exp(float(np.sum(w * np.log(a)) / np.sum(w))))
+    fused_sigma = float(1.0 / np.sqrt(np.sum(w)))
+    print("[fuse] " + " + ".join(f"{k}={usable[k][0]:.2f}±{usable[k][1]*100:.0f}%"
+                                 for k in names)
+          + f" -> alpha={fused:.3f}±{fused_sigma*100:.0f}% "
+            f"(worst disagreement {worst_z:.1f} sigma)")
+    return dict(applied=True, alpha=fused, alpha_sigma_rel=fused_sigma,
+                n_sources=len(names), worst_z=worst_z, sources=detail,
+                method="inverse-variance in log space")
 
 
 def confidence_report(spread, height, meta, ground_spread, cross_check,
@@ -1073,7 +1249,8 @@ def estimate_elevation(path, known_height_m=None, gcps=None,
                        sun_azimuth=None, sun_elevation=None,
                        use_dem=True, alpha_gain=1.0, outdir="outputs",
                        rotations=ROTATIONS, adaptive_sigma=True,
-                       height_reference="tallest", debias_coarse_dem=True):
+                       height_reference="tallest", debias_coarse_dem=True,
+                       fuse_scale=False, sun_from_tags=False):
     """THE MAIN FUNCTION. Image path in, elevation map out.
 
     The numbered list at the top of this file is the order of what follows -
@@ -1095,6 +1272,17 @@ def estimate_elevation(path, known_height_m=None, gcps=None,
                     reverts to a single pass and the plane-fit detrend.
     adaptive_sigma  size the object/terrain split from the scene's own
                     structures instead of from the coarse DEM's resolution.
+    fuse_scale      combine every calibrator that answered into one alpha by
+                    inverse variance, instead of taking the first in priority
+                    order. OFF by default: the accuracy figures in the
+                    benchmark were produced with the priority path, and this
+                    has not been measured against LiDAR yet. See
+                    fuse_scale_estimates().
+    sun_from_tags   True when the sun angles came from the GeoTIFF's own tags
+                    rather than from a person. Only affects the error bar the
+                    shadow calibrator carries into the fusion - angles read
+                    from the file are a measurement, angles typed by eye are
+                    a guess worth about 18% on alpha.
     """
     os.makedirs(outdir, exist_ok=True)
     rgb, meta = load_image(path)
@@ -1174,13 +1362,19 @@ def estimate_elevation(path, known_height_m=None, gcps=None,
             and not gcps and not known_height_m):
         # last resort only - an explicit choice by the caller always wins
         sun_azimuth, sun_elevation = meta.get("sun_azimuth"), meta.get("sun_elevation")
+        if sun_azimuth is not None and sun_elevation is not None:
+            sun_from_tags = True          # read from the file, not guessed
+    sun_sigma_deg = 0.0 if sun_from_tags else SUN_GUESS_SIGMA_DEG
     if sun_azimuth is not None and sun_elevation is not None:
         tried_shadows = True
-        alpha, sdiag = alpha_from_shadows(detail, rgb, sun_azimuth, sun_elevation, px)
+        alpha, sdiag = alpha_from_shadows(detail, rgb, sun_azimuth, sun_elevation,
+                                          px, sun_sigma_deg=sun_sigma_deg)
         info["self_check"] = sdiag
+        info["sun_from_tags"] = bool(sun_from_tags)
     if alpha is None and gcps:
         alpha = alpha_from_gcps(detail, gcps)
-        print(f"[gcp] alpha={alpha}")
+        if alpha is not None:
+            print(f"[gcp] alpha={alpha:.3f} from {len(gcps)} control points")
     if alpha is None and known_height_m:
         alpha = alpha_from_known_height(detail, known_height_m,
                                         reference=height_reference)
@@ -1217,7 +1411,24 @@ def estimate_elevation(path, known_height_m=None, gcps=None,
     # which is the only confidence statement available where no LiDAR exists.
     info["cross_check"] = cross_check_scale(
         detail, rgb, px, known_height_m=known_height_m, gcps=gcps,
-        sun_azimuth=sun_azimuth, sun_elevation=sun_elevation)
+        sun_azimuth=sun_azimuth, sun_elevation=sun_elevation,
+        sun_sigma_deg=sun_sigma_deg)
+
+    # ...unless the caller asked for the sources to be COMBINED rather than
+    # ranked. Off by default, so the path above is untouched for every run that
+    # does not opt in. The gain is re-applied because the fusion works from the
+    # raw estimates, which never saw it.
+    if fuse_scale:
+        fusion = fuse_scale_estimates(info["cross_check"])
+        info["scale_fusion"] = fusion
+        if fusion.get("alpha") is not None:
+            alpha = float(fusion["alpha"])
+            if alpha_gain and abs(alpha_gain - 1.0) > 1e-6:
+                alpha *= float(alpha_gain)
+            info["alpha_priority"] = info["alpha"]      # what it would have been
+            info["alpha"] = float(alpha)
+            print(f"[calib] alpha replaced by the fused estimate: "
+                  f"{info['alpha_priority']:.3f} -> {alpha:.3f}")
 
     dem_path = fetch_dem(meta, os.path.join(outdir, "dem_coarse.tif")) if use_dem else None
     if dem_path:

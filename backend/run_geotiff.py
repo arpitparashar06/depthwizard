@@ -87,6 +87,12 @@ def main():
                    metavar=("AZ", "ELEV"),
                    help="sun azimuth and elevation for shadow calibration; "
                         "read from the GeoTIFF tags automatically when present")
+    g.add_argument("--fuse-scale", action="store_true",
+                   help="combine every calibrator that answers into one alpha "
+                        "by inverse variance, instead of taking the first in "
+                        "priority order. Needs at least two sources; refuses "
+                        "and keeps the tightest when they disagree beyond "
+                        "their error bars")
     g.add_argument("--alpha-gain", type=float, default=1.0,
                    help="multiplier on the fitted scale; feed back the value "
                         "the validation report suggests")
@@ -152,7 +158,7 @@ def main():
         sun_azimuth=az, sun_elevation=el,
         use_dem=not args.no_dem, alpha_gain=args.alpha_gain,
         rotations=args.rotations, height_reference=args.height_reference,
-        outdir=out)
+        fuse_scale=args.fuse_scale, outdir=out)
 
     px = meta.get("px_size_m") or args.gsd
     if mode == "relative":
@@ -226,6 +232,14 @@ def main():
 
     if info.get("alpha") is not None:
         print(f"scale        alpha {info['alpha']:.3f} m per model unit")
+    fus = info.get("scale_fusion")
+    if fus:
+        if fus.get("applied"):
+            print(f"             fused from {fus['n_sources']} sources, "
+                  f"+/-{fus['alpha_sigma_rel']*100:.0f}% "
+                  f"(priority path would have used {info['alpha_priority']:.3f})")
+        elif fus.get("refused"):
+            print(f"             fusion REFUSED: {fus['reason']}")
     u = "m" if datum != "relative" else "m*"
     print(f"range        {np.nanmin(height):.1f} .. {np.nanmax(height):.1f} {u}"
           f"   (relief {np.nanmax(height) - np.nanmin(height):.1f} {u})")

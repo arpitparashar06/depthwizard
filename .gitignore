@@ -11,6 +11,3 @@ mathsandml/benchmark/scenes/
 mathsandml/benchmark/results/
 .env
 *.bak
-
-# experiment outputs - the script regenerates them
-mathsandml/benchmark/mode_comparison/

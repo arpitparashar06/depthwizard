@@ -18,7 +18,6 @@ jobs/
 outputs/
 mathsandml/benchmark/scenes/
 mathsandml/benchmark/results/
-mathsandml/benchmark/mode_comparison/
 dem_coarse.tif
 *.bak
 .DS_Store

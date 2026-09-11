@@ -19,6 +19,11 @@
  * THE ONE RULE THE UI ENFORCES: a georeferenced image cannot run without a
  * scale source, because alpha (metres per model unit) is one number that sets
  * every elevation in the scene. See DEFAULTS below and server.py.
+ *
+ * LAYOUT, top to bottom: <AmbientBackground> (decoration only) -> a sticky
+ * nav bar -> the hero -> a two-column grid, controls on the left and output
+ * on the right. The hero is a headline and one sentence; there is deliberately
+ * no marketing strip of feature pills, because the panel below it is the demo.
  */
 import { useCallback, useEffect, useRef, useState } from 'react'
 import Viewer from './Viewer.jsx'
@@ -26,11 +31,16 @@ import Dropzone from './components/Dropzone.jsx'
 import RunProgress from './components/RunProgress.jsx'
 import Results from './components/Results.jsx'
 import Validation from './components/Validation.jsx'
+import AmbientBackground from './components/AmbientBackground.jsx'
 import { createJob, pollJob, fileUrl, validateJob } from './api.js'
 
-/* known_height_m starts EMPTY on purpose. alpha is metres per model unit and
+/* Every key here is sent to the backend verbatim as the job's params, so this
+ * object doubles as the list of what the API accepts - server.py reads the
+ * same names.
+ *
+ * known_height_m starts EMPTY on purpose. alpha is metres per model unit and
  * this one number sets it for the whole scene, so a georeferenced image is
- * refused rather than silently anchored to a default. See server.py. */
+ * refused rather than silently anchored to a default. */
 const DEFAULTS = {
   style: 'city',
   gsd_m: 0.5,
@@ -39,6 +49,7 @@ const DEFAULTS = {
   sun_azimuth: 145,
   sun_elevation: 52,
   use_dem: true,
+  fuse_scale: false,
   alpha_gain: 1.0,
   flatten: 0.8,
   sharpen: 0.4,
@@ -46,6 +57,7 @@ const DEFAULTS = {
   target_grid: 256
 }
 
+/* [id, button label, the hint shown under the segmented control] */
 const STYLES = [
   ['city', 'City', 'Footprints extruded as separate prisms'],
   ['stepped', 'Stepped', 'One surface with real vertical walls'],
@@ -63,9 +75,15 @@ const SCALE_SOURCES = [
   ['sun', 'Shadows', 'Sun angles — read from the GeoTIFF tags when the file carries them']
 ]
 
+/* The validator writes these five files AFTER result.json was saved, so they
+ * are not in job.result.files and have to be added to the download list by
+ * hand once a report exists. See onReference() below. */
 const VALIDATION_ARTEFACTS = ['validation.md', 'validation.json',
                               'error_map.png', 'scatter.png', 'stability.png']
 
+/* One labelled control: title on the left, live value on the right, the input
+ * itself, then the explanation. Every setting in the left panel uses it, which
+ * is why they all line up. */
 function Field ({ label, value, hint, required, children }) {
   return (
     <label className={`field${required ? ' required' : ''}`}>
@@ -79,6 +97,9 @@ function Field ({ label, value, hint, required, children }) {
   )
 }
 
+/* The ground-control-point table. Rows are held as STRINGS while being typed
+ * (an empty cell has to stay empty rather than becoming 0) and are converted
+ * to numbers once, in run(), where incomplete rows are dropped. */
 function GcpEditor ({ gcps, onChange, disabled }) {
   const set = (i, k) => (e) => {
     const v = e.target.value
@@ -108,20 +129,36 @@ function GcpEditor ({ gcps, onChange, disabled }) {
 }
 
 export default function App () {
-  const [file, setFile] = useState(null)
+  const [file, setFile] = useState(null)       // the image the user picked
   const [params, setParams] = useState(DEFAULTS)
   const [gcps, setGcps] = useState([{ row: '', col: '', height_m: '' },
                                     { row: '', col: '', height_m: '' }])
-  const [job, setJob] = useState(null)
-  const [busy, setBusy] = useState(false)
+  const [job, setJob] = useState(null)         // the whole server-side job record
+  const [busy, setBusy] = useState(false)      // a run is in flight
   const [error, setError] = useState('')
-  const [report, setReport] = useState(null)
+  const [report, setReport] = useState(null)   // validation result, if scored
   const [validating, setValidating] = useState(false)
   const [valError, setValError] = useState('')
   const [tab, setTab] = useState('3d')
-  const [stamp, setStamp] = useState(0)
-  const stopRef = useRef(null)
+  const [stamp, setStamp] = useState(0)        // cache-buster for re-validation
+  const [scrolled, setScrolled] = useState(false)  // has the page moved at all?
+  const stopRef = useRef(null)                 // cancels the running poll loop
 
+  /* The top bar has no chrome until you scroll: at rest it sits straight on the
+   * paper, and the moment the page moves it becomes a white card with a border
+   * and a shadow, so it stays readable over whatever scrolls underneath it.
+   * Passive listener - this never calls preventDefault, and saying so lets the
+   * browser scroll without waiting on us. */
+  useEffect(() => {
+    const onScroll = () => setScrolled(window.scrollY > 8)
+    onScroll()                                  // correct on a restored scroll position
+    window.addEventListener('scroll', onScroll, { passive: true })
+    return () => window.removeEventListener('scroll', onScroll)
+  }, [])
+
+  /* One change handler for every input. Checkboxes give booleans, number and
+   * range inputs give numbers (but an empty string stays empty, so a cleared
+   * box does not silently become 0), everything else gives its string. */
   const set = (k) => (e) => {
     const t = e.target
     const v = t.type === 'checkbox' ? t.checked
@@ -131,10 +168,12 @@ export default function App () {
     setParams((p) => ({ ...p, [k]: v }))
   }
 
+  // stop polling if the component goes away mid-run
   useEffect(() => () => { if (stopRef.current) stopRef.current() }, [])
 
   const run = useCallback(async () => {
     if (!file) { setError('Choose an image first.'); return }
+    // strings -> numbers, and half-filled rows are dropped rather than sent
     const clean = gcps
       .filter((g) => g.row !== '' && g.col !== '' && g.height_m !== '')
       .map((g) => [Number(g.row), Number(g.col), Number(g.height_m)])
@@ -146,6 +185,7 @@ export default function App () {
     setError(''); setReport(null); setValError(''); setBusy(true); setJob(null); setTab('3d')
     try {
       const { job_id } = await createJob(file, { ...params, gcps: clean })
+      // pollJob calls back on every status change and returns its own stopper
       stopRef.current = pollJob(job_id, (j) => {
         setJob(j)
         if (j.status === 'done' || j.status === 'error') {
@@ -177,6 +217,10 @@ export default function App () {
   const glb = res ? fileUrl(job.id, 'terrain.glb') : null
   const heightMap = res ? fileUrl(job.id, 'height16.png') : null
 
+  /* The datum badge. This is the single most important thing on the screen for
+   * a judge: it says whether the numbers are metres above SEA LEVEL, metres
+   * above LOCAL GROUND, or not metres at all. See Results.jsx for the long
+   * version and inference.py for where the datum is decided. */
   const chip = !res
     ? null
     : res.datum === 'sea level' ? { cls: 'on', text: 'absolute · sea level' }
@@ -185,14 +229,45 @@ export default function App () {
 
   return (
     <div className="app">
-      <div className="topbar">
-        <div className="brand">
-          <h1>DepthWizard</h1>
-          <span className="tagline">one optical image in — a measurable, navigable 3D city out</span>
+      {/* decoration only - drifting dots and a cursor spotlight, pointer-events
+          off, and it draws a single static frame under prefers-reduced-motion */}
+      <AmbientBackground />
+
+      {/* One wide bar: identity on the left, state on the right. The datum
+          lives here rather than in the hero because the bar is sticky - once a
+          run finishes, the one thing you must not misread stays on screen
+          however far down the page you scroll. `is-stuck` is what gives it its
+          card once the page has moved; see the scroll effect above. */}
+      <nav className="site-nav">
+        <div className={`nav-bar${scrolled ? ' is-stuck' : ''}`}>
+          <a href="#" className="nav-brand">
+            <span className="nav-mark" aria-hidden="true" />
+            <span>DepthWizard</span>
+          </a>
+          <div className="nav-meta">
+            <span className="nav-note">single-view elevation</span>
+            <span className="nav-tag">SIH · ISRO</span>
+            {chip && (
+              <span className={`nav-chip ${chip.cls}`}>
+                <span className="dot-live" />
+                <span>{chip.text}</span>
+              </span>
+            )}
+          </div>
         </div>
-        <span className="spacer" />
-        {chip && <span className={`mode-chip ${chip.cls}`}>{chip.text}</span>}
-      </div>
+      </nav>
+
+      <header className="hero">
+        <h1 className="hero-title">
+          Single-View Height Estimation<br />
+          <span className="muted">&amp; 3D Flythrough</span>
+        </h1>
+        <p className="hero-subtitle">
+          One optical image in. A Digital Surface Model in real metres out — plus a
+          city you can fly through and measure, from a single frame with no stereo
+          pair, no LiDAR and no radar.
+        </p>
+      </header>
 
       <div className="layout">
         {/* ------------------------------------------------------- controls */}
@@ -202,6 +277,9 @@ export default function App () {
             <Dropzone file={file} disabled={busy}
                       onFile={(f) => { setFile(f); setReport(null); setError('') }} />
 
+            {/* ---------------------------------------------------- scale --
+                Where metres come from. Picking a source swaps the inputs
+                below it, because each calibrator needs different evidence. */}
             <p className="section-label" style={{ marginTop: 24 }}>Scale</p>
             <Field label="Where metres come from"
                    hint={SCALE_SOURCES.find((s) => s[0] === params.scale_source)?.[2]}>
@@ -230,6 +308,9 @@ export default function App () {
               </Field>
             )}
 
+            {/* These two are PRE-FILLED from the GeoTIFF's own sun tags by the
+                backend when the file carries them; what is typed here is the
+                fallback for imagery that does not. See inference.py. */}
             {params.scale_source === 'sun' && (
               <>
                 <Field label="Sun azimuth" value={`${params.sun_azimuth}°`}
@@ -251,6 +332,7 @@ export default function App () {
                      value={params.gsd_m} onChange={set('gsd_m')} />
             </Field>
 
+            {/* ------------------------------------------------- geometry -- */}
             <p className="section-label" style={{ marginTop: 24 }}>Geometry</p>
             <Field label="Style" hint={STYLES.find((s) => s[0] === params.style)?.[2]}>
               <div className="seg" role="group" aria-label="Mesh style">
@@ -266,6 +348,9 @@ export default function App () {
                      value={params.z_exaggeration} onChange={set('z_exaggeration')} />
             </Field>
 
+            {/* Collapsed by default: everything below changes the maths rather
+                than the framing, and a first-time user should not have to read
+                it to get a result. */}
             <details className="adv">
               <summary>Advanced</summary>
               <div className="body">
@@ -289,6 +374,23 @@ export default function App () {
                   <input type="range" min="0.4" max="2.5" step="0.02"
                          value={params.alpha_gain} onChange={set('alpha_gain')} />
                 </Field>
+                {/* inverse-variance fusion, inference.py::fuse_scale_estimates */}
+                <label className="check">
+                  <input type="checkbox" checked={params.fuse_scale}
+                         onChange={set('fuse_scale')} />
+                  <span>
+                    <b>Combine every scale source</b>
+                    <span className="hint">
+                      Off, the first calibrator that answers sets the scale
+                      (shadows, then control points, then the landmark). On,
+                      every one that answers is combined by how well it knows
+                      its own error — and it refuses to combine sources that
+                      disagree by more than their error bars allow. Needs at
+                      least two sources to do anything.
+                    </span>
+                  </span>
+                </label>
+                {/* this checkbox is what decides the datum badge at the top */}
                 <label className="check">
                   <input type="checkbox" checked={params.use_dem} onChange={set('use_dem')} />
                   <span>
@@ -313,7 +415,11 @@ export default function App () {
           </div>
         </aside>
 
-        {/* --------------------------------------------------------- output */}
+        {/* --------------------------------------------------------- output --
+            The stage shows exactly one of three things: the elevation map, the
+            3D viewer, or - before any run - the explanation of what the tool
+            is for. Below it, progress then results then validation appear as
+            they become available. */}
         <main>
           <div className="tabs" role="tablist">
             <button role="tab" aria-selected={tab === '3d'}

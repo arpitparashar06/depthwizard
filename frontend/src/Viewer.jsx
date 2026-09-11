@@ -52,13 +52,15 @@ export default function Viewer({ url, exaggeration = 1, baseM = 0, units = 'm' }
 
     const keys = {}
     const scene = new THREE.Scene()
-    scene.background = new THREE.Color(0x07090c)
+    // matched to .stage's background in styles.css, so there is no seam
+    // between the CSS box and the canvas while the .glb downloads
+    scene.background = new THREE.Color(0x010110)
     const camera = new THREE.PerspectiveCamera(70, 1, 0.5, 60000)
     const renderer = new THREE.WebGLRenderer({ antialias: true })
     renderer.setPixelRatio(Math.min(devicePixelRatio, 2))
     host.appendChild(renderer.domElement)
 
-    scene.add(new THREE.HemisphereLight(0xdfefff, 0x2a2620, 2.0))
+    scene.add(new THREE.HemisphereLight(0xdfe6ff, 0x1a1a2a, 2.0))
     const sun = new THREE.DirectionalLight(0xffffff, 1.4)
     sun.position.set(1, 2, 1.5)
     scene.add(sun)
@@ -85,7 +87,7 @@ export default function Viewer({ url, exaggeration = 1, baseM = 0, units = 'm' }
         const box = new THREE.Box3().setFromObject(terrain)
         const size = box.getSize(new THREE.Vector3())
         const mid = box.getCenter(new THREE.Vector3())
-        scene.fog = new THREE.Fog(0x07090c, size.length() * 0.3, size.length() * 1.8)
+        scene.fog = new THREE.Fog(0x010110, size.length() * 0.3, size.length() * 1.8)
         camera.position.set(mid.x - size.x * 0.55,
                             box.max.y + size.y * 0.8 + size.z * 0.25,
                             mid.z + size.z * 0.75)
@@ -171,7 +173,7 @@ export default function Viewer({ url, exaggeration = 1, baseM = 0, units = 'm' }
       if (!hit) { setHud((h) => ({ ...h, probe: 'no surface under crosshair' })); return }
       const m = new THREE.Mesh(
         new THREE.SphereGeometry(Math.max(1, hit.distance * 0.006), 12, 8),
-        new THREE.MeshBasicMaterial({ color: 0x5fd3f5 }))
+        new THREE.MeshBasicMaterial({ color: 0x5b4fff }))   // --accent
       m.position.copy(hit.point)
       pinGroup.add(m)
       pins.push(hit.point.clone())

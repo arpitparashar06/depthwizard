@@ -170,6 +170,17 @@ def _run(job_id, src_path, params):
         mode = meta["mode"]
         _log(job_id, f"{rgb.shape[1]}x{rgb.shape[0]} px, mode={mode}")
 
+        # What the conditioning chain did to the image before the model saw
+        # it. Band reordering and cloud masking change the result, so they
+        # belong in the run's own log, not only in meta.json.
+        try:
+            import preprocess as PRE
+            _prep = PRE.summarise(meta.get("preprocess") or {})
+            if _prep:
+                _log(job_id, f"preprocessing: {_prep}")
+        except Exception:
+            pass
+
         # Cost scales with tile count, not pixel count, and people quite
         # reasonably assume a stalled-looking terminal means a crash. A
         # 2352x1222 image is 40 tiles against a 600x600 tile's 9, so the same

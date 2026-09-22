@@ -678,3 +678,10 @@ kbd{
 
 .note{font-size:12px;color:var(--faint);line-height:1.55;margin:var(--s3) 0 0}
 .hidden-input{display:none}
+
+/* The overlay swallows clicks so it can grab pointer lock, so the human-scale
+   button has to claim its own pointer events back. */
+.mode-toggle {
+  margin-top: 18px;
+  pointer-events: auto;
+}

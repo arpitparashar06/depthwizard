@@ -72,6 +72,8 @@ import numpy as np
 from PIL import Image
 from scipy.ndimage import gaussian_filter, minimum_filter, maximum_filter
 
+import preprocess as PRE
+
 # ----------------------------------------------------------------------------
 # CONFIG
 # ----------------------------------------------------------------------------
@@ -89,6 +91,10 @@ DEM_RES_M    = 30.0
 # uncertainty map; it costs 4x the inference time. 1 disables the ensemble.
 ROTATIONS    = int(os.environ.get("DEPTH_ROTATIONS", "4"))
 OPENTOPO_KEY = os.environ.get("OPENTOPO_KEY", "")   # free: portal.opentopography.org
+# Largest raster read at full resolution. Past this, rasterio decimates
+# during the read so the full array never exists in memory. 40 MP is about
+# 6300x6300 - comfortably above any scene a CPU run would finish anyway.
+MAX_READ_PIXELS = int(os.environ.get("MAX_READ_PIXELS", 40_000_000))
 
 _pipe = None
 
@@ -96,22 +102,75 @@ _pipe = None
 # ----------------------------------------------------------------------------
 # 1. LOAD  (route on metadata, not extension - a .tif can be untagged)
 # ----------------------------------------------------------------------------
-def load_image(path):
-    """Returns (rgb uint8 HxWx3, meta). meta['mode'] is 'absolute' or 'relative'."""
+def load_image(path, preprocess=True):
+    """Returns (rgb uint8 HxWx3, meta). meta['mode'] is 'absolute' or 'relative'.
+
+    preprocess : run the conditioning chain in preprocess.py - pick the real
+        RGB bands, mask cloud and deep shadow, stretch each band, gentle
+        CLAHE. Pass False to reproduce a benchmark taken before this existed.
+        The conditioning changes what the backbone sees, so an accuracy
+        number is only comparable to another number taken the same way.
+    """
     import rasterio
     from rasterio.transform import Affine
 
     meta = dict(path=path, mode="relative", crs=None, transform=None,
-                px_size_m=None, bounds=None, sun_azimuth=None, sun_elevation=None)
+                px_size_m=None, bounds=None, sun_azimuth=None, sun_elevation=None,
+                valid_mask=None, preprocess=None)
 
     if os.path.splitext(path)[1].lower() in (".tif", ".tiff"):
         with rasterio.open(path) as ds:
-            arr = ds.read()
-            n = min(3, ds.count)
-            rgb = np.transpose(arr[:n], (1, 2, 0))
-            if n == 1:
+            # Which bands are actually R, G, B?
+            #
+            # ds.read() with no argument, or arr[:3], takes the first three -
+            # which is right for a plain RGB product and wrong for the two
+            # other orderings archives actually ship: (B,G,R,NIR), and
+            # false-colour (NIR,R,G). Near-infrared handed to the backbone as
+            # a red channel blows vegetation out to white and breaks the
+            # depth prior, silently. pick_rgb_bands asks the file.
+            idx, band_note = PRE.pick_rgb_bands(ds)
+
+            # Decimated read for very large rasters.
+            #
+            # ds.read() pulls the WHOLE raster into memory. A 12000x12000
+            # three-band uint16 scene is 860 MB before anything is done to
+            # it, and every stage after this holds a float64 copy of the same
+            # grid - the run dies on a laptop long before the depth model is
+            # reached. rasterio can decimate during the read, so the full
+            # array never exists. Only kicks in past the budget; ordinary
+            # scenes are untouched.
+            dec = 1
+            while (ds.height // dec) * (ds.width // dec) > MAX_READ_PIXELS:
+                dec += 1
+            if dec > 1:
+                oh, ow = ds.height // dec, ds.width // dec
+                arr = ds.read(idx, out_shape=(len(idx), oh, ow),
+                              resampling=rasterio.enums.Resampling.average)
+                # the transform MUST follow the decimation or px_size_m, the
+                # DEM footprint and every metre downstream are off by `dec`
+                transform = ds.transform * Affine.scale(ds.width / ow,
+                                                        ds.height / oh)
+            else:
+                arr = ds.read(idx)
+                transform = ds.transform
+
+            rgb = np.transpose(arr, (1, 2, 0))
+            if rgb.shape[2] == 1:
                 rgb = np.repeat(rgb, 3, axis=2)
-            if rgb.dtype != np.uint8:                      # 16-bit satellite data
+
+            nodata = None
+            if ds.nodata is not None:
+                nodata = np.all(rgb == ds.nodata, axis=2)
+
+            if preprocess:
+                rgb, vmask, prep = PRE.condition(rgb, nodata_mask=nodata)
+                prep["band_note"] = band_note
+                if dec > 1:
+                    prep["decimated"] = (f"{ds.width}x{ds.height} read at 1/{dec} "
+                                         f"-> {rgb.shape[1]}x{rgb.shape[0]}")
+                meta["valid_mask"] = vmask
+                meta["preprocess"] = prep
+            elif rgb.dtype != np.uint8:                    # 16-bit satellite data
                 lo, hi = np.nanpercentile(rgb, [2, 98])
                 rgb = (np.clip((rgb - lo) / max(hi - lo, 1e-9), 0, 1) * 255).astype(np.uint8)
 
@@ -119,11 +178,20 @@ def load_image(path):
                       and ds.transform != Affine.identity() \
                       and abs(ds.transform.a) > 0
             if has_crs:
-                meta.update(mode="absolute", crs=ds.crs, transform=ds.transform,
-                            bounds=ds.bounds, px_size_m=_px_size_m(ds))
+                meta.update(mode="absolute", crs=ds.crs, transform=transform,
+                            bounds=ds.bounds, px_size_m=_px_size_m(ds) * dec)
             meta.update(_sun_from_tags(ds.tags()))
     else:
         rgb = np.array(Image.open(path).convert("RGB"))
+        if preprocess:
+            rgb, vmask, prep = PRE.condition(rgb)
+            prep["band_note"] = None
+            meta["valid_mask"] = vmask
+            meta["preprocess"] = prep
+
+    note = PRE.summarise(meta.get("preprocess") or {})
+    if note:
+        print(f"[prep] {note}")
 
     return np.ascontiguousarray(rgb), meta
 

@@ -50,6 +50,23 @@ Two routes, chosen by METADATA (not by the file extension):
   has CRS -> absolute DSM, metres
 
 ===========================================================================
+TWO ENGINES
+===========================================================================
+Everything above describes the ZERO-SHOT engine: the depth model exactly as
+released. When a trained checkpoint is installed (models/heightnet.pt, built
+by training/ - see training/TRAINING.md), estimate_elevation hands the image
+to the fine-tuned model instead. It has two outputs:
+  A  relative depth, fine-tuned for top-down images. It replaces the zero-shot
+     model in step 2 and goes through steps 3-11 unchanged - the problem
+     statement's own workflow (engine "finetuned").
+  B  metres above ground, directly (engine "metric", _estimate_heightnet).
+The default, engine "hybrid", is A's workflow with B in two roles: in step 8 B
+is the scene-level prior that sets alpha when no measured anchor exists
+(replacing GHSL), and after step 10 A and B are fused per pixel by their
+uncertainties. $DEPTHWIZARD_ENGINE=zeroshot|finetuned|metric|hybrid|auto picks;
+the benchmark pins it (benchmark/compare_engines.py scores all four).
+
+===========================================================================
 THREE THINGS IN HERE ARE NOT OPTIONAL
 ===========================================================================
 Each was measured, not guessed:
@@ -67,10 +84,11 @@ Each was measured, not guessed:
      66.70 (hybrid). The global fit even produced NEGATIVE building heights.
 """
 
-import os, io, json, math
+import os, io, json, math, hashlib, shutil, time
 import numpy as np
 from PIL import Image
-from scipy.ndimage import gaussian_filter, minimum_filter, maximum_filter
+from scipy.ndimage import (gaussian_filter, minimum_filter, maximum_filter,
+                           percentile_filter, zoom)
 
 import preprocess as PRE
 
@@ -96,7 +114,76 @@ OPENTOPO_KEY = os.environ.get("OPENTOPO_KEY", "")   # free: portal.opentopograph
 # 6300x6300 - comfortably above any scene a CPU run would finish anyway.
 MAX_READ_PIXELS = int(os.environ.get("MAX_READ_PIXELS", 40_000_000))
 
+# Where the model runs. "auto" takes CUDA when there is one and the CPU
+# otherwise. "mps" uses the Apple-silicon GPU, "cpu" / "cuda" force a device.
+# MPS falls back to the CPU on the first operator it cannot run, so asking for
+# it is never worse than not asking.
+DEPTH_DEVICE = os.environ.get("DEPTH_DEVICE", "auto").strip().lower()
+
+# Which engine turns pixels into heights.
+#   zeroshot   Depth-Anything-V2 as released -> calibration module -> DSM
+#   finetuned  ENGINE A: the same workflow with the FINE-TUNED relative depth
+#              (trained on GAMUS + LiDAR). Needs a scale anchor like zeroshot.
+#   metric     ENGINE B: the fine-tuned model's metres directly
+#   hybrid     A + B: A's workflow, with B as the scene-level scale prior and
+#              fused in per pixel by uncertainty. What the app ships.
+#   auto       hybrid when a checkpoint is present (models/heightnet.pt or
+#              $DEPTHWIZARD_HEIGHTNET), else zeroshot
+# Read at call time, not import time, so a test, the benchmark or a caller can
+# pin it. ("heightnet" is accepted as another name for hybrid.)
+ENGINE_ENV = "DEPTHWIZARD_ENGINE"
+ENGINES = ("zeroshot", "finetuned", "metric", "hybrid")
+ENGINE_LABEL = {
+    "zeroshot": "zero-shot depth + scale anchor",
+    "finetuned": "fine-tuned relative depth + scale anchor (engine A)",
+    "metric": "HeightNet metres (engine B)",
+    "hybrid": "hybrid A+B: fine-tuned relative depth, calibrated and fused with HeightNet metres",
+}
+_ENGINE_ALIASES = {"zero-shot": "zeroshot", "frozen": "zeroshot", "depth": "zeroshot",
+                   "a": "finetuned", "relative": "finetuned", "fine-tuned": "finetuned",
+                   "b": "metric", "heightnet": "hybrid", "a+b": "hybrid", "combined": "hybrid"}
+
+
+def refine_by_default(engine):
+    """Whether refine.py's clean-up should run on this engine's surface.
+
+    refine (guided filter + structure flattening + unsharp) was built for the
+    zero-shot model, whose buildings arrive as blurry domes. On the fine-tuned
+    engines it does the opposite of its job - measured on the 9-scene LiDAR
+    benchmark, it raised the hybrid's RMSE 4.91 -> 5.01 m and its MAE
+    1.43 -> 1.66 m, and cut the agreement of its edges with the LiDAR's
+    (gradient correlation 0.50 -> 0.32): it smears edges the model already
+    placed correctly. So it is on for zeroshot only; callers can still force it."""
+    return engine == "zeroshot"
+
+
+def engine_needs_anchor(engine):
+    """Engines whose metres come from a scale anchor (shadows/GCPs/prior)."""
+    return engine in ("zeroshot", "finetuned")
+
+# ----------------------------------------------------------------------------
+# CACHES - the model runs once per image, the DEM downloads once per place.
+# ----------------------------------------------------------------------------
+# Everything after the depth model is cheap, and everything worth tuning lives
+# after it. Without a cache, re-running a scene to try a different scale source,
+# a different gain or a different mesh style costs the full backbone again -
+# minutes per scene with the Large model on a CPU. With it, only the first run
+# pays. The key covers the pixels the model actually sees (after conditioning),
+# the checkpoint and the tiling, so a changed input can never hit a stale entry.
+#
+# The DEM cache is what makes an absolute run work OFFLINE. Every successful
+# download is kept, and any cached or user-supplied DEM that covers a scene is
+# used before the network is tried. Drop a CartoDEM, SRTM or COP30 GeoTIFF into
+# DEM_DIR (or cache/dem) and the pipeline needs no key and no connection.
+_REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+CACHE_ROOT = os.environ.get("DEPTHWIZARD_CACHE", os.path.join(_REPO_ROOT, "cache"))
+DEPTH_CACHE = os.environ.get("DEPTH_CACHE", "1") not in ("0", "false", "no", "")
+DEPTH_CACHE_MB = float(os.environ.get("DEPTH_CACHE_MB", "2048"))
+DEM_DIRS = [d for d in (os.environ.get("DEM_DIR", ""),
+                        os.path.join(CACHE_ROOT, "dem")) if d]
+
 _pipe = None
+_pipe_device = None
 
 
 # ----------------------------------------------------------------------------
@@ -242,19 +329,42 @@ def _px_size_m(ds):
 # ----------------------------------------------------------------------------
 # 2. DEPTH  (frozen backbone + scale-aligned tiling)
 # ----------------------------------------------------------------------------
-def _get_pipe():
-    global _pipe
-    if _pipe is None:
-        import torch
+def _pick_device(want=None):
+    """'cuda' / 'mps' / 'cpu' - what DEPTH_DEVICE asks for, if it exists."""
+    import torch
+    want = (want or DEPTH_DEVICE or "auto").lower()
+    has_mps = bool(getattr(torch.backends, "mps", None)
+                   and torch.backends.mps.is_available())
+    if want == "cuda":
+        return "cuda" if torch.cuda.is_available() else "cpu"
+    if want == "mps":
+        return "mps" if has_mps else "cpu"
+    if want == "cpu":
+        return "cpu"
+    return "cuda" if torch.cuda.is_available() else "cpu"
+
+
+def _get_pipe(device=None):
+    global _pipe, _pipe_device
+    if _pipe is None or (device and device != _pipe_device):
         from transformers import pipeline
-        dev = 0 if torch.cuda.is_available() else -1
-        print(f"[depth] loading {MODEL_ID} on {'cuda' if dev == 0 else 'cpu'}")
+        dev = device or _pick_device()
+        print(f"[depth] loading {MODEL_ID} on {dev}")
         _pipe = pipeline("depth-estimation", model=MODEL_ID, device=dev)
+        _pipe_device = dev
     return _pipe
 
 
 def _predict_patch(patch):
-    out = _get_pipe()(Image.fromarray(patch))
+    try:
+        out = _get_pipe()(Image.fromarray(patch))
+    except (RuntimeError, NotImplementedError) as ex:
+        if _pipe_device != "mps":
+            raise
+        # an operator the Metal backend does not implement - finish on the CPU
+        print(f"[depth] MPS failed ({type(ex).__name__}: {str(ex)[:80]}) - "
+              f"falling back to the CPU")
+        out = _get_pipe("cpu")(Image.fromarray(patch))
     d = out["predicted_depth"]
     d = d.squeeze().cpu().numpy() if hasattr(d, "cpu") else np.asarray(d)
     if d.shape != patch.shape[:2]:
@@ -323,6 +433,9 @@ def predict_depth(rgb, tile=TILE, overlap=OVERLAP):
     return acc / np.maximum(wsum, 1e-8)
 
 
+_REAL_PREDICT_DEPTH = predict_depth
+
+
 def _fill_nan(a, fill=None):
     """NaN -> the array's own median. Anything that blurs has to do this first:
     one NaN inside a Gaussian window poisons every pixel the window touches."""
@@ -355,8 +468,102 @@ def _fit_affine(src, ref, iters=4):
     return (a, b) if (0.1 < a < 10.0) else (1.0, 0.0)
 
 
+def source_key(path):
+    """Cache identity of an input FILE: its bytes plus the conditioning code.
+
+    Keying on the file rather than on the conditioned pixels makes the cache
+    portable between machines whose OpenCV builds might round a CLAHE pixel
+    differently - the depth model ran on one of them, and the other must still
+    find the result. Any edit to preprocess.py changes the key, so a change in
+    what the model would have seen can never be served a stale prediction.
+    """
+    h = hashlib.sha1()
+    with open(path, "rb") as f:
+        for chunk in iter(lambda: f.read(1 << 20), b""):
+            h.update(chunk)
+    try:
+        with open(PRE.__file__, "rb") as f:
+            h.update(f.read())
+    except Exception:
+        pass
+    return h.hexdigest()
+
+
+def _depth_cache_path(rgb, tile, overlap, n, key=None):
+    h = hashlib.sha1()
+    h.update(f"v1|{MODEL_ID}|{tile}|{overlap}|{n}|{rgb.shape}".encode())
+    if key:
+        h.update(f"file:{key}".encode())
+    else:
+        h.update(np.ascontiguousarray(rgb).tobytes())
+    return os.path.join(CACHE_ROOT, "depth", h.hexdigest()[:32] + ".npz")
+
+
+def _depth_cache_get(path, shape=None):
+    try:
+        with np.load(path) as z:
+            mean, spread = z["mean"].astype(np.float64), z["spread"].astype(np.float64)
+        if shape is not None and mean.shape != tuple(shape[:2]):
+            return None
+        os.utime(path)                   # most recently used survives eviction
+        return mean, spread
+    except Exception:
+        return None
+
+
+def _depth_cache_put(path, mean, spread):
+    try:
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        tmp = path + ".tmp.npz"
+        np.savez_compressed(tmp, mean=mean.astype(np.float32),
+                            spread=spread.astype(np.float32))
+        os.replace(tmp, path)
+        # oldest-first eviction past the size budget
+        d = os.path.dirname(path)
+        files = sorted((os.path.join(d, f) for f in os.listdir(d) if f.endswith(".npz")),
+                       key=os.path.getmtime)
+        total = sum(os.path.getsize(f) for f in files)
+        while files and total > DEPTH_CACHE_MB * 1e6:
+            f = files.pop(0)
+            if f == path:
+                continue
+            total -= os.path.getsize(f)
+            os.remove(f)
+    except Exception as ex:
+        print(f"[depth] cache write skipped: {ex}")
+
+
 def predict_depth_ensemble(rgb, tile=TILE, overlap=OVERLAP, rotations=4,
-                           verbose=True):
+                           verbose=True, cache=None, cache_key=None):
+    """The rotation ensemble below, behind a disk cache.
+
+    The cache is keyed on the exact pixels the model sees plus the checkpoint
+    and the tiling, and it is bypassed whenever predict_depth has been swapped
+    for a stub (the tests and the selftest do that), so a fake backbone can
+    never leave entries behind for a real one to find. Values round-trip
+    through float32 on the first run too, so a cached run and a fresh one are
+    bit-identical.
+    """
+    n = int(max(1, min(4, rotations)))
+    use = (DEPTH_CACHE if cache is None else bool(cache)) \
+        and predict_depth is _REAL_PREDICT_DEPTH
+    path = _depth_cache_path(rgb, tile, overlap, n, cache_key) if use else None
+    if path and os.path.exists(path):
+        hit = _depth_cache_get(path, rgb.shape)
+        if hit is not None:
+            if verbose:
+                print(f"[depth] cache hit - backbone skipped ({os.path.basename(path)[:12]})")
+            return hit
+    mean, spread = _predict_depth_ensemble(rgb, tile, overlap, n, verbose)
+    mean = np.asarray(mean, np.float32).astype(np.float64)
+    spread = np.asarray(spread, np.float32).astype(np.float64)
+    if path:
+        _depth_cache_put(path, mean, spread)
+    return mean, spread
+
+
+def _predict_depth_ensemble(rgb, tile=TILE, overlap=OVERLAP, rotations=4,
+                            verbose=True):
     """Run the depth model four times - upright, 90, 180, 270 - and average.
 
     IN PLAIN ENGLISH: the model always paints the bottom of a picture as
@@ -617,6 +824,70 @@ def detrend(h, iters=3):
     return h - plane, plane
 
 
+# ---------------------------------------------------------------------------
+# How height above ground is separated from the depth map.
+#
+# "envelope" (default): subtract a ground-hugging lower surface - a robust
+# opening, 2nd-percentile erosion then dilation over GROUND_WINDOW_M. Anything
+# narrower than the window (buildings, trees) stands on it at full height, and
+# ground pixels land at ~0 by construction.
+# "gauss" (before 2026-09-26): subtract a Gaussian low-pass, then shift by the
+# lowest strong histogram peak (ground_level). Two measured failures:
+#   * the lowest peak is often WATER, not ground - the model reads canals and
+#     rivers as the lowest surface - so every street and field was lifted:
+#     +11 m in Delft (canals), +7.6 m in Zurich (the Limmat), +2 to +4 m in
+#     three more scenes;
+#   * a Gaussian takes part of every large block into "terrain", so wide tall
+#     buildings came back short.
+# Measured on the nine LiDAR scenes' cached depth, height-above-ground only:
+#   correlation with the reference nDSM  0.657 -> 0.729
+#   ground lift (mean / worst scene)     +2.3 m / 8.1 m -> -0.2 m / 1.7 m
+# and it held across windows of 50-100 m and percentiles of 1-2, so 80 m / 2
+# is the middle of a plateau, not a tuned corner. End to end, with the capped
+# DEM debias (DEM_DEBIAS_MAX_M), all nine scenes, typed priors:
+#   pooled RMSE, one offset removed   6.31 -> 5.08 m
+#   pooled RMSE, raw                  8.76 -> 5.37 m
+#   MAE 4.42 -> 3.45 m, r 0.731 -> 0.779
+# Six scenes improve, three get slightly worse (Flevoland +0.6 m, Rotterdam
+# +0.2 m, Interlaken +0.1 m). Towers over 30 m are still ~30 m short: that is
+# the depth model not seeing them, which no split can fix.
+SPLIT = os.environ.get("DEPTHWIZARD_SPLIT", "envelope").strip().lower()
+GROUND_WINDOW_M = 80.0
+GROUND_PCT = 2.0
+
+
+def ground_envelope(p, px_size_m, window_m=GROUND_WINDOW_M, pct=GROUND_PCT,
+                    step_m=2.0, max_cells=400):
+    """The ground under the depth map: a robust opening, in the map's own units.
+
+    IN PLAIN ENGLISH: slide an 80 m plate UP from below the surface. It stops
+    on the ground between buildings and cannot reach up into any building
+    narrower than the plate, so surface-minus-plate is the height of whatever
+    stands on the ground. Taking the 2nd percentile rather than the minimum
+    keeps one dark pixel from dragging the plate down.
+
+    Works on a coarse copy (2 m cells, or coarser for big scenes so the grid
+    stays under max_cells a side) and is interpolated back up - the plate is
+    smooth by nature, and the percentile filter is the only costly step.
+    """
+    a = np.asarray(p, np.float64)
+    H, W = a.shape
+    px = max(float(px_size_m or 1.0), 1e-6)
+    step = max(step_m, px, max(H, W) * px / max_cells)
+    f = max(1, int(round(step / px)))
+    Hc, Wc = max(1, H // f), max(1, W // f)
+    ds = a[:Hc * f, :Wc * f].reshape(Hc, f, Wc, f).mean(axis=(1, 3))
+    k = max(3, int(round(window_m / (px * f))) | 1)
+    env = percentile_filter(ds, pct, size=k, mode="nearest")
+    env = maximum_filter(env, size=k, mode="nearest")
+    env = gaussian_filter(env, k / 4.0)
+    up = zoom(env, (H / env.shape[0], W / env.shape[1]), order=1)
+    if up.shape != (H, W):                       # zoom rounding
+        up = np.pad(up, ((0, max(0, H - up.shape[0])), (0, max(0, W - up.shape[1]))),
+                    mode="edge")[:H, :W]
+    return up
+
+
 def ground_level(h, bins=256):
     """The commonest surface in an overhead scene is the ground, so the lowest
     strong histogram mode is ground level. Free offset, no reference data."""
@@ -660,17 +931,81 @@ def ground_consistency(h, grid=4, pct=15):
 # ----------------------------------------------------------------------------
 # 4. COARSE DEM  (terrain only - it cannot see buildings at 30 m)
 # ----------------------------------------------------------------------------
-def fetch_dem(meta, out_tif="dem_coarse.tif"):
-    """Download the scene footprint from OpenTopography. Returns path or None."""
+def _dem_request_bounds(meta, pad_deg=0.01):
+    """The scene footprint in lon/lat, padded so bilinear resampling has
+    neighbours at the edges."""
+    from rasterio.warp import transform_bounds
+    w, s_, e, n = transform_bounds(meta["crs"], "EPSG:4326", *meta["bounds"],
+                                   densify_pts=21)
+    return w - pad_deg, s_ - pad_deg, e + pad_deg, n + pad_deg
+
+
+def _local_dem_covering(meta):
+    """A DEM already on disk that covers the whole scene, or None.
+
+    Searches DEM_DIR (anything the user put there - CartoDEM, SRTM, COP30
+    tiles) and then the download cache. Returns (path, label).
+    """
+    import glob
+    import rasterio
+    from rasterio.warp import transform_bounds
+    for d in DEM_DIRS:
+        if not d or not os.path.isdir(d):
+            continue
+        for path in sorted(glob.glob(os.path.join(d, "*.tif")) +
+                           glob.glob(os.path.join(d, "*.tiff"))):
+            try:
+                with rasterio.open(path) as ds:
+                    if ds.crs is None:
+                        continue
+                    l, b, r, t = transform_bounds(meta["crs"], ds.crs,
+                                                  *meta["bounds"], densify_pts=21)
+                    B = ds.bounds
+                    if l >= B.left and r <= B.right and b >= B.bottom and t <= B.top:
+                        cached = os.path.abspath(d) == os.path.abspath(
+                            os.path.join(CACHE_ROOT, "dem"))
+                        return path, ("cache" if cached else "local file") + \
+                            f": {os.path.basename(path)}"
+            except Exception:
+                continue
+    return None, None
+
+
+def fetch_dem(meta, out_tif="dem_coarse.tif", info=None):
+    """The coarse terrain model for the scene footprint. Returns path or None.
+
+    Order: a DEM on disk that covers the scene (DEM_DIR, then the cache), then
+    OpenTopography. Every download is kept in cache/dem, so the second run over
+    the same place - and any run with the network gone - needs no connection.
+    Where it came from is recorded in info["dem_source"].
+    """
     if meta["mode"] != "absolute":
         return None
-    import requests, rasterio
-    from rasterio.warp import transform_bounds
+    import rasterio
+    rec = info if info is not None else {}
+
+    local, label = _local_dem_covering(meta)
+    if local:
+        try:
+            if os.path.abspath(local) != os.path.abspath(out_tif):
+                shutil.copyfile(local, out_tif)
+            rec["dem_source"] = label
+            print(f"[dem] using {label} (no download)")
+            return out_tif
+        except Exception as ex:
+            print(f"[dem] could not use {local}: {ex}")
+
+    if not OPENTOPO_KEY:
+        rec["dem_source"] = "none (no cached DEM covers the scene and OPENTOPO_KEY is empty)"
+        print("[dem] FAILED: no cached DEM covers this scene and OPENTOPO_KEY is "
+              "empty - see .env.example, or put a DEM GeoTIFF in DEM_DIR")
+        return None
+    import requests
     try:
-        w, s, e, n = transform_bounds(meta["crs"], "EPSG:4326", *meta["bounds"], densify_pts=21)
+        w, s_, e, n = _dem_request_bounds(meta)
         r = requests.get("https://portal.opentopography.org/API/globaldem",
-                         params=dict(demtype=DEM_SOURCE, south=s - .01, north=n + .01,
-                                     west=w - .01, east=e + .01,
+                         params=dict(demtype=DEM_SOURCE, south=s_, north=n,
+                                     west=w, east=e,
                                      outputFormat="GTiff", API_Key=OPENTOPO_KEY),
                          timeout=90)
         r.raise_for_status()
@@ -678,9 +1013,18 @@ def fetch_dem(meta, out_tif="dem_coarse.tif"):
             f.write(r.content)
         with rasterio.open(out_tif) as ds:
             ds.read(1)
+        rec["dem_source"] = f"OpenTopography {DEM_SOURCE}"
         print(f"[dem] ok -> {out_tif}")
+        try:
+            cdir = os.path.join(CACHE_ROOT, "dem")
+            os.makedirs(cdir, exist_ok=True)
+            shutil.copyfile(out_tif, os.path.join(
+                cdir, f"{DEM_SOURCE}_{w:.4f}_{s_:.4f}_{e:.4f}_{n:.4f}.tif"))
+        except Exception as ex:
+            print(f"[dem] cache write skipped: {ex}")
         return out_tif
     except Exception as ex:
+        rec["dem_source"] = f"none (download failed: {type(ex).__name__})"
         print(f"[dem] FAILED: {ex}")
         return None
 
@@ -690,10 +1034,27 @@ DEM_DEBIAS_WINDOW_M = 200.0     # wider than any single building, narrower
 DEM_DEBIAS_DEADBAND_M = 0.75    # COP30's own vertical accuracy is about 1 m
                                 # RMSE, so a sub-metre gap between the surface
                                 # and its own opening is noise, not clutter
+# The most the opening may lower the DEM anywhere. Rooftops and canopy blur
+# into a 30 m radar cell as a few metres, not tens; anything the opening wants
+# to take off beyond that is real relief - a hilltop, the side of a river
+# valley - and removing it put the terrain metres wrong. Measured against the
+# LiDAR terrain models of all seven scored scenes (2026-09-26):
+#
+#     correction          terrain RMSE (raw)   terrain shape (own offset)
+#     none                4.47 m               2.87 m
+#     opening, uncapped   4.14                 3.67   (Jura 5.82, Zurich 7.33)
+#     capped at 3 m       3.25                 2.46
+#     capped at 5 m       3.01                 2.35
+# DEPTHWIZARD_DEM_MAX_M=none restores the uncapped opening.
+#
+# The flat Dutch scenes keep essentially all of their correction; the two
+# with real relief stop being damaged by it.
+_dem_max = os.environ.get("DEPTHWIZARD_DEM_MAX_M", "5").strip().lower()
+DEM_DEBIAS_MAX_M = None if _dem_max in ("none", "off", "") else float(_dem_max)
 
 
 def debias_dem(dem, px_size_m, window_m=DEM_DEBIAS_WINDOW_M,
-               deadband_m=DEM_DEBIAS_DEADBAND_M):
+               deadband_m=DEM_DEBIAS_DEADBAND_M, max_m=DEM_DEBIAS_MAX_M):
     """Take the rooftops out of the free 30 m DEM, so it describes the ground.
 
     IN PLAIN ENGLISH: COP30 is a radar SURFACE model - over a town, part of its
@@ -730,6 +1091,9 @@ def debias_dem(dem, px_size_m, window_m=DEM_DEBIAS_WINDOW_M,
                             size=k, mode="nearest")
     ground = gaussian_filter(ground, max(1.0, k / 6.0))
     correction = np.maximum(dem - ground - float(deadband_m), 0.0)
+    if max_m is not None:
+        # past a few metres it is relief, not rooftops - see DEM_DEBIAS_MAX_M
+        correction = np.minimum(correction, float(max_m))
     return dem - correction, float(np.median(correction))
 
 
@@ -766,6 +1130,79 @@ def dem_on_grid(dem_path, meta, shape):
 # Raising this constant to 99.5 would move the anchor to ~p99.75, not to the
 # measured configuration.
 HEIGHT_REFERENCE_PCT = {"tallest": 99.0, "tall": 95.0, "typical": 60.0}
+
+# ---------------------------------------------------------------------------
+# The correction on a person's "tallest structure" prior depends on how height
+# above ground is separated (SPLIT), because that is what sets the size of the
+# detail band the prior is anchored to.
+#
+# ENVELOPE SPLIT (the default since 2026-09-26): NO correction, measured. With
+# the envelope split and the capped DEM debias, the structure amplitude ratio
+# (reference / predicted) has a geometric mean of 1.08 over all nine scenes,
+# and a factor fitted on eight and applied to the ninth made 9 of 9 worse
+# (object band 3.2 -> 3.3 m). A smaller multiplier would still lower RMSE, but
+# only by shrinking every structure - the trade this project refuses.
+#
+# GAUSS SPLIT (the old one, DEPTHWIZARD_SPLIT=gauss): 0.80, as measured below.
+#
+# A "tallest structure" prior gets the tallest structures right on average but
+# spreads too much height over everything else. Measured on the seven LiDAR
+# scenes that carry an ortho-read prior (2026-09-25): the p99 height ratio
+# (predicted / reference, where both see a structure) has a geometric mean of
+# 1.02, while the overall structure AMPLITUDE (object-band standard deviation,
+# reference / predicted) has one of 0.80 - 0.73 to 0.95 when fitted on the other
+# six scenes each time. Scaling by 0.80, the full benchmark moved:
+#
+#     pooled RMSE (shift)   6.65 -> 5.74 m    every one of the 7 scenes better
+#     pooled RMSE (raw)    10.87 -> 8.66 m
+#     object-band RMSE      4.10 -> 3.61 m
+#     p99 height ratio      1.02 -> 0.82      the tallest now read ~18% low
+#
+# This is deliberately NOT the through-origin least-squares gain that
+# validate.attenuation() reports as `suggested_alpha_gain` (pooled 0.52). That
+# one minimises squared error, and where the model puts height in the wrong
+# place it does so by shrinking every structure toward zero - it scores better
+# (RMSE 5.01 m) but returns buildings at roughly half their height in the
+# viewer and the probes. 0.80 matches the SIZE of the structures and leaves
+# their placement to the model. Set DEPTHWIZARD_PRIOR_GAIN=0.52 for the
+# minimum-error surface, or =1 for the uncorrected prior that every accuracy
+# figure before this date was produced with.
+#
+# Only the "tallest" reference given by a PERSON is corrected - that is the
+# only case measured. The automatic prior (see ghsl_height_prior) has its own
+# factor, GHSL_PRIOR_GAIN, measured the same way below.
+PRIOR_GAIN = float(os.environ.get("DEPTHWIZARD_PRIOR_GAIN",
+                                   "0.80" if SPLIT == "gauss" else "1.0"))
+# The automatic GHSL prior gets NO correction, and that is a measured result.
+# Scored against LiDAR on the five benchmark scenes GHSL has buildings under
+# (re-measured 2026-09-26 with the envelope split), the structure amplitude
+# ratio (reference / predicted) ranged from 0.92 (Zurich) to 3.85 (Wengen).
+# Fitted on four scenes and applied to the fifth, a single factor made pooled
+# object-band RMSE worse (4.12 -> 6.30 m) and the least-squares gain helped
+# 0 of 5. GHSL's error is scene-specific - cell averages miss the few tall
+# blocks in Rotterdam and the forest in Wengen - so no multiplier transfers.
+# Uncorrected, it scores pooled RMSE 5.70 m (shift) / 6.05 m (raw) there.
+GHSL_PRIOR_GAIN = float(os.environ.get("DEPTHWIZARD_GHSL_GAIN", "1.0"))
+
+
+def prior_gain(reference="tallest", source="person"):
+    """The measured correction for a landmark prior, 1.0 where none is measured."""
+    if str(source).lower() == "ghsl":
+        return GHSL_PRIOR_GAIN
+    return PRIOR_GAIN if str(reference).lower() == "tallest" else 1.0
+
+
+def ghsl_height_prior(meta, allow_download=True):
+    """The automatic landmark height for a georeferenced scene - see ghsl.py.
+
+    Returns (prior, reason). prior is None when GHSL cannot answer (no tile
+    and no network, or no buildings under the scene), and reason says why.
+    """
+    try:
+        import ghsl as GH
+        return GH.height_prior(meta, CACHE_ROOT, allow_download=allow_download)
+    except Exception as ex:                       # never break a run over a prior
+        return None, f"GHSL lookup failed ({type(ex).__name__}: {str(ex)[:120]})"
 
 # ---------------------------------------------------------------------------
 # How much to trust each calibrator, as a FRACTION of the alpha it returns.
@@ -1155,7 +1592,8 @@ def alpha_from_shadows(detail, rgb, sun_az_deg, sun_elev_deg, px_size_m,
 
 
 def cross_check_scale(detail, rgb, px_size_m, known_height_m=None, gcps=None,
-                      sun_azimuth=None, sun_elevation=None, sun_sigma_deg=0.0):
+                      sun_azimuth=None, sun_elevation=None, sun_sigma_deg=0.0,
+                      prior_source="person"):
     """Run every available scale source and report whether they agree.
 
     The three calibrators are mutually independent: shadow length is pure
@@ -1186,7 +1624,10 @@ def cross_check_scale(detail, rgb, px_size_m, known_height_m=None, gcps=None,
             notes["gcps"] = {"n": len(gcps), "alpha_sigma_rel": s}
             sig["gcps"] = float(s)
     if known_height_m:
-        est["prior"] = float(alpha_from_known_height(detail, known_height_m))
+        # corrected the same way as the priority path, or the cross-check would
+        # report a disagreement that is only the missing correction
+        est["prior"] = float(alpha_from_known_height(detail, known_height_m)
+                             * prior_gain("tallest", prior_source))
         notes["prior"] = {"known_height_m": float(known_height_m),
                           "alpha_sigma_rel": PRIOR_SIGMA_REL}
         sig["prior"] = PRIOR_SIGMA_REL
@@ -1313,12 +1754,283 @@ def confidence_report(spread, height, meta, ground_spread, cross_check,
 # ----------------------------------------------------------------------------
 # 6. THE PIPELINE
 # ----------------------------------------------------------------------------
+
+# ----------------------------------------------------------------------------
+# THE TRAINED ENGINE - HeightNet (heightnet.py, trained by training/train.py)
+# ----------------------------------------------------------------------------
+# Everything above this line exists because a frozen depth model can only RANK
+# heights: steps 6-10 turn a ranking into metres with one outside measurement.
+# HeightNet was fine-tuned on LiDAR-measured scenes (GAMUS + AHN + swisstopo),
+# so it answers in metres above ground by itself. What it still needs from the
+# rest of this file is the terrain under the buildings (the 30 m DEM, debiased
+# exactly as before) and the export. The scale sources become CROSS-CHECKS: if
+# shadows, GHSL or a typed landmark height disagree with the model, the run
+# says by how much - it does not silently rescale. Surveyed control points are
+# the one exception: they are measurements, so they correct the model.
+
+def resolve_engine(engine=None):
+    """One of ENGINES for this call - see ENGINE_ENV above."""
+    e = (engine or os.environ.get(ENGINE_ENV, "auto")).strip().lower()
+    e = _ENGINE_ALIASES.get(e, e)
+    if e == "zeroshot":
+        return "zeroshot"
+    if e not in ENGINES + ("auto",):
+        raise ValueError(f"unknown engine {e!r} - expected one of {ENGINES} or auto")
+    try:
+        import heightnet as HN
+        ok = HN.available()
+    except Exception:
+        HN, ok = None, None
+    if e != "auto":
+        if not ok:
+            where = HN.default_checkpoint() if HN else "models/heightnet.pt"
+            raise ValueError(f"engine {e!r} needs the trained model, but there is no "
+                             f"usable checkpoint at {where} (it needs torch and the "
+                             f".pt file from training/)")
+        return e
+    return "hybrid" if ok else "zeroshot"
+
+
+_hn = None
+
+
+def get_heightnet():
+    """The loaded predictor, reused across runs; reloaded if the file changes."""
+    global _hn
+    import heightnet as HN
+    path = HN.default_checkpoint()
+    stamp = (path, os.path.getmtime(path))
+    if _hn is None or getattr(_hn, "_stamp", None) != stamp:
+        dev = DEPTH_DEVICE if DEPTH_DEVICE in ("cpu", "cuda", "mps") else "auto"
+        _hn = HN.HeightPredictor(path, device=dev)
+        _hn._stamp = stamp
+        print(f"[heightnet] loaded {_hn.describe()} on {_hn.device}")
+    return _hn
+
+
+def _heightnet_predict(rgb, gsd, rotations, cache_key=None):
+    """HeightPredictor.predict with the same disk cache idea as the depth model."""
+    hp = get_heightnet()
+    path = None
+    if DEPTH_CACHE:
+        h = hashlib.sha1()
+        h.update((cache_key or hashlib.sha1(np.ascontiguousarray(rgb).tobytes())
+                  .hexdigest()).encode())
+        h.update(f"v2|{hp.digest}|{gsd}|{rotations}|{rgb.shape}".encode())
+        d = os.path.join(CACHE_ROOT, "heightnet")
+        path = os.path.join(d, h.hexdigest()[:24] + ".npz")
+        if os.path.exists(path):
+            try:
+                z = np.load(path)
+                print(f"[heightnet] cached prediction {os.path.basename(path)}")
+                return dict(height=z["height"], sigma=z["sigma"].astype(np.float32),
+                            seg=z["seg"], rel=z["rel"],
+                            rel_sigma=z["rel_sigma"].astype(np.float32),
+                            gsd_model=float(z["gsd_model"]), tiles=0,
+                            rotations=int(rotations)), hp
+            except Exception:
+                pass
+    t0 = time.time()
+    try:
+        r = hp.predict(rgb, gsd, rotations=rotations)
+    except RuntimeError as e:
+        if hp.device.type == "mps":                  # an op MPS lacks: redo on CPU
+            print(f"[heightnet] MPS failed ({str(e)[:80]}), retrying on CPU")
+            import torch
+            hp.device = torch.device("cpu")
+            hp.model.to(hp.device)
+            r = hp.predict(rgb, gsd, rotations=rotations)
+        else:
+            raise
+    print(f"[heightnet] {r['tiles']} tile passes, {r['rotations']} rotations, "
+          f"model GSD {r['gsd_model']:.2f} m, {time.time() - t0:.1f}s on {hp.device}")
+    if path:
+        try:
+            os.makedirs(os.path.dirname(path), exist_ok=True)
+            np.savez_compressed(path, height=r["height"].astype(np.float32),
+                                sigma=r["sigma"].astype(np.float16), seg=r["seg"],
+                                rel=r["rel"].astype(np.float32),
+                                rel_sigma=r["rel_sigma"].astype(np.float16),
+                                gsd_model=r["gsd_model"])
+        except Exception as e:
+            print(f"[heightnet] cache write skipped: {e}")
+    return r, hp
+
+
+def _export_landcover(seg, meta, outdir, info):
+    """landcover.png (+ .tif when georeferenced): the semantic head's classes."""
+    import heightnet as HN
+    Image.fromarray(seg.astype(np.uint8)).save(os.path.join(outdir, "landcover.png"))
+    if meta["mode"] == "absolute":
+        import rasterio
+        prof = dict(driver="GTiff", height=seg.shape[0], width=seg.shape[1], count=1,
+                    dtype="uint8", nodata=255, compress="deflate",
+                    crs=meta["crs"], transform=meta["transform"])
+        with rasterio.open(os.path.join(outdir, "landcover.tif"), "w", **prof) as ds:
+            ds.write(seg.astype(np.uint8), 1)
+            ds.update_tags(PRODUCT="LANDCOVER",
+                           CLASSES=",".join(f"{i}={c}" for i, c in enumerate(HN.CLASSES)))
+    n = max(seg.size, 1)
+    info["landcover"] = {c: round(float((seg == i).sum()) / n, 4)
+                         for i, c in enumerate(HN.CLASSES) if (seg == i).any()}
+
+
+def _heightnet_gcp_gain(agl, gcps, min_h=0.5):
+    """Least-squares gain through the origin from control points to the model's
+    height above ground. Not alpha_from_gcps: that subtracts a histogram-mode
+    ground level, which the zero-shot detail band needs and HeightNet's output
+    (already zero at the ground) must not get."""
+    H, W = agl.shape
+    x, y = [], []
+    for r, c, h in gcps:
+        r, c = int(min(max(r, 0), H - 1)), int(min(max(c, 0), W - 1))
+        x.append(agl[r, c])
+        y.append(h)
+    x, y = np.array(x, float), np.array(y, float)
+    ok = np.isfinite(x) & np.isfinite(y) & (x > min_h)
+    if ok.sum() < 2:
+        print(f"[gcp] only {int(ok.sum())} control points sit on something the "
+              f"model sees above {min_h} m - kept the model's own metres")
+        return None
+    a = float((x[ok] * y[ok]).sum() / (x[ok] ** 2).sum())
+    return a if a > 0 else None
+
+
+def _estimate_heightnet(path, rgb, meta, info, key, known_height_m=None, gcps=None,
+                        sun_azimuth=None, sun_elevation=None, use_dem=True,
+                        alpha_gain=1.0, outdir="outputs", rotations=ROTATIONS,
+                        debias_coarse_dem=True, sun_from_tags=False,
+                        prior_source="person", auto_prior=True, prior_info=None,
+                        gsd_hint=None, height_reference="tallest"):
+    absolute = meta["mode"] == "absolute"
+    px = meta["px_size_m"] if absolute else (float(gsd_hint) if gsd_hint else None)
+    r, hp = _heightnet_predict(rgb, px, rotations, cache_key=key)
+    agl = r["height"].astype(np.float64)
+    sig = r["sigma"].astype(np.float64)
+    vm = meta.get("valid_mask")
+    if vm is not None and vm.shape == agl.shape:
+        agl = np.where(vm, agl, np.nan)        # cloud / nodata: no claim made
+    info.update(engine="metric", model=hp.describe(),
+                model_train=hp.train_info.get("val") or {},
+                model_gsd_m=float(r["gsd_model"]),
+                split="none - the model predicts height above ground directly",
+                sigma_m=15.0, ramp_share=0.0)
+    ground = ground_consistency(np.nan_to_num(agl))
+    info.update(ground_spread_before=ground, ground_spread_after=ground)
+    _export_landcover(r["seg"], meta, outdir, info)
+
+    if not absolute:
+        full = float(np.nanpercentile(agl, 99.8)) if np.isfinite(agl).any() else 1.0
+        full = max(full, 1.0)
+        height = np.clip(agl / full, 0, 1)
+        unc = sig / full
+        info["note"] = ("relative rDSM from HeightNet (no georeference: metres "
+                        f"assumed at {r['gsd_model']:.2f} m/px)")
+        info["suggested_full_scale_m"] = full
+        info["scale_source"] = None
+        info["confidence"] = confidence_report(sig, agl, meta, ground, dict(estimates={}),
+                                               alpha=1.0)
+        _export(height, rgb, meta, outdir, info, uncertainty=unc)
+        return height, dict(meta, _uncertainty=unc), info
+
+    # ---- metres: the model's own, unless surveyed points say otherwise ------
+    alpha = 1.0
+    info["scale_source"] = "HeightNet - metres learned from LiDAR, no anchor needed"
+    if gcps:
+        a = _heightnet_gcp_gain(agl, gcps)
+        if a and a > 0:
+            alpha = float(a)
+            info["scale_source"] = (f"HeightNet corrected by {len(gcps)} ground control "
+                                    f"points (x{alpha:.2f})")
+            print(f"[gcp] HeightNet heights x{alpha:.3f} from {len(gcps)} control points")
+    if alpha_gain and abs(alpha_gain - 1.0) > 1e-6:
+        alpha *= float(alpha_gain)
+        info["alpha_gain"] = float(alpha_gain)
+    info["alpha"] = float(alpha)
+
+    # every other anchor becomes an independent check of the model's metres
+    if sun_azimuth is None and sun_elevation is None:
+        sun_azimuth, sun_elevation = meta.get("sun_azimuth"), meta.get("sun_elevation")
+        sun_from_tags = sun_azimuth is not None and sun_elevation is not None
+    if not known_height_m and auto_prior:
+        try:
+            prior, why = ghsl_height_prior(meta)
+        except Exception as e:
+            prior, why = None, f"{type(e).__name__}: {e}"
+        if prior is not None:
+            known_height_m, prior_source, prior_info = prior["known_height_m"], "ghsl", prior
+        else:
+            info["auto_prior_unavailable"] = why
+    if prior_info:
+        info["auto_prior"] = prior_info
+    cc = cross_check_scale(np.nan_to_num(agl), rgb, px, known_height_m=known_height_m,
+                           gcps=gcps, sun_azimuth=sun_azimuth, sun_elevation=sun_elevation,
+                           sun_sigma_deg=0.0 if sun_from_tags else SUN_GUESS_SIGMA_DEG,
+                           prior_source=prior_source)
+    info["cross_check"] = cc
+    if cc.get("estimates"):
+        info["model_vs_anchors"] = {k: round(float(v), 3) for k, v in cc["estimates"].items()}
+        print("[heightnet] independent anchors vs the model's metres: " + ", ".join(
+            f"{k} x{v:.2f}" for k, v in cc["estimates"].items()) + "  (x1.00 = agree)")
+
+    dem_path = (fetch_dem(meta, os.path.join(outdir, "dem_coarse.tif"), info)
+                if use_dem else None)
+    if dem_path:
+        terrain = dem_on_grid(dem_path, meta, agl.shape)
+        terrain = np.where(np.isfinite(terrain), terrain, np.nanmedian(terrain))
+        if debias_coarse_dem:
+            terrain, shift = debias_dem(terrain, px)
+            info["dem_debias_m"] = shift
+            print(f"[dem] rooftop contamination removed: terrain lowered by "
+                  f"{shift:.2f} m (median)")
+        info["calibration"] = "HeightNet (DEM terrain + predicted height above ground)"
+    else:
+        terrain = np.zeros_like(agl)
+        info["calibration"] = "HeightNet, no DEM (heights above local ground)"
+        print("[calib] no DEM - output is height above ground, not above sea level")
+
+    ndsm = np.maximum(alpha * agl, 0.0)
+    height = terrain + ndsm
+    dtm = height - ndsm
+    unc = alpha * sig
+    print(f"[calib] {info['calibration']}  range {np.nanmin(height):.1f}.."
+          f"{np.nanmax(height):.1f} m, objects up to {np.nanpercentile(ndsm, 99.5):.1f} m")
+    info["confidence"] = confidence_report(unc, height, meta, ground, cc, alpha=1.0)
+    info["ndsm_p99_m"] = float(np.nanpercentile(ndsm, 99))
+    info["ndsm_mean_m"] = float(np.nanmean(ndsm))
+    _export(height, rgb, meta, outdir, info, ndsm=ndsm, dtm=dtm, uncertainty=unc)
+    return height, dict(meta, _uncertainty=unc), info
+
+
+def _hybrid_relative(rgb, meta, info, outdir, r, hp, gsd):
+    """PNG/JPG through the hybrid: fuse A and B in metres at the assumed GSD,
+    then hand back a 0..1 surface like every relative run, plus the metres
+    the full range corresponds to."""
+    import heightnet as HN
+    c = HN.combine(r, gsd, fusion=hp.fusion)
+    h = np.asarray(c["fused"], np.float64)
+    full = max(float(np.nanpercentile(h, 99.8)) if np.isfinite(h).any() else 1.0, 1.0)
+    height = np.clip(h / full, 0, 1)
+    unc = np.asarray(c["fused_sigma"], np.float64) / full
+    info.update(note=("relative rDSM from the hybrid engine (no georeference: metres "
+                      f"assumed at {r['gsd_model']:.2f} m/px)"),
+                suggested_full_scale_m=full, scale_source=None,
+                learned_alpha=c["alpha"], fusion_weight_b_mean=float(np.mean(c["w_b"])))
+    info["confidence"] = confidence_report(np.asarray(c["fused_sigma"]), h, meta,
+                                           info.get("ground_spread_before", 0.0),
+                                           dict(estimates={}), alpha=1.0)
+    _export(height, rgb, meta, outdir, info, uncertainty=unc)
+    return height, dict(meta, _uncertainty=unc), info
+
+
 def estimate_elevation(path, known_height_m=None, gcps=None,
                        sun_azimuth=None, sun_elevation=None,
                        use_dem=True, alpha_gain=1.0, outdir="outputs",
                        rotations=ROTATIONS, adaptive_sigma=True,
                        height_reference="tallest", debias_coarse_dem=True,
-                       fuse_scale=False, sun_from_tags=False):
+                       fuse_scale=False, sun_from_tags=False,
+                       prior_source="person", auto_prior=True, prior_info=None,
+                       engine=None, gsd_hint=None):
     """THE MAIN FUNCTION. Image path in, elevation map out.
 
     The numbered list at the top of this file is the order of what follows -
@@ -1351,14 +2063,75 @@ def estimate_elevation(path, known_height_m=None, gcps=None,
                     shadow calibrator carries into the fusion - angles read
                     from the file are a measurement, angles typed by eye are
                     a guess worth about 18% on alpha.
+    prior_source    who supplied known_height_m: "person" (the default) or
+                    "ghsl" (a caller that already looked it up). Picks which
+                    measured correction applies - see PRIOR_GAIN.
+    auto_prior      when nothing else sets the scale, look up the building
+                    height under the scene in GHSL (ghsl.py) instead of
+                    refusing. The run records that its scale is a prior.
+    prior_info      the dict ghsl_height_prior() returned, when the caller
+                    looked it up itself and passes known_height_m with
+                    prior_source="ghsl" - recorded in info["auto_prior"].
+    engine          "zeroshot", "finetuned" (A), "metric" (B), "hybrid" (A+B)
+                    or None (= $DEPTHWIZARD_ENGINE, default auto: hybrid when a
+                    trained checkpoint is installed, else zeroshot). metric and
+                    hybrid need no scale anchor; see ENGINE_ENV.
+    gsd_hint        metres per pixel for an image WITHOUT georeference; only
+                    HeightNet uses it (it is told the GSD it is looking at).
     """
     os.makedirs(outdir, exist_ok=True)
     rgb, meta = load_image(path)
     print(f"[load] {rgb.shape[1]}x{rgb.shape[0]}  mode={meta['mode']}  px={meta['px_size_m']}")
 
     info = dict(mode=meta["mode"], rotations=int(max(1, min(4, rotations))))
-    p, spread = predict_depth_ensemble(rgb, rotations=rotations)
-    p = validate_depth(p, rgb, info)  # Issue 1+10: fix inversion, check sanity
+    try:
+        key = source_key(path)
+    except Exception:
+        key = None
+    eng = resolve_engine(engine)
+    if eng == "metric":
+        return _estimate_heightnet(
+            path, rgb, meta, info, key, known_height_m=known_height_m, gcps=gcps,
+            sun_azimuth=sun_azimuth, sun_elevation=sun_elevation, use_dem=use_dem,
+            alpha_gain=alpha_gain, outdir=outdir, rotations=rotations,
+            debias_coarse_dem=debias_coarse_dem, sun_from_tags=sun_from_tags,
+            prior_source=prior_source, auto_prior=auto_prior, prior_info=prior_info,
+            gsd_hint=gsd_hint, height_reference=height_reference)
+    info["engine"] = eng
+    hn_pred = hn = None
+    if eng in ("finetuned", "hybrid"):
+        # engine A: the fine-tuned model's RELATIVE depth takes the zero-shot
+        # model's place; everything after this line is the same calibration
+        # module. The luminance flip check is skipped: that heuristic exists
+        # for a model trained on ground-level photos, this one was trained
+        # top-down and is right side up by construction.
+        gsd_run = meta["px_size_m"] if meta["mode"] == "absolute" else (
+            float(gsd_hint) if gsd_hint else None)
+        hn_pred, hn = _heightnet_predict(rgb, gsd_run, rotations, cache_key=key)
+        p = hn_pred["rel"].astype(np.float64)
+        spread = hn_pred["rel_sigma"].astype(np.float64)
+        import heightnet as HN
+        if not HN.relative_informative(p):
+            if eng == "finetuned":
+                raise ValueError("the fine-tuned model's relative depth is flat on this "
+                                 "image - the checkpoint looks broken or untrained. Use "
+                                 "engine zeroshot or metric.")
+            print("[engine] relative output is flat - the hybrid falls back to engine B")
+            info["hybrid_fallback"] = "relative output flat: engine B only"
+            return _estimate_heightnet(
+                path, rgb, meta, info, key, known_height_m=known_height_m, gcps=gcps,
+                sun_azimuth=sun_azimuth, sun_elevation=sun_elevation, use_dem=use_dem,
+                alpha_gain=alpha_gain, outdir=outdir, rotations=rotations,
+                debias_coarse_dem=debias_coarse_dem, sun_from_tags=sun_from_tags,
+                prior_source=prior_source, auto_prior=auto_prior, prior_info=prior_info,
+                gsd_hint=gsd_hint, height_reference=height_reference)
+        info.update(model=hn.describe(), depth_inverted=False,
+                    depth_finite_frac=float(np.isfinite(p).mean()))
+        print(f"[engine] {ENGINE_LABEL[eng]}")
+        _export_landcover(hn_pred["seg"], meta, outdir, info)
+    else:
+        p, spread = predict_depth_ensemble(rgb, rotations=rotations, cache_key=key)
+        p = validate_depth(p, rgb, info)  # Issue 1+10: fix inversion, check sanity
     p = clean_depth(p, rgb)
 
     # ---- remove the fake tilt ----
@@ -1396,6 +2169,9 @@ def estimate_elevation(path, known_height_m=None, gcps=None,
     info.update(ramp_share=ramp_share, ground_spread_before=before, ground_spread_after=after)
 
     # ---------------- RELATIVE ----------------
+    if meta["mode"] != "absolute" and eng == "hybrid":
+        return _hybrid_relative(rgb, meta, info, outdir, hn_pred, hn,
+                                float(gsd_hint) if gsd_hint else None)
     if meta["mode"] != "absolute":
         lo, hi = np.nanpercentile(p, [0.5, 99.8])   # wide: avoids clipping roof tops
         height = np.clip((p - lo) / max(hi - lo, 1e-9), 0, 1)
@@ -1418,14 +2194,22 @@ def estimate_elevation(path, known_height_m=None, gcps=None,
     # fill before blurring and restore afterwards. structure_scale_m already
     # did this; the split that actually produces the elevations did not.
     p_fill = _fill_nan(p)
-    detail = p_fill - gaussian_filter(p_fill, sigma)
+    if SPLIT == "gauss":
+        detail = p_fill - gaussian_filter(p_fill, sigma)
+    else:
+        # height above a ground-hugging envelope: ground ~0, no water trap
+        detail = p_fill - ground_envelope(p_fill, px)
     detail = np.where(np.isfinite(p), detail, np.nan)   # buildings live here
+    info["split"] = "gauss" if SPLIT == "gauss" else (
+        f"ground envelope ({GROUND_WINDOW_M:g} m, p{GROUND_PCT:g})")
     info["sigma_px"] = float(sigma)
     info["sigma_m"] = float(sigma_m)
     info["sigma_source"] = "scene structures" if adaptive_sigma else "DEM resolution"
 
     alpha = None
     tried_shadows = False
+    ghsl_reason = None
+    info["scale_source"] = None
     if (sun_azimuth is None and sun_elevation is None
             and not gcps and not known_height_m):
         # last resort only - an explicit choice by the caller always wins
@@ -1439,16 +2223,62 @@ def estimate_elevation(path, known_height_m=None, gcps=None,
                                           px, sun_sigma_deg=sun_sigma_deg)
         info["self_check"] = sdiag
         info["sun_from_tags"] = bool(sun_from_tags)
+        if alpha is not None:
+            info["scale_source"] = "shadows (sun angles from the file)" \
+                if sun_from_tags else "shadows (sun angles given)"
     if alpha is None and gcps:
         alpha = alpha_from_gcps(detail, gcps)
         if alpha is not None:
             print(f"[gcp] alpha={alpha:.3f} from {len(gcps)} control points")
+            info["scale_source"] = f"{len(gcps)} ground control points"
+    if (alpha is None and not known_height_m and not gcps and eng == "hybrid"):
+        # THE LEARNED SCENE PRIOR. The fine-tuned model's metric head has
+        # measured how tall things are in this scene; matching the upper
+        # height distribution of the relative detail to it gives metres per
+        # relative unit. A scene-level statistic, like GHSL - but from this
+        # image, at this resolution, today, instead of 100 m cells from 2018.
+        import heightnet as HN
+        a_l = HN.learned_scale(detail, hn_pred["height"], np.isfinite(detail))
+        if a_l is not None:
+            alpha = a_l
+            info["scale_source"] = "learned scene prior (HeightNet metric head)"
+            print(f"[prior] alpha={alpha:.3f} from the learned scene prior")
+    if (alpha is None and not known_height_m and not gcps and auto_prior):
+        # Nothing a person gave us sets the scale (or the shadows in the tags
+        # did not produce enough pairs). Look up how tall the buildings here
+        # are in GHSL before giving up. A prior, and recorded as one.
+        prior, ghsl_reason = ghsl_height_prior(meta)
+        if prior is not None:
+            known_height_m = prior["known_height_m"]
+            prior_source = "ghsl"
+            height_reference = "tallest"
+            info["auto_prior"] = prior
+            print(f"[ghsl] no scale given - GHSL building height under this "
+                  f"scene: {known_height_m:g} m ({prior['n_built']} of "
+                  f"{prior['n_cells']} 100 m cells built)")
+        else:
+            print(f"[ghsl] no automatic prior: {ghsl_reason}")
+            info["auto_prior_unavailable"] = ghsl_reason
     if alpha is None and known_height_m:
         alpha = alpha_from_known_height(detail, known_height_m,
                                         reference=height_reference)
         info["height_reference"] = str(height_reference)
+        info["prior_source"] = str(prior_source)
+        if prior_info and "auto_prior" not in info:
+            info["auto_prior"] = prior_info
+        pg = prior_gain(height_reference, prior_source)
         print(f"[prior] alpha={alpha:.2f} from {height_reference} structure "
-              f"= {known_height_m} m")
+              f"= {known_height_m} m ({prior_source})")
+        if abs(pg - 1.0) > 1e-6:
+            alpha *= pg
+            print(f"[prior] alpha x{pg:.2f} -> {alpha:.2f} (measured correction "
+                  f"for a tallest-structure prior; DEPTHWIZARD_PRIOR_GAIN=1 "
+                  f"turns it off)")
+        info["prior_gain"] = float(pg)
+        info["scale_source"] = (
+            f"GHSL building height ({known_height_m:g} m) - automatic prior"
+            if str(prior_source) == "ghsl" else
+            f"{height_reference} structure = {known_height_m:g} m (given)")
     if alpha is not None and alpha_gain and abs(alpha_gain - 1.0) > 1e-6:
         # closes the loop with validate.py: freqsplit attenuates structures, and
         # the validation report measures by how much. Feed its suggested gain
@@ -1456,6 +2286,20 @@ def estimate_elevation(path, known_height_m=None, gcps=None,
         alpha *= float(alpha_gain)
         info["alpha_gain"] = float(alpha_gain)
         print(f"[calib] alpha x{alpha_gain:.2f} (measured attenuation correction)")
+    if alpha is None and eng == "hybrid":
+        # A flat scene (nothing standing above the ground to match) gives the
+        # learned prior nothing to measure, and no other anchor answered:
+        # the hybrid then IS engine B, and says so.
+        print("[prior] nothing above ground to calibrate the relative depth on - "
+              "using the HeightNet metres directly (engine B)")
+        info["hybrid_fallback"] = "no scale for engine A in this scene: engine B only"
+        return _estimate_heightnet(
+            path, rgb, meta, info, key, known_height_m=known_height_m, gcps=gcps,
+            sun_azimuth=sun_azimuth, sun_elevation=sun_elevation, use_dem=use_dem,
+            alpha_gain=alpha_gain, outdir=outdir, rotations=rotations,
+            debias_coarse_dem=debias_coarse_dem, sun_from_tags=sun_from_tags,
+            prior_source=prior_source, auto_prior=False, prior_info=prior_info,
+            gsd_hint=gsd_hint, height_reference=height_reference)
     if alpha is None and tried_shadows:
         # Do not tell someone who supplied sun angles to supply sun angles.
         n_pairs = (info.get("self_check") or {}).get("n", 0)
@@ -1465,13 +2309,17 @@ def estimate_elevation(path, known_height_m=None, gcps=None,
             "happens on hazy imagery, on a high sun that casts almost nothing, "
             "and where shadows fall on other buildings rather than on open "
             "ground. Pass known_height_m (the height of the tallest structure "
-            "you can identify) or at least two gcps instead.")
+            "you can identify) or at least two gcps instead."
+            + (f" (No automatic GHSL prior either: {ghsl_reason}.)"
+               if ghsl_reason else ""))
     if alpha is None:
         raise ValueError(
             "No scale source. The coarse DEM supplies the terrain baseline but "
             "not this multiplier - the model's low-frequency band carries a "
             "large fake ramp, exactly where a 30 m DEM is blind. Pass "
-            "known_height_m, gcps, or sun_azimuth + sun_elevation.")
+            "known_height_m, gcps, or sun_azimuth + sun_elevation."
+            + (f" (No automatic GHSL prior either: {ghsl_reason}.)"
+               if ghsl_reason else ""))
     info["alpha"] = float(alpha)
 
     # Every calibrator that COULD have answered, run and compared. None of this
@@ -1480,7 +2328,7 @@ def estimate_elevation(path, known_height_m=None, gcps=None,
     info["cross_check"] = cross_check_scale(
         detail, rgb, px, known_height_m=known_height_m, gcps=gcps,
         sun_azimuth=sun_azimuth, sun_elevation=sun_elevation,
-        sun_sigma_deg=sun_sigma_deg)
+        sun_sigma_deg=sun_sigma_deg, prior_source=prior_source)
 
     # ...unless the caller asked for the sources to be COMBINED rather than
     # ranked. Off by default, so the path above is untouched for every run that
@@ -1498,7 +2346,8 @@ def estimate_elevation(path, known_height_m=None, gcps=None,
             print(f"[calib] alpha replaced by the fused estimate: "
                   f"{info['alpha_priority']:.3f} -> {alpha:.3f}")
 
-    dem_path = fetch_dem(meta, os.path.join(outdir, "dem_coarse.tif")) if use_dem else None
+    dem_path = (fetch_dem(meta, os.path.join(outdir, "dem_coarse.tif"), info)
+                if use_dem else None)
     if dem_path:
         terrain = dem_on_grid(dem_path, meta, p.shape)
         terrain = np.where(np.isfinite(terrain), terrain, np.nanmedian(terrain))
@@ -1519,7 +2368,10 @@ def estimate_elevation(path, known_height_m=None, gcps=None,
     # BELOW the local average - so ground lands at a negative value. Shift by
     # the histogram mode (the commonest surface = the ground), not by a low
     # percentile, which would land in the middle of open areas instead.
-    detail = detail - ground_level(detail)
+    if SPLIT == "gauss":
+        detail = detail - ground_level(detail)
+    # (the envelope already puts ground at zero - no histogram shift, which is
+    # what used to land on canals and rivers)
     height = terrain + alpha * detail
     if dem_path is None:
         # heights are above local ground, so negatives are residual error, not
@@ -1532,6 +2384,36 @@ def estimate_elevation(path, known_height_m=None, gcps=None,
         height = np.maximum(height, 0.0)
     print(f"[calib] {info['calibration']}  alpha={alpha:.2f}  "
           f"range {np.nanmin(height):.1f}..{np.nanmax(height):.1f} m")
+
+    if eng == "hybrid":
+        # FUSION: A (calibrated above) and B, per pixel, each trusted by its
+        # own uncertainty - scaled by the honesty factors evaluate.py measured
+        # on held-out tiles and stored in the checkpoint.
+        import heightnet as HN
+        b_h = np.asarray(hn_pred["height"], np.float64)
+        b_s = np.asarray(hn_pred["sigma"], np.float64)
+        if gcps:
+            gb = _heightnet_gcp_gain(b_h, gcps)
+            if gb:
+                b_h, b_s = b_h * gb, b_s * gb
+                info["metric_gcp_gain"] = float(gb)
+        a_h = np.maximum(alpha * detail, 0.0)
+        a_s = alpha * spread if np.any(spread) else np.full_like(a_h, 1.0)
+        fused, fsig, wb = HN.fuse(a_h, a_s, b_h, b_s, fusion=hn.fusion)
+        fused = np.where(np.isfinite(fused), fused, b_h)
+        height = terrain + fused
+        spread = fsig / max(alpha, 1e-9)       # so unc = alpha*spread = fused sigma
+        b_alpha = HN.learned_scale(detail, b_h, np.isfinite(detail))
+        info.update(fusion_weight_b_mean=float(np.nanmean(wb)),
+                    fusion_calibration=dict(hn.fusion) or None)
+        if b_alpha is not None and not str(info.get("scale_source", "")).startswith("learned"):
+            # only meaningful when something else set the scale: then it says
+            # whether the measured anchor and the model agree
+            info["model_vs_anchors"] = {"metric head": round(float(b_alpha / alpha), 3)}
+        print(f"[fusion] A and B blended per pixel, mean weight on B "
+              f"{info['fusion_weight_b_mean']:.2f}")
+        info["calibration"] = (info.get("calibration", "") +
+                               " + fused with HeightNet metres")
 
     # Derive the other two products AFTER the clip, so all three stay
     # consistent: dsm = dtm + ndsm holds pixel for pixel.

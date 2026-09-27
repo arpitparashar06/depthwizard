@@ -17,7 +17,7 @@ requests>=2.31
 # --- mesh ---
 trimesh>=4.0
 
-# --- API (Gradio is gone; the front end is React in web/) ---
+# --- API (the front end is React in frontend/, served from frontend/dist) ---
 fastapi>=0.110
 uvicorn[standard]>=0.27
 python-multipart>=0.0.9

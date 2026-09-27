@@ -11,6 +11,26 @@ from the cloud sandbox this was prepared in.
 
 ---
 
+## 0. The short version
+
+```bash
+# on a machine with the internet and the model (double-click run_on_mac.command
+# on a Mac): fetch missing scenes, run the backbone once per scene, cache DEMs
+python mathsandml/benchmark/fetch_data.py --source ahn       --out mathsandml/benchmark/scenes
+python mathsandml/benchmark/fetch_data.py --source swisstopo --out mathsandml/benchmark/scenes
+python mathsandml/benchmark/warm_cache.py --scenes mathsandml/benchmark/scenes
+
+# anywhere after that - no model, no network needed, seconds per scene
+python mathsandml/benchmark/run_benchmark.py --scenes mathsandml/benchmark/scenes \
+       --out mathsandml/benchmark/results \
+       --scale-source known-height --compare gcps-from-ref --loso-gain
+```
+
+`run_all.sh` does all of it in one go. Existing scenes are never re-downloaded
+(`REFETCH=1` to force it), and a scene.json someone has annotated is never
+overwritten - an earlier version did both, which silently deleted every
+hand-entered prior and failed the next benchmark on every scene.
+
 ## 1. One-time setup
 
 ```bash
@@ -72,7 +92,7 @@ table are what they actually publish today, not guesses.
 | Source | Reference | Imagery | CRS | Covers |
 |---|---|---|---|---|
 | `ahn` | AHN4 `dsm_05m` **and** `dtm_05m`, 0.5 m, ≥10 pts/m², flown 2020–22 | `Actueel_orthoHR`, 8 cm | EPSG:28992 | urban, sparse |
-| `swisstopo` | swissSURFACE3D Raster, 0.5 m COG tiles | SWISSIMAGE 10 cm | EPSG:2056 | urban, hilly, forest |
+| `swisstopo` | swissSURFACE3D Raster **and** swissALTI3D terrain, 0.5 m COG tiles | SWISSIMAGE 10 cm | EPSG:2056 | urban, sparse, hilly, forest |
 | `usgs` | 3DEP, 1 m — **bare earth**, self-described | NAIP | EPSG:3857 | hilly |
 
 Three things that probing turned up, all now handled in code:
@@ -167,28 +187,41 @@ where scale came from, and `--scale-source` controls that.
 
 | Flag | What it does | Independence |
 |---|---|---|
-| `gcps-from-ref` *(default)* | samples 8 control points from the reference nDSM, one per grid cell | partial — see below |
-| `known-height` | one semantic prior per scene from `scene.json` | good, if the prior is genuinely external |
+| `known-height` *(default, and the headline)* | one semantic prior per scene from `scene.json`, read off the ortho | good - no reference elevation enters calibration |
+| `gcps-from-ref` | samples 8 control points from the reference nDSM, one per grid cell | **none** - a diagnostic of the pipeline's ceiling, never a headline |
 | `shadow` | sun azimuth + elevation, from `scene.json` or the GeoTIFF tags | **full** — no reference data enters calibration |
+| `ghsl` | GHSL building height under the scene (`mathsandml/ghsl.py`), no person involved | good - an external global product, never the reference |
 | `scene` | whatever each `scene.json` specifies | mixed |
 
-The default is the "limited set of Ground Control Points" route the problem
-statement explicitly allows, and 8 points across a 600 x 600 scene is a
-defensible reading of "limited". The points used are written into
-`results.json` so the disclosure is on the record.
+The headline uses `known-height`: one number per scene - roughly how tall the
+tallest sustained structure is - read off the orthophoto and written into
+`scene.json` with where it came from. No reference elevation enters the
+calibration, so the headline is an honest answer to "what happens on an image
+nobody has LiDAR for".
 
-But be straight about it when you present: those points come from the same
-raster used for scoring, so **absolute scale is not independently validated**
-in that mode. Two things to do about it:
+`--compare gcps-from-ref` scores the same scenes again with 8 control points
+sampled from the reference, as a clearly labelled second table. Those points
+come from the raster used for scoring, so that table is the pipeline's ceiling
+with perfect anchors, not an accuracy claim.
 
-1. Quote the **object band** table as the headline. It measures relative
-   structure geometry, which a handful of point heights cannot fake across a
-   whole scene.
-2. Run `--scale-source shadow` on at least one scene with known sun angles.
-   Nothing from the reference enters the calibration there, so it is the number
-   that answers "does this work without ground truth". Most satellite products
-   carry sun angles in the GeoTIFF tags and `load_image` reads them
-   automatically.
+`--scale-source shadow` needs sun azimuth and elevation. None of the benchmark
+orthophotos carries an acquisition time, so the shadow calibrator is covered
+by the synthetic scenes in `tests.py` (it recovers a known scale to within 4%
+at every sun angle tested) but has no LiDAR-scored number yet. Say so if asked.
+
+A person's `known_height_m` is used as given with the default envelope split
+(`DEPTHWIZARD_PRIOR_GAIN=1.0`, measured - see the README). Scores from
+2026-09-25 used the old Gaussian split with a x0.80 correction; reproduce them
+with `DEPTHWIZARD_SPLIT=gauss DEPTHWIZARD_DEM_MAX_M=none`. `--scale-source
+ghsl` is what an image nobody has looked at gets. Its own factor
+(`DEPTHWIZARD_GHSL_GAIN`) is 1.0 by measurement: fitted held-out, no single
+factor transferred between the five scenes GHSL covers (README). The GHSL
+tiles must be on disk - `fetch_ghsl.command` or `warm_cache.py`.
+
+`--loso-gain` asks whether one global correction on alpha generalises: each
+scene's gain is fitted on the OTHER scenes only and scored on the held-out one.
+A gain fitted and scored on the same scene always looks good; this is the test
+that it would help on a scene it has never seen.
 
 ---
 

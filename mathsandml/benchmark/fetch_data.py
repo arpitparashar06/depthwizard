@@ -68,8 +68,17 @@ AOIS = {
     "swisstopo": {
         "zurich_centre":    ("EPSG:2056", 2683400, 1247500, "urban",
                              "mid-rise European core on a slope"),
-        "interlaken_hills": ("EPSG:2056", 2633000, 1170000, "hilly",
-                             "steep relief, the terrain-band stress test"),
+        # named for the region, not the relief: this footprint turned out to
+        # be chalets and meadow with only 22 m of relief, so it scores as sparse
+        "interlaken_hills": ("EPSG:2056", 2633000, 1170000, "sparse",
+                             "detached chalets and meadow on a gentle slope"),
+        # the genuinely steep ones - the hilly row of the marking scheme
+        "wengen_slope":     ("EPSG:2056", 2637000, 1161750, "hilly",
+                             "car-free village on a ~30% mountainside: hotels, "
+                             "chalets and forest strips on real relief"),
+        "lavaux_terraces":  ("EPSG:2056", 2546950, 1149250, "hilly",
+                             "terraced vineyards and a wine village above Lake "
+                             "Geneva - steep, stepped, built"),
         "jura_forest":      ("EPSG:2056", 2570000, 1220000, "forest",
                              "mixed forest on rolling terrain"),
     },
@@ -100,6 +109,9 @@ SOURCES = {
     "swisstopo": dict(
         stac="https://data.geo.admin.ch/api/stac/v0.9",
         dsm_collection="ch.swisstopo.swisssurface3d-raster",
+        # the matching LiDAR terrain model; with it the reference nDSM is a
+        # measured difference instead of a low-pass approximation
+        dtm_collection="ch.swisstopo.swissalti3d",
         rgb_collection="ch.swisstopo.swissimage-dop10",
         native_px=0.5,
     ),
@@ -281,7 +293,7 @@ def fetch_ahn(aoi, cfg, size_m, px, outdir):
                 coverage=dsm_name, ortho=rgb_name, wms_format=fmt)
 
 
-def fetch_swisstopo(aoi, cfg, size_m, px, outdir):
+def fetch_swisstopo(aoi, cfg, size_m, px, outdir, parts=("dsm", "dtm", "rgb")):
     S = SOURCES["swisstopo"]
     crs, cx, cy, landscape, note = cfg
     bbox = bbox_from_centre(cx, cy, size_m)
@@ -348,12 +360,21 @@ def fetch_swisstopo(aoi, cfg, size_m, px, outdir):
             print(f"    warning: {100 * gaps:.1f}% of the AOI had no tile coverage")
         return dst
 
-    dsm = crop_mosaic(tile_hrefs(S["dsm_collection"]), 1)
-    write_geotiff(os.path.join(outdir, "ref_dsm.tif"), dsm[0], bbox, crs)
-    rgb = crop_mosaic(tile_hrefs(S["rgb_collection"]), 3)
-    rgb = np.nan_to_num(rgb, nan=0.0)
-    write_geotiff(os.path.join(outdir, "rgb.tif"),
-                  np.clip(rgb, 0, 255).astype(np.uint8).transpose(1, 2, 0), bbox, crs)
+    if "dsm" in parts:
+        dsm = crop_mosaic(tile_hrefs(S["dsm_collection"]), 1)
+        write_geotiff(os.path.join(outdir, "ref_dsm.tif"), dsm[0], bbox, crs)
+    if "dtm" in parts:
+        try:
+            dtm = crop_mosaic(tile_hrefs(S["dtm_collection"]), 1)
+            write_geotiff(os.path.join(outdir, "ref_dtm.tif"), dtm[0], bbox, crs)
+        except Exception as e:
+            print(f"    (no DTM: {type(e).__name__}: {str(e)[:120]})")
+    if "rgb" in parts:
+        rgb = crop_mosaic(tile_hrefs(S["rgb_collection"]), 3)
+        rgb = np.nan_to_num(rgb, nan=0.0)
+        write_geotiff(os.path.join(outdir, "rgb.tif"),
+                      np.clip(rgb, 0, 255).astype(np.uint8).transpose(1, 2, 0),
+                      bbox, crs)
     return dict(landscape=landscape, note=note, source="swissSURFACE3D + SWISSIMAGE",
                 crs=crs, bbox=list(bbox), px_size_m=px)
 
@@ -442,6 +463,9 @@ def main():
     ap.add_argument("--size-m", type=float, default=300.0,
                     help="square footprint in metres (300 m at 0.5 m = 600 px)")
     ap.add_argument("--px", type=float, default=0.5, help="output GSD in metres")
+    ap.add_argument("--force", action="store_true",
+                    help="re-download scenes that already exist (hand-entered "
+                         "keys in scene.json are kept either way)")
     ap.add_argument("--check", action="store_true")
     ap.add_argument("--list", action="store_true")
     args = ap.parse_args()
@@ -465,14 +489,50 @@ def main():
                 continue
             scene = f"{src}_{name}"
             d = os.path.join(args.out, scene)
+            have = all(os.path.exists(os.path.join(d, f))
+                       for f in ("rgb.tif", "ref_dsm.tif"))
+            if have and not args.force:
+                # This used to re-download every scene on every run_all.sh AND
+                # overwrite scene.json - which silently deleted the
+                # known_height_m a person had read off the ortho, so the next
+                # benchmark failed every scene with "no known_height_m".
+                print(f"\n[{scene}] already present - skipped (--force to refetch)")
+                if src == "swisstopo" and not os.path.exists(
+                        os.path.join(d, "ref_dtm.tif")):
+                    # older swisstopo scenes were built before the terrain
+                    # model was fetched; add just that
+                    print("    adding the swissALTI3D terrain model")
+                    try:
+                        fetch_swisstopo(name, cfg, args.size_m, args.px, d,
+                                        parts=("dtm",))
+                    except Exception as e:
+                        print(f"    (no DTM: {type(e).__name__}: {str(e)[:120]})")
+                made.append(scene)
+                continue
             os.makedirs(d, exist_ok=True)
             print(f"\n[{scene}] {cfg[3]} - {cfg[4]}")
             try:
                 info = FETCHERS[src](name, cfg, args.size_m, args.px, d)
                 info.update(aoi=name, size_m=args.size_m)
-                with open(os.path.join(d, "scene.json"), "w") as f:
+                # keep what a human wrote into an existing scene.json
+                old = {}
+                sj = os.path.join(d, "scene.json")
+                if os.path.exists(sj):
+                    try:
+                        with open(sj) as f:
+                            old = json.load(f)
+                    except Exception:
+                        old = {}
+                info = {**info, **{k: v for k, v in old.items()
+                                   if k in ("known_height_m", "known_height_source",
+                                            "gcps", "sun_azimuth", "sun_elevation",
+                                            "landscape", "note")}}
+                with open(sj, "w") as f:
                     json.dump(info, f, indent=2)
                 print(f"    -> {d}")
+                if info.get("known_height_m"):
+                    made.append(scene)
+                    continue
                 # run_benchmark refuses to invent the scale prior, and it must
                 # never come from the reference raster this scene is scored
                 # against. So a freshly fetched scene is not runnable until a

@@ -19,5 +19,6 @@ outputs/
 mathsandml/benchmark/scenes/
 mathsandml/benchmark/results/
 dem_coarse.tif
+cache/
 *.bak
 .DS_Store

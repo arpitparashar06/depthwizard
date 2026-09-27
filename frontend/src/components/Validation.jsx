@@ -32,7 +32,7 @@ const ALIGN = {
  * same five filenames in the job folder, so without a version on the URL the
  * browser serves the FIRST run's figures. See App.jsx::onReference. */
 export default function Validation ({ job, report, busy, error, onFile, fileUrl,
-                                      datum, stamp }) {
+                                      datum, stamp, onShowError }) {
   const inputRef = useRef(null)
   const [over, setOver] = useState(false)   // a file is being dragged over the well
   if (!job) return null
@@ -140,6 +140,13 @@ export default function Validation ({ job, report, busy, error, onFile, fileUrl,
                 Share of scene: {classes.map(([n, v]) => `${n} ${v.share_pct?.toFixed(0)}%`).join(' · ')}
               </p>
             </>
+          )}
+
+          {onShowError && (
+            <button type="button" className="btn ghost" style={{ marginTop: 16 }}
+                    onClick={onShowError}>
+              Show this error on the 3D model
+            </button>
           )}
 
           {/* the three figures validate.py wrote, each linking to itself at

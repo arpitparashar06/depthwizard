@@ -6,13 +6,16 @@
  * in production server.py serves this bundle from the same origin, so the
  * relative paths work in both without a base-URL switch.
  *
- * THE WHOLE CONTRACT, in four calls - these are the only four things the
- * browser can ask the server to do, and server.py has a route for each:
+ * THE WHOLE CONTRACT - these are the only things the browser can ask the
+ * server to do, and server.py has a route for each:
  *
  *   createJob(file, params)      POST /api/jobs                  -> { job_id }
  *   getJob(id)                   GET  /api/jobs/:id              -> the job record
  *   fileUrl(id, name, v)         GET  /api/jobs/:id/files/:name  -> an artefact
  *   validateJob(id, ref)         POST /api/jobs/:id/validate     -> the report
+ *   getLayers(id)                GET  /api/jobs/:id/layers       -> drapeable layers
+ *   getProfile(id, a, b)         GET  /api/jobs/:id/profile      -> heights along a line
+ *   getProbe(id, p)              GET  /api/jobs/:id/probe        -> heights at a pixel
  *
  * plus pollJob(), which is getJob() on a loop with a give-up rule.
  *
@@ -58,6 +61,24 @@ export async function validateJob (id, referenceFile, sigmaM = 15) {
   if (!r.ok) throw new Error(await r.text())
   return r.json()
 }
+
+async function getJSON (url) {
+  const r = await fetch(url)
+  if (!r.ok) {
+    let detail = ''
+    try { detail = (await r.json()).detail || '' } catch { /* not JSON */ }
+    throw new Error(detail || `${url}: ${r.status}`)
+  }
+  return r.json()
+}
+
+export const getLayers = (id) => getJSON(`/api/jobs/${id}/layers`)
+
+// a and b are {row, col} in source-image pixels
+export const getProfile = (id, a, b, n = 256) =>
+  getJSON(`/api/jobs/${id}/profile?r0=${a.row}&c0=${a.col}&r1=${b.row}&c1=${b.col}&n=${n}`)
+
+export const getProbe = (id, p) => getJSON(`/api/jobs/${id}/probe?r=${p.row}&c=${p.col}`)
 
 // Poll until the job leaves the running state. The Large backbone on CPU takes
 // minutes, so a single blocking request would time out in the browser.

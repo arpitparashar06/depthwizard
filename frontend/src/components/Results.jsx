@@ -96,10 +96,39 @@ export default function Results ({ res, job, fileUrl, extraFiles = [] }) {
             <td>Height range</td>
             <td className="mono">{res.min_m.toFixed(1)} – {res.max_m.toFixed(1)} {u}</td>
           </tr>
-          {res.info?.alpha != null && (
+          {res.info?.engine && res.info.engine !== 'zeroshot' && (
+            <tr>
+              <td>Engine</td>
+              <td className="mono">{{ finetuned: 'A: fine-tuned relative depth',
+                                     metric: 'B: HeightNet metres',
+                                     hybrid: 'A+B: relative depth, calibrated and fused' }[res.info.engine] || res.info.engine}
+                {res.info.model && <span style={{ color: 'var(--faint)' }}> · {res.info.model}</span>}
+                {res.info.fusion_weight_b_mean != null && (
+                  <span style={{ color: 'var(--faint)' }}> · weight on B {Number(res.info.fusion_weight_b_mean).toFixed(2)}</span>
+                )}</td>
+            </tr>
+          )}
+          {res.info?.alpha != null && res.info?.engine !== 'metric' && (
             <tr>
               <td>Scale</td>
               <td className="mono">alpha {Number(res.info.alpha).toFixed(3)} m per model unit</td>
+            </tr>
+          )}
+          {res.info?.model_vs_anchors && Object.keys(res.info.model_vs_anchors).length > 0 && (
+            <tr>
+              <td>Cross-checks</td>
+              <td className="mono">{Object.entries(res.info.model_vs_anchors)
+                .map(([k, v]) => `${k} x${Number(v).toFixed(2)}`).join(', ')}
+                <span style={{ color: 'var(--faint)' }}> · x1.00 = agrees with the model</span></td>
+            </tr>
+          )}
+          {res.scale_source && (
+            <tr>
+              <td>Scale from</td>
+              <td className="mono">{res.scale_source}
+                {res.info?.prior_source === 'ghsl' && (
+                  <span style={{ color: 'var(--faint)' }}> · enter the tallest structure to override</span>
+                )}</td>
             </tr>
           )}
           {res.info?.sigma_m != null && (

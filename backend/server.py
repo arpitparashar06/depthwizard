@@ -13,6 +13,9 @@ Five endpoints, and one function that does all the work:
                                     the browser polls this about once a second
     GET  /api/jobs/{id}/files/{n}   download dsm.tif, terrain.glb, a figure...
     POST /api/jobs/{id}/validate    upload reference LiDAR -> accuracy report
+    GET  /api/jobs/{id}/layers      analysis layers the viewer can drape
+    GET  /api/jobs/{id}/profile     exact heights along a line (r0,c0 -> r1,c1)
+    GET  /api/jobs/{id}/probe       exact heights at one pixel
     GET  /api/health                which model checkpoint is loaded
 
     _run(job_id, path, params)      THE WHOLE PIPELINE, in order:
@@ -66,10 +69,12 @@ from _bootstrap import ROOT, JOBS_DIR, FRONTEND_DIST, load_env  # noqa: E402
 load_env()
 
 from inference import (estimate_elevation, load_image, export_products,  # noqa: E402
-                       clip_below_ground)
+                       clip_below_ground, ghsl_height_prior, resolve_engine,
+                       engine_needs_anchor, ENGINE_LABEL, refine_by_default)
 from mesh_builder import build_mesh, build_city, export_mesh, slope_map  # noqa: E402
 from refine import refine                                               # noqa: E402
 import validate as V                                                    # noqa: E402
+import layers as LY                                                     # noqa: E402
 
 os.makedirs(JOBS_DIR, exist_ok=True)
 
@@ -186,40 +191,73 @@ def _run(job_id, src_path, params):
         # 2352x1222 image is 40 tiles against a 600x600 tile's 9, so the same
         # settings take minutes rather than one. Say so before it starts.
         rots = int(params.get("rotations") or 4)
-        n_tiles = _tile_count(rgb.shape[0], rgb.shape[1])
-        est = n_tiles * rots * SECONDS_PER_TILE
-        _log(job_id, f"{n_tiles} tiles x {rots} passes = {n_tiles * rots} model "
-                     f"runs, roughly {est / 60:.0f}-{est * 1.6 / 60:.0f} min on CPU")
-        if est > 180:
-            _log(job_id, "large image - drop rotations to 1, or use the Small "
-                         "backbone (DEPTH_MODEL=...-Small-hf), to go faster")
+        engine = resolve_engine(params.get("engine"))
+        if engine != "zeroshot":
+            _log(job_id, f"engine: {ENGINE_LABEL[engine]}" + (
+                "" if engine_needs_anchor(engine) else
+                " - no scale anchor required; any given is used as a check"))
+        if engine == "zeroshot":
+            n_tiles = _tile_count(rgb.shape[0], rgb.shape[1])
+            est = n_tiles * rots * SECONDS_PER_TILE
+            _log(job_id, f"{n_tiles} tiles x {rots} passes = {n_tiles * rots} model "
+                         f"runs, roughly {est / 60:.0f}-{est * 1.6 / 60:.0f} min on CPU")
+            if est > 180:
+                _log(job_id, "large image - drop rotations to 1, or use the Small "
+                             "backbone (DEPTH_MODEL=...-Small-hf), to go faster")
 
         kh = gcps = az = el = None
+        prior_source, prior_info = "person", None
+        auto_after_sun = False
         if mode == "absolute":
             src = params.get("scale_source", "known_height")
             if src == "known_height":
-                # No default here. alpha is metres per model unit and this one
-                # number sets it for the whole scene, so quietly falling back to
-                # 40 m rescales every elevation in the output while the UI still
-                # reports metres. A GeoTIFF carrying sun angles can calibrate
-                # itself; anything else has to be told.
+                # No made-up default here. alpha is metres per model unit and
+                # this one number sets it for the whole scene, so quietly
+                # falling back to 40 m rescales every elevation in the output
+                # while the UI still reports metres. In order: the person's
+                # number, the sun angles in the GeoTIFF tags, then GHSL's
+                # measured building height at these coordinates (ghsl.py).
+                # Only when none of those exists does the run stop and ask.
                 raw = params.get("known_height_m")
                 kh = float(raw) if raw not in (None, "") else 0.0
                 if kh <= 0:
-                    if (meta.get("sun_azimuth") is not None
+                    kh = None
+                    auto = params.get("auto_prior", True) not in (
+                        False, "false", 0, "0")
+                    if not engine_needs_anchor(engine):
+                        # the trained model sets the scale itself (hybrid: the
+                        # learned prior; metric: directly); GHSL and the sun
+                        # tags are still consulted inside, as fallback / check
+                        auto_after_sun = auto
+                    elif (meta.get("sun_azimuth") is not None
                             and meta.get("sun_elevation") is not None):
-                        kh = None
+                        # the shadows answer first; GHSL stays the fallback
+                        # inside estimate_elevation if they find too few pairs
+                        auto_after_sun = auto
                         _log(job_id, "no height prior given - calibrating from "
                                      "the sun angles in the GeoTIFF tags")
                     else:
-                        raise ValueError(
-                            "This image is georeferenced, so the output is in "
-                            "metres - and metres need a scale anchor. Enter the "
-                            "height of the tallest structure you can identify "
-                            "in the scene, or supply ground control points or "
-                            "sun angles. There is no way to turn relative depth "
-                            "into metres without one, and a guessed value "
-                            "rescales every elevation in the scene.")
+                        if auto:
+                            _log(job_id, "no height prior given - looking up GHSL "
+                                         "building height for these coordinates")
+                            prior, why = ghsl_height_prior(meta)
+                        else:
+                            prior, why = None, "the automatic prior is switched off"
+                        if prior is None:
+                            raise ValueError(
+                                "This image is georeferenced, so the output is in "
+                                "metres - and metres need a scale anchor. Enter the "
+                                "height of the tallest structure you can identify "
+                                "in the scene, or supply ground control points or "
+                                "sun angles. The automatic prior could not help: "
+                                f"{why}.")
+                        kh = float(prior["known_height_m"])
+                        prior_source, prior_info = "ghsl", prior
+                        _log(job_id, f"scale from GHSL: buildings under this scene "
+                                     f"reach about {kh:g} m ({prior['n_built']} of "
+                                     f"{prior['n_cells']} 100 m cells built). A prior, "
+                                     f"not a measurement - enter the tallest "
+                                     f"structure to override it")
             elif src == "gcps":
                 gcps = _parse_gcps(params.get("gcps"))
                 if len(gcps) < 2:
@@ -248,7 +286,8 @@ def _run(job_id, src_path, params):
                                  f"'known_height', 'gcps' or 'sun'")
 
         _set(job_id, progress=0.15)
-        _log(job_id, f"running depth backbone ({os.environ.get('DEPTH_MODEL', 'Large')})")
+        _log(job_id, f"running {ENGINE_LABEL[engine]}" if engine != "zeroshot" else
+                     f"running depth backbone ({os.environ.get('DEPTH_MODEL', 'Large')})")
         height, meta, info = estimate_elevation(
             src_path, known_height_m=kh, gcps=gcps,
             rotations=int(params.get("rotations") or 4),
@@ -257,9 +296,14 @@ def _run(job_id, src_path, params):
             debias_coarse_dem=bool(params.get("debias_coarse_dem", True)),
             fuse_scale=bool(params.get("fuse_scale", False)),
             sun_azimuth=az, sun_elevation=el,
+            prior_source=prior_source, prior_info=prior_info,
+            # decided above; the only second chance is GHSL after tag shadows
+            # that found too few pairs, and the run log says so if it happens
+            auto_prior=auto_after_sun,
             use_dem=bool(params.get("use_dem", True)),
             alpha_gain=float(params.get("alpha_gain") or 1.0),
-            outdir=out)
+            outdir=out, engine=engine,
+            gsd_hint=float(params.get("gsd_m") or 0) or None)
 
         # The coarse-DEM fetch happens deep inside estimate_elevation and its
         # failure is caught there, so without this the only trace is the
@@ -275,11 +319,20 @@ def _run(job_id, src_path, params):
                              "Score it against an nDSM, not an absolute DSM.")
             else:
                 dbg = info.get("dem_debias_m")
-                _log(job_id, "terrain baseline from COP30" +
+                _log(job_id, f"terrain baseline from {info.get('dem_source') or 'COP30'}" +
                      (f", rooftop bias removed ({dbg:.2f} m)"
                       if isinstance(dbg, (int, float)) else ""))
-            if isinstance(info.get("alpha"), (int, float)):
-                _log(job_id, f"scale: alpha={info['alpha']:.3f} m per model unit")
+            if info.get("engine") in ("metric", "hybrid"):
+                _log(job_id, f"scale: {info.get('scale_source')}")
+                chk = info.get("model_vs_anchors") or {}
+                if chk:
+                    _log(job_id, "independent checks of the model's metres: " +
+                         ", ".join(f"{k} x{v:.2f}" for k, v in chk.items()) +
+                         " (x1.00 = agree)")
+            elif isinstance(info.get("alpha"), (int, float)):
+                _log(job_id, f"scale: alpha={info['alpha']:.3f} m per model unit"
+                             + (f" - from {info['scale_source']}"
+                                if info.get("scale_source") else ""))
             fus = info.get("scale_fusion") or {}
             if fus.get("applied"):
                 _log(job_id, f"scale fused from {fus['n_sources']} sources "
@@ -295,7 +348,11 @@ def _run(job_id, src_path, params):
         if mode == "relative":
             # relative depth is 0..1; give it plausible metres before anything
             # downstream reasons in metres
-            scale = float(params.get("known_height_m") or 0) or RELATIVE_FULL_SCALE_M
+            # a typed height wins; else what HeightNet measured (metres at the
+            # assumed GSD); else the fixed nominal range
+            scale = (float(params.get("known_height_m") or 0)
+                     or float(info.get("suggested_full_scale_m") or 0)
+                     or RELATIVE_FULL_SCALE_M)
             height = height * scale
             meta = dict(meta, px_size_m=px)
             info["relative_full_scale_m"] = scale
@@ -307,7 +364,13 @@ def _run(job_id, src_path, params):
 
         _set(job_id, progress=0.6)
         rinfo = {}
-        if params.get("flatten", 0.8) or params.get("sharpen", 0.4):
+        want = params.get("refine")
+        do_refine = (refine_by_default(info.get("engine") or "zeroshot") if want in (None, "", "auto")
+                     else want not in (False, "false", 0, "0", "off"))
+        if not do_refine:
+            _log(job_id, "edge clean-up skipped: the fine-tuned model's edges are "
+                         "already where the image's are, and the clean-up smears them")
+        elif params.get("flatten", 0.8) or params.get("sharpen", 0.4):
             _log(job_id, "refining against image edges")
             # Use the split the pipeline measured for THIS scene. refine's own
             # 15 m default is narrower than the buildings in a dense tile, so
@@ -334,6 +397,12 @@ def _run(job_id, src_path, params):
         info = export_products(height, rgb, meta, out, info,
                                uncertainty=meta.get("_uncertainty"))
         _log(job_id, "products re-exported from the final surface")
+        try:
+            LY.write_layers(out, height, px, uncertainty=meta.get("_uncertainty"),
+                            units="m*" if mode == "relative" else "m")
+            _log(job_id, "analysis layers written (height, slope, uncertainty)")
+        except Exception as ex:           # a layer is a nicety, never a failure
+            _log(job_id, f"analysis layers skipped: {ex}")
 
         _set(job_id, progress=0.75)
         style = params.get("style", "city")
@@ -375,6 +444,8 @@ def _run(job_id, src_path, params):
             # before quoting any elevation out of this run
             datum=("local ground" if "no DEM" in info.get("calibration", "")
                    else "sea level" if mode == "absolute" else "relative"),
+            # where the metre scale came from - a person, the file, or GHSL
+            scale_source=info.get("scale_source"),
             min_m=float(np.nanmin(height)), max_m=float(np.nanmax(height)),
             relief_m=float(np.nanmax(height) - np.nanmin(height)),
             median_slope_deg=float(np.nanmedian(slope)),
@@ -489,15 +560,82 @@ async def validate_job(job_id: str, reference: UploadFile = File(...),
         V.save_report(rep, out)
     except Exception as e:
         raise HTTPException(400, f"{type(e).__name__}: {e}")
+    # the reference on the estimate's own grid, so the viewer's profile and
+    # probe can show LiDAR beside the estimate, and the error as a 3D layer
+    try:
+        LY.write_reference_grid(out, refarr)
+        LY.add_error_layer(out, rep["_arrays"]["error"],
+                           offset_m=float(rep["headline"].get("offset", 0.0) or 0.0))
+    except Exception as ex:
+        print(f"[validate] error layer skipped: {ex}")
 
     clean = {k: v for k, v in rep.items() if k != "_arrays"}
     return JSONResponse(json.loads(json.dumps(clean, default=float)))
 
 
+def _job_px(out):
+    """Pixel size of a finished job, from what the run itself recorded."""
+    for name in ("result.json", "meta.json"):
+        try:
+            with open(os.path.join(out, name)) as f:
+                v = json.load(f).get("px_size_m")
+            if v:
+                return float(v)
+        except Exception:
+            pass
+    return 1.0
+
+
+def _job_dir(job_id):
+    out = os.path.join(JOBS_DIR, os.path.basename(job_id))
+    if not os.path.exists(os.path.join(out, "dsm.tif")):
+        raise HTTPException(404, "run a job first")
+    return out
+
+
+@app.get("/api/jobs/{job_id}/layers")
+def job_layers(job_id: str):
+    out = _job_dir(job_id)
+    p = os.path.join(out, "layers.json")
+    if not os.path.exists(p):
+        # a run from before layers existed - build them now from its rasters
+        try:
+            dsm, _ = LY._read(os.path.join(out, "dsm.tif"))
+            unc, _ = LY._read(os.path.join(out, "uncertainty.tif"))
+            with open(os.path.join(out, "result.json")) as f:
+                units = "m*" if json.load(f).get("mode") == "relative" else "m"
+            LY.write_layers(out, dsm, _job_px(out), uncertainty=unc, units=units)
+        except Exception as e:
+            raise HTTPException(500, f"could not build layers: {e}")
+    with open(p) as f:
+        return json.load(f)
+
+
+@app.get("/api/jobs/{job_id}/profile")
+def job_profile(job_id: str, r0: float, c0: float, r1: float, c1: float, n: int = 256):
+    out = _job_dir(job_id)
+    return JSONResponse(json.loads(json.dumps(
+        LY.profile(out, r0, c0, r1, c1, n=n, px_size_m=_job_px(out)), default=float)))
+
+
+@app.get("/api/jobs/{job_id}/probe")
+def job_probe(job_id: str, r: float, c: float):
+    return LY.probe(_job_dir(job_id), r, c)
+
+
 @app.get("/api/health")
 def health():
-    return {"ok": True, "model": os.environ.get(
+    try:
+        engine = resolve_engine()
+    except Exception as e:
+        engine = f"unavailable: {e}"
+    out = {"ok": True, "engine": engine, "model": os.environ.get(
         "DEPTH_MODEL", "depth-anything/Depth-Anything-V2-Large-hf")}
+    if engine in ENGINE_LABEL and engine != "zeroshot":
+        import heightnet as HN
+        out["heightnet"] = HN.default_checkpoint()
+        out["engine_label"] = ENGINE_LABEL[engine]
+    return out
 
 
 # Serve the built front end if it exists, so production is one process.

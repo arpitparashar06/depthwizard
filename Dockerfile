@@ -48,6 +48,9 @@ RUN grep -viE '^torch' requirements.txt > /tmp/req.txt && pip install -r /tmp/re
 # .dockerignore because they are hundreds of megabytes of LiDAR.
 COPY backend/ ./backend/
 COPY mathsandml/ ./mathsandml/
+# the fine-tuned model (hybrid engine). Without it the app falls back to
+# the zero-shot engine below.
+COPY models/ ./models/
 COPY --from=web /web/dist ./frontend/dist
 
 # bake the checkpoint in, so the first run needs no network

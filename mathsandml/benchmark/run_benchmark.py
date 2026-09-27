@@ -24,8 +24,13 @@ Scale sources (--scale-source), in the order the problem statement allows them:
                    N is tiny (default 8) and the sampled points are written
                    into the report so the disclosure is explicit.
     known-height   one semantic prior per scene, from scene.json.
+    ghsl           the automatic prior: GHSL building height under the scene
+                   (ghsl.py). Needs the GHSL tile once - warm_cache.py.
     shadow         sun angles from scene.json or the GeoTIFF tags.
     scene          whatever scene.json specifies, per scene.
+    model          the trained HeightNet (models/heightnet.pt): no scale input
+                   at all. Every other source runs the zero-shot engine, even
+                   when a checkpoint is installed.
 
 Usage:
 
@@ -35,6 +40,7 @@ Usage:
 """
 
 import argparse
+import copy
 import json
 import os
 import sys
@@ -255,6 +261,7 @@ def run_scene(scene, outdir, args):
     # ---- pick the scale source --------------------------------------------
     cfg = scene["cfg"]
     kh = gcps = az = el = None
+    prior_source, prior_info = "person", None
     src = args.scale_source
     if src == "scene":
         if cfg.get("gcps"):
@@ -321,6 +328,25 @@ def run_scene(scene, outdir, args):
         rec["known_height_m"] = kh
         rec["known_height_source"] = cfg.get(
             "known_height_source", "scene.json (operator-supplied prior)")
+    elif src == "ghsl":
+        # The automatic prior: GHSL's average building height under the scene,
+        # with nothing from this scene's reference AND nothing from a person.
+        # This is what an image nobody has looked at gets.
+        prior, why = I.ghsl_height_prior(meta)
+        if prior is None:
+            rec["error"] = f"no GHSL prior: {why}"
+            return rec
+        kh = float(prior["known_height_m"])
+        prior_source, prior_info = "ghsl", prior
+        rec["known_height_m"] = kh
+        rec["known_height_source"] = (f"GHSL ANBH 2018, {prior['statistic']} "
+                                      f"({prior['n_built']}/{prior['n_cells']} "
+                                      f"cells built). NOT from the reference.")
+    elif src == "model":
+        # the trained model sets the scale itself (hybrid: learned prior;
+        # metric: directly): nothing about scale is given to it, from the
+        # reference or from anyone
+        rec["model"] = "HeightNet"
     elif src == "shadow":
         az = cfg.get("sun_azimuth")
         el = cfg.get("sun_elevation")
@@ -329,6 +355,7 @@ def run_scene(scene, outdir, args):
             return rec
         az, el = float(az), float(el)
     rec["scale_source"] = src
+    rec["engine"] = args.engine
 
     # ---- the pipeline ------------------------------------------------------
     try:
@@ -336,7 +363,14 @@ def run_scene(scene, outdir, args):
             scene["rgb"], known_height_m=kh, gcps=gcps,
             sun_azimuth=az, sun_elevation=el,
             use_dem=args.use_dem, alpha_gain=args.alpha_gain, outdir=out,
-            debias_coarse_dem=not args.no_debias)
+            debias_coarse_dem=not args.no_debias,
+            prior_source=prior_source, prior_info=prior_info,
+            # the benchmark scores the source it was asked for - never a
+            # GHSL fallback that happened to answer instead
+            auto_prior=False,
+            # pinned: an unlabelled run measures the zero-shot path even on a
+            # machine where a trained checkpoint is installed
+            engine=args.engine)
     except Exception as e:
         traceback.print_exc()
         rec["error"] = f"{type(e).__name__}: {e}"
@@ -350,7 +384,9 @@ def run_scene(scene, outdir, args):
     # described a surface no user ever receives. refine() self-checks and
     # declines when it makes things worse, so running it here costs little and
     # removes the mismatch. --no-refine reproduces the old behaviour.
-    if not args.no_refine:
+    do_refine = (I.refine_by_default(info.get("engine") or "zeroshot")
+                 if args.refine == "auto" else args.refine == "on")
+    if do_refine:
         import refine as R
         height, rinfo = R.refine(
             height, rgb, px_size_m=(meta2.get("px_size_m") or 1.0),
@@ -364,7 +400,7 @@ def run_scene(scene, outdir, args):
                                  uncertainty=meta2.get("_uncertainty"))
         rec["refine"] = {k: v for k, v in rinfo.items()
                          if not isinstance(v, np.ndarray)}
-    rec["refined"] = not args.no_refine
+    rec["refined"] = bool(do_refine)
 
     rec["info"] = {k: (float(v) if isinstance(v, (int, float, np.floating)) else v)
                    for k, v in info.items() if not isinstance(v, np.ndarray)}
@@ -448,13 +484,78 @@ def pool(rows):
     return out
 
 
+def run_scenes(scenes, outdir, args):
+    records = []
+    for s in scenes:
+        try:
+            records.append(run_scene(s, outdir, args))
+        except Exception as e:
+            traceback.print_exc()
+            records.append(dict(scene=s["name"], error=f"{type(e).__name__}: {e}"))
+    return records
+
+
+INDEPENDENT = {"known-height": "yes - one prior read off the ortho",
+               "ghsl": "yes - GHSL building height, no person involved",
+               "shadow": "yes - sun geometry only",
+               "model": "yes - trained HeightNet, no scale input; benchmark areas "
+                        "excluded from its training data",
+               "gcps-from-ref": "NO - points sampled from the scoring reference",
+               "known-gcps": "depends on where the points came from",
+               "scene": "mixed"}
+
+
+def loso_gain(scenes, records, args):
+    """Leave-one-scene-out scale correction - the honest way to ask whether
+    one global alpha gain generalises.
+
+    For each scene, the gain is fitted ONLY on the other scenes (pooled
+    through-origin least squares over their object bands, i.e. the argmin of
+    their squared error), then applied to the held-out scene and scored. If
+    the held-out scenes improve, a global gain is a real property of the
+    pipeline; if they do not, any gain that looks good in-sample is fitted
+    noise. Cheap to run because the depth cache means the backbone is not
+    called again.
+    """
+    ok = [(s, r) for s, r in zip(scenes, records)
+          if (r.get("attenuation") or {}).get("sxx") and not r.get("error")]
+    if len(ok) < 3:
+        return None
+    out = []
+    for i, (s, r) in enumerate(ok):
+        sxy = sum(o[1]["attenuation"]["sxy"] for j, o in enumerate(ok) if j != i)
+        sxx = sum(o[1]["attenuation"]["sxx"] for j, o in enumerate(ok) if j != i)
+        if sxx <= 1e-12:
+            continue
+        g = float(sxy / sxx)
+        a2 = copy.copy(args)
+        a2.alpha_gain = float(args.alpha_gain) * g
+        a2.no_figures = True
+        print(f"\n--- held-out gain for {s['name']}: x{g:.3f} (fitted on "
+              f"{len(ok) - 1} other scenes) ---")
+        r2 = run_scene(s, os.path.join(args.out, "loso"), a2)
+        if r2.get("error") or "headline" not in r2:
+            continue
+        out.append(dict(
+            scene=s["name"], gain=g,
+            rmse_before=r["headline"].get("rmse"), rmse_after=r2["headline"].get("rmse"),
+            raw_before=(r.get("raw_alignment") or {}).get("rmse"),
+            raw_after=(r2.get("raw_alignment") or {}).get("rmse"),
+            obj_before=(r.get("object_band") or {}).get("rmse"),
+            obj_after=(r2.get("object_band") or {}).get("rmse"),
+            n=r["headline"].get("n")))
+    sxy = sum(r["attenuation"]["sxy"] for _, r in ok)
+    sxx = sum(r["attenuation"]["sxx"] for _, r in ok)
+    return dict(rows=out, all_scene_gain=float(sxy / sxx) if sxx > 1e-12 else None)
+
+
 def fmt(v, nd=2):
     if v is None or (isinstance(v, float) and not np.isfinite(v)):
         return "-"
     return f"{v:.{nd}f}"
 
 
-def build_report(records, args):
+def build_report(records, args, loso=None, compare=None):
     ok = [r for r in records if "headline" in r and not r.get("error")]
     bad = [r for r in records if r.get("error")]
 
@@ -466,7 +567,7 @@ def build_report(records, args):
           + f"  \nCoarse DEM terrain baseline: `{'on' if args.use_dem else 'off'}`  ",
           f"Object/terrain split: sized per scene from the imagery "
           f"(the {args.sigma_m:g} m setting is the fallback when that is off)  \n"
-          f"Scored surface: `{'refined - the same dsm.tif the CLI and UI export' if not args.no_refine else 'raw estimate, pre-refine'}`  ", ""]
+          f"Scored surface: `the same dsm.tif the CLI and UI export (refine: {args.refine})`  ", ""]
 
     # -- how the headline was aligned, stated before any number is shown ------
     aligns = sorted({r.get("headline_alignment") for r in ok
@@ -612,6 +713,65 @@ def build_report(records, args):
                          f"{fmt(p.get('mae'))} | {fmt(p.get('bias'))} |")
             L.append("")
 
+    # -- held-out gain ----------------------------------------------------------
+    if loso and loso.get("rows"):
+        rows = loso["rows"]
+        L += ["## Does one global scale correction generalise? (leave one scene out)", "",
+              "Each scene's gain is fitted on the **other** scenes only, then applied to "
+              "the held-out scene and scored. This is the only fair test of a global "
+              "`--alpha-gain`: a gain fitted and scored on the same scene always looks good.", "",
+              "| Held-out scene | gain (from the others) | RMSE before | RMSE after | "
+              "raw before | raw after | object band before | object band after |",
+              "|---|--:|--:|--:|--:|--:|--:|--:|"]
+        for x in rows:
+            L.append(f"| {x['scene']} | x{fmt(x['gain'], 3)} | {fmt(x['rmse_before'])} | "
+                     f"{fmt(x['rmse_after'])} | {fmt(x['raw_before'])} | {fmt(x['raw_after'])} | "
+                     f"{fmt(x['obj_before'])} | {fmt(x['obj_after'])} |")
+        w = np.array([x["n"] or 0 for x in rows], float)
+        w = w / max(w.sum(), 1e-9)
+        def _q(k):
+            v = np.array([x[k] if x[k] is not None else np.nan for x in rows], float)
+            return float(np.sqrt(np.nansum(w * v ** 2)))
+        better = sum(1 for x in rows if (x["obj_after"] or 9e9) < (x["obj_before"] or 0))
+        pb, pa = _q("rmse_before"), _q("rmse_after")
+        ob, oa = _q("obj_before"), _q("obj_after")
+        L.append(f"| **pooled** | | **{fmt(pb)}** | **{fmt(pa)}** | {fmt(_q('raw_before'))} | "
+                 f"{fmt(_q('raw_after'))} | **{fmt(ob)}** | **{fmt(oa)}** |")
+        L.append("")
+        g_all = loso.get("all_scene_gain")
+        if oa < ob and better > len(rows) / 2:
+            L += [f"Held out, the correction helps on **{better} of {len(rows)}** scenes "
+                  f"and pooled object-band RMSE moves {fmt(ob)} -> {fmt(oa)} m. "
+                  f"The gain fitted on all scenes together is **x{fmt(g_all, 3)}**; "
+                  f"the held-out numbers above, not the in-sample ones, are what to "
+                  f"expect from it on a new scene.", ""]
+        else:
+            L += [f"Held out, the correction helps on only **{better} of {len(rows)}** "
+                  f"scenes (pooled object band {fmt(ob)} -> {fmt(oa)} m), so no global "
+                  f"gain is recommended - it does not transfer between scenes.", ""]
+
+    # -- scale-source comparison ------------------------------------------------
+    if compare:
+        L += ["## Scale source comparison", "",
+              "The same scenes, the same cached depth, only the source of the "
+              "metre scale changes. Only independent sources belong in a headline.", "",
+              "| Scale source | independent of the reference? | scenes | "
+              "RMSE (shift) | RMSE raw | MAE | r | object band RMSE |",
+              "|---|---|--:|--:|--:|--:|--:|--:|"]
+        for src, recs in [(args.scale_source, records)] + list(compare.items()):
+            good = [r for r in recs if "headline" in r and not r.get("error")]
+            p = pool([r["headline"] for r in good]) or {}
+            pr = pool([r["raw_alignment"] for r in good if r.get("raw_alignment")]) or {}
+            po = pool([r["object_band"] for r in good if r.get("object_band")]) or {}
+            L.append(f"| `{src}` | {INDEPENDENT.get(src, '?')} | {len(good)} | "
+                     f"{fmt(p.get('rmse'))} | {fmt(pr.get('rmse'))} | {fmt(p.get('mae'))} | "
+                     f"{fmt(p.get('r'), 3)} | {fmt(po.get('rmse'))} |")
+        L.append("")
+        fails = {src: [r for r in recs if r.get("error")] for src, recs in compare.items()}
+        for src, bad_ in fails.items():
+            if bad_ and len(bad_) == len(compare[src]):
+                L += [f"`{src}` scored no scene: {str(bad_[0]['error'])[:160]}", ""]
+
     # -- disclosures ----------------------------------------------------------
     L += ["## How scale was set", ""]
     if args.scale_source == "gcps-from-ref":
@@ -626,6 +786,18 @@ def build_report(records, args):
               "validated. The **object band** table above is the leakage-resistant "
               "number - it measures relative structure geometry, which a handful of "
               "point heights cannot fake across a whole scene.", ""]
+    elif args.scale_source == "ghsl":
+        L += ["Each scene was calibrated **automatically**, with no input from "
+              "anyone: the 95th percentile of GHSL's average building height "
+              "(GHS-BUILT-H R2023A, 100 m cells, epoch 2018) under the scene "
+              "stands in for the tallest-structure prior. No reference elevation "
+              "enters the calibration. Scenes GHSL shows no buildings under are "
+              "reported as failures.", ""]
+        L += ["| Scene | prior | where it came from |", "|---|--:|---|"]
+        for r in ok:
+            L.append(f"| {r['scene']} | {fmt(r.get('known_height_m'), 1)} m | "
+                     f"{r.get('known_height_source', 'GHSL')} |")
+        L.append("")
     elif args.scale_source == "known-height":
         L += ["Each scene was calibrated from **one semantic prior** - roughly how "
               "tall the tallest sustained structure is - read off the ortho and "
@@ -638,6 +810,25 @@ def build_report(records, args):
             L.append(f"| {r['scene']} | {fmt(r.get('known_height_m'), 0)} m | "
                      f"{r.get('known_height_source', 'scene.json')} |")
         L.append("")
+    elif args.scale_source == "model":
+        info0 = (ok[0].get("info") or {}) if ok else {}
+        how = ("the fine-tuned relative depth, calibrated by the learned scene "
+               "prior (the metric head) and fused with the metric head per pixel"
+               if args.engine == "hybrid" else "the metric head's metres directly")
+        L += [f"Engine **{args.engine}**: {how}. Model: Depth-Anything-V2 fine-tuned "
+              "on LiDAR height-above-ground from GAMUS, AHN4 and swisstopo. Nothing "
+              "about scale was given - no prior, no control points, no sun angles - "
+              "and no tile within 3 km of any scene here was in its training data "
+              "(training/prepare_lidar.py).", "",
+              f"Model: {info0.get('model', 'HeightNet')}.", ""]
+        chk = [(r["scene"], (r.get("info") or {}).get("model_vs_anchors")) for r in ok]
+        if any(c for _, c in chk):
+            L += ["| Scene | independent anchors vs model (x1.00 = agree) |", "|---|---|"]
+            for sc, c in chk:
+                if c:
+                    L.append(f"| {sc} | " + ", ".join(f"{k} x{v:.2f}" for k, v in c.items())
+                             + " |")
+            L.append("")
     elif args.scale_source == "shadow":
         L += ["Scale came from **shadow length** against the sun angles, so no "
               "reference elevation entered the calibration at all. This is the only "
@@ -670,7 +861,12 @@ def main():
     # noisy. Measured pooled RMSE: 5.28 m from the prior, against 6.94 m from 10
     # control points and 9.16 m from 5 - fewer points made it worse, not better.
     ap.add_argument("--scale-source", default="known-height",
-                    choices=["gcps-from-ref", "known-height", "shadow", "scene"])
+                    choices=["gcps-from-ref", "known-height", "ghsl", "shadow",
+                             "scene", "model"])
+    ap.add_argument("--engine", default=None,
+                    choices=["zeroshot", "finetuned", "metric", "hybrid"],
+                    help="default: hybrid for --scale-source model, zeroshot otherwise. "
+                         "finetuned = engine A (needs an anchor like zeroshot)")
     ap.add_argument("--n-gcps", type=int, default=8)
     ap.add_argument("--seed", type=int, default=0)
     ap.add_argument("--sigma-m", type=float, default=15.0,
@@ -687,6 +883,8 @@ def main():
     ap.add_argument("--no-debias", action="store_true",
                     help="ablation: leave rooftop contamination in the coarse "
                          "elevation model")
+    ap.add_argument("--refine", default="auto", choices=("auto", "on", "off"),
+                    help="auto = refine the zero-shot engine only, as the app does")
     ap.add_argument("--no-refine", action="store_true",
                     help="score the raw estimate instead of the refined surface "
                          "the CLI and UI actually export (the old behaviour)")
@@ -695,9 +893,21 @@ def main():
     ap.add_argument("--sharpen", type=float, default=0.4,
                     help="refine: object-band unsharp amount")
     ap.add_argument("--no-figures", action="store_true")
+    ap.add_argument("--loso-gain", action="store_true",
+                    help="leave-one-scene-out test of a global alpha gain")
+    ap.add_argument("--compare", default="",
+                    help="comma-separated extra scale sources to score on the "
+                         "same scenes, e.g. gcps-from-ref,shadow")
     ap.add_argument("--limit", type=int, default=0, help="score only the first N scenes")
     ap.add_argument("--only", default=None, help="comma-separated scene names")
     args = ap.parse_args()
+    if args.no_refine:
+        args.refine = "off"
+    if args.engine is None:
+        args.engine = "hybrid" if args.scale_source == "model" else "zeroshot"
+    if args.scale_source == "model" and args.engine in ("zeroshot", "finetuned"):
+        ap.error(f"--scale-source model gives no anchor; engine {args.engine} needs one "
+                 "(use metric or hybrid, or a different --scale-source)")
 
     scenes = discover_scenes(args.scenes)
     if args.only:
@@ -715,19 +925,26 @@ def main():
     os.makedirs(args.out, exist_ok=True)
     print(f"{len(scenes)} scene(s): {', '.join(s['name'] for s in scenes)}")
 
-    records = []
-    for s in scenes:
-        try:
-            records.append(run_scene(s, args.out, args))
-        except Exception as e:
-            traceback.print_exc()
-            records.append(dict(scene=s["name"], error=f"{type(e).__name__}: {e}"))
+    records = run_scenes(scenes, args.out, args)
 
-    md = build_report(records, args)
+    loso = loso_gain(scenes, records, args) if args.loso_gain else None
+
+    compare = {}
+    for src in [x.strip() for x in args.compare.split(",") if x.strip()]:
+        if src == args.scale_source:
+            continue
+        a2 = copy.copy(args)
+        a2.scale_source = src
+        a2.no_figures = True
+        print(f"\n=== comparison run: --scale-source {src} ===")
+        compare[src] = run_scenes(scenes, os.path.join(args.out, "by_source", src), a2)
+
+    md = build_report(records, args, loso=loso, compare=compare)
     with open(os.path.join(args.out, "report.md"), "w") as f:
         f.write(md)
     with open(os.path.join(args.out, "results.json"), "w") as f:
-        json.dump(dict(config=vars(args), scenes=records), f, indent=2, default=float)
+        json.dump(dict(config=vars(args), scenes=records, loso=loso,
+                       compare=compare), f, indent=2, default=float)
 
     print("\n" + md)
     print(f"\nWrote {os.path.join(args.out, 'report.md')} and results.json")

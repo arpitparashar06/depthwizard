@@ -10,15 +10,21 @@
  *   3. run()               POST /api/jobs, then pollJob() asks the server for
  *                          status about once a second until it says done
  *   4. job.result arrives  -> <Viewer> loads terrain.glb and you can fly
+ *                          -> the layer switcher swaps the photo for height,
+ *                             slope, uncertainty or (after validation) error
+ *                          -> two probe pins -> <Profile>, exact heights along
+ *                             the line, read from the GeoTIFFs by the server
  *                          -> <Results> lists the numbers and the downloads
  *                          -> <Validation> optionally scores it against LiDAR
  *
  * Everything that talks to the backend is in api.js. Everything that draws 3D
  * is in Viewer.jsx. This file is the wiring between them.
  *
- * THE ONE RULE THE UI ENFORCES: a georeferenced image cannot run without a
- * scale source, because alpha (metres per model unit) is one number that sets
- * every elevation in the scene. See DEFAULTS below and server.py.
+ * THE ONE RULE THE UI ENFORCES: a georeferenced image never runs on a made-up
+ * scale, because alpha (metres per model unit) is one number that sets every
+ * elevation in the scene. With the height left empty the server looks up
+ * GHSL's building height at the image's coordinates and labels the result as
+ * a prior; only if that fails too does it stop and ask. See server.py.
  *
  * LAYOUT, top to bottom: <AmbientBackground> (decoration only) -> a sticky
  * nav bar -> the hero -> a two-column grid, controls on the left and output
@@ -32,19 +38,22 @@ import RunProgress from './components/RunProgress.jsx'
 import Results from './components/Results.jsx'
 import Validation from './components/Validation.jsx'
 import AmbientBackground from './components/AmbientBackground.jsx'
-import { createJob, pollJob, fileUrl, validateJob } from './api.js'
+import Profile from './components/Profile.jsx'
+import { createJob, pollJob, fileUrl, validateJob, getLayers, getProfile, getProbe } from './api.js'
 
 /* Every key here is sent to the backend verbatim as the job's params, so this
  * object doubles as the list of what the API accepts - server.py reads the
  * same names.
  *
  * known_height_m starts EMPTY on purpose. alpha is metres per model unit and
- * this one number sets it for the whole scene, so a georeferenced image is
- * refused rather than silently anchored to a default. */
+ * this one number sets it for the whole scene, so it is never defaulted here:
+ * empty means "use the GHSL building height for this place" (auto_prior),
+ * and a person's number always overrides that. */
 const DEFAULTS = {
   style: 'city',
   gsd_m: 0.5,
   known_height_m: '',
+  auto_prior: true,
   scale_source: 'known_height',
   sun_azimuth: 145,
   sun_elevation: 52,
@@ -143,6 +152,14 @@ export default function App () {
   const [stamp, setStamp] = useState(0)        // cache-buster for re-validation
   const [scrolled, setScrolled] = useState(false)  // has the page moved at all?
   const stopRef = useRef(null)                 // cancels the running poll loop
+  const [layers, setLayers] = useState([])     // drapeable analysis layers
+  const [layerId, setLayerId] = useState('photo')
+  const [pins, setPins] = useState([])         // probe pins, in source pixels
+  const [probes, setProbes] = useState(null)   // exact values at each pin
+  const [profile, setProfile] = useState(null) // exact values along A -> B
+  const [hoverIdx, setHoverIdx] = useState(null)
+  const [clearPins, setClearPins] = useState(0) // bumped to tell the viewer to drop its pins
+  const layersRef = useRef([])
 
   /* The top bar has no chrome until you scroll: at rest it sits straight on the
    * paper, and the moment the page moves it becomes a white card with a border
@@ -171,6 +188,32 @@ export default function App () {
   // stop polling if the component goes away mid-run
   useEffect(() => () => { if (stopRef.current) stopRef.current() }, [])
 
+  /* Which engine the server will use. With the trained HeightNet installed the
+   * height field is optional - the model measures metres itself - and the form
+   * says so instead of promising a GHSL prior that is now only a cross-check. */
+  const [engine, setEngine] = useState(null)
+  useEffect(() => {
+    fetch('/api/health').then((r) => r.json()).then((h) => setEngine(h.engine || null))
+      .catch(() => setEngine(null))
+  }, [])
+
+  /* ?job=<id> reopens a run. The id is written into the address bar the moment
+   * a run starts, so a reload - or a crashed tab mid-demo - comes straight back
+   * to the same result instead of an empty page, and a finished run can be
+   * bookmarked. The server recovers finished jobs from disk after a restart. */
+  useEffect(() => {
+    const id = new URLSearchParams(window.location.search).get('job')
+    if (!id || !/^[A-Za-z0-9_-]+$/.test(id)) return
+    setBusy(true)
+    stopRef.current = pollJob(id, (j) => {
+      setJob(j)
+      if (j.status === 'done' || j.status === 'error') {
+        setBusy(false)
+        if (j.status === 'error') setError(j.error || 'The run failed.')
+      }
+    })
+  }, [])
+
   const run = useCallback(async () => {
     if (!file) { setError('Choose an image first.'); return }
     // strings -> numbers, and half-filled rows are dropped rather than sent
@@ -183,8 +226,14 @@ export default function App () {
       return
     }
     setError(''); setReport(null); setValError(''); setBusy(true); setJob(null); setTab('3d')
+    setLayers([]); setLayerId('photo'); setPins([]); setProfile(null); setProbes(null)
     try {
       const { job_id } = await createJob(file, { ...params, gcps: clean })
+      try {
+        const u = new URL(window.location.href)
+        u.searchParams.set('job', job_id)
+        window.history.replaceState(null, '', u)
+      } catch { /* an address bar we cannot write is not worth failing a run for */ }
       // pollJob calls back on every status change and returns its own stopper
       stopRef.current = pollJob(job_id, (j) => {
         setJob(j)
@@ -214,7 +263,46 @@ export default function App () {
   }
 
   const res = job?.status === 'done' ? job.result : null
+  const jobId = res ? job.id : null
   const glb = res ? fileUrl(job.id, 'terrain.glb') : null
+
+  // The layer list. Fetched when a run finishes, and again after a validation,
+  // which adds the error layer.
+  useEffect(() => {
+    if (!jobId) return
+    let live = true
+    getLayers(jobId).then((d) => { if (live) setLayers(d.layers || []) }).catch(() => {})
+    return () => { live = false }
+  }, [jobId, stamp])
+
+  // Pins -> exact values. One pin gets a probe, two get a probe each and the
+  // profile between them. Re-asked after a validation so LiDAR joins in.
+  useEffect(() => {
+    if (!jobId || !pins.length) { setProbes(null); setProfile(null); return }
+    let live = true
+    Promise.all(pins.map((p) => getProbe(jobId, p).catch(() => null)))
+      .then((v) => { if (live) setProbes(v) })
+    if (pins.length === 2) {
+      getProfile(jobId, pins[0], pins[1])
+        .then((d) => { if (live) { setProfile(d); setHoverIdx(null) } })
+        .catch(() => { if (live) setProfile(null) })
+    } else {
+      setProfile(null)
+    }
+    return () => { live = false }
+  }, [jobId, pins, stamp])
+
+  const onPins = useCallback((p) => setPins(p || []), [])
+  layersRef.current = layers
+  const cycleLayer = useCallback(() => {
+    const ls = layersRef.current
+    if (!ls.length) return
+    setLayerId((cur) => ls[(ls.findIndex((l) => l.id === cur) + 1) % ls.length].id)
+  }, [])
+  const layer = layers.find((l) => l.id === layerId)
+  const layerUrl = jobId && layer && layer.id !== 'photo'
+    ? fileUrl(jobId, layer.file, layer.id === 'error' ? stamp : undefined) : null
+  const legend = layer && layer.id !== 'photo' ? layer : null
   const heightMap = res ? fileUrl(job.id, 'height16.png') : null
 
   /* The datum badge. This is the single most important thing on the screen for
@@ -294,9 +382,12 @@ export default function App () {
             </Field>
 
             {params.scale_source === 'known_height' && (
-              <Field label="Tallest structure (m)" required
-                     hint="The tallest building you can identify, not a typical one. This one number sets the scale for the whole scene, so a GeoTIFF will not run without it. A PNG or JPG runs fine without.">
-                <input type="number" step="1" min="1" placeholder="required for GeoTIFF"
+              <Field label="Tallest structure (m)"
+                     hint={engine === 'hybrid' || engine === 'metric'
+                       ? "Optional. The fine-tuned model sets the scale itself: its metric head measures this scene and calibrates the relative depth, then the two are fused. A number typed here is used instead of that learned prior, and the run reports whether they agree."
+                       : "The tallest building you can identify, not a typical one. This one number sets the scale for the whole scene. Leave it empty and a GeoTIFF uses the GHSL building height for its location instead — a prior, and labelled as one. A PNG or JPG runs fine without."}>
+                <input type="number" step="1" min="1"
+                       placeholder={engine === 'hybrid' || engine === 'metric' ? 'optional - the model measures heights' : 'empty = GHSL building height'}
                        value={params.known_height_m} onChange={set('known_height_m')} />
               </Field>
             )}
@@ -421,19 +512,39 @@ export default function App () {
             is for. Below it, progress then results then validation appear as
             they become available. */}
         <main>
-          <div className="tabs" role="tablist">
-            <button role="tab" aria-selected={tab === '3d'}
-                    onClick={() => setTab('3d')}>3D flythrough</button>
-            <button role="tab" aria-selected={tab === 'map'} disabled={!heightMap}
-                    onClick={() => setTab('map')}>Elevation map</button>
+          <div className="stage-bar">
+            <div className="tabs" role="tablist">
+              <button role="tab" aria-selected={tab === '3d'}
+                      onClick={() => setTab('3d')}>3D flythrough</button>
+              <button role="tab" aria-selected={tab === 'map'} disabled={!heightMap}
+                      onClick={() => setTab('map')}>Elevation map</button>
+            </div>
+            {/* What is draped on the terrain. The photo is the default; each
+                other layer is a colour-mapped raster on the same UVs, with its
+                legend in the viewer's top-right corner. L cycles while flying. */}
+            {glb && tab === '3d' && layers.length > 1 && (
+              <div className="layer-seg">
+                <span className="lbl">Layer</span>
+                <div className="seg layers" role="group" aria-label="Draped layer">
+                  {layers.map((l) => (
+                    <button key={l.id} type="button" aria-pressed={layerId === l.id}
+                            onClick={() => setLayerId(l.id)}>{l.label}</button>
+                  ))}
+                </div>
+              </div>
+            )}
           </div>
 
           <div className="stage">
             {tab === 'map' && heightMap
               ? <div className="flat-view"><img src={heightMap} alt="Elevation map" /></div>
               : glb
-                ? <Viewer url={glb} units={res.datum === 'relative' ? 'm*' : 'm'}
-                          exaggeration={res.z_exaggeration || 1} baseM={res.base_m || 0} />
+                ? <Viewer url={glb} clearSignal={clearPins}
+                          units={res.datum === 'relative' ? 'm*' : 'm'}
+                          exaggeration={res.z_exaggeration || 1} baseM={res.base_m || 0}
+                          pxSize={res.px_size_m || 1} layerUrl={layerUrl} legend={legend}
+                          exact={probes} profile={profile} profileHover={hoverIdx}
+                          onPins={onPins} onCycleLayer={cycleLayer} />
                 : (
                   <div className="empty">
                     <p className="headline">
@@ -445,7 +556,7 @@ export default function App () {
                         <span className="t">Drop an aerial or satellite image</span></div>
                       <span className="arrow">→</span>
                       <div className="step"><span className="n">2</span>
-                        <span className="t">Name the tallest structure you can see</span></div>
+                        <span className="t">Optionally, name the tallest structure you can see</span></div>
                       <span className="arrow">→</span>
                       <div className="step"><span className="n">3</span>
                         <span className="t">Fly through the result and measure it</span></div>
@@ -453,6 +564,23 @@ export default function App () {
                   </div>
                 )}
           </div>
+
+          {res && tab === '3d' && (
+            profile
+              ? (
+                <div className="panel" style={{ marginTop: 16 }}>
+                  <Profile profile={profile} units={res.datum === 'relative' ? 'm*' : 'm'}
+                           hover={hoverIdx} onHover={setHoverIdx}
+                           onClear={() => { setPins([]); setClearPins((k) => k + 1) }} />
+                </div>
+                )
+              : (
+                <p className="note" style={{ marginTop: 10 }}>
+                  Click the view to fly, then click two points on the terrain: the
+                  elevation profile between them appears here, read from the GeoTIFFs.
+                </p>
+                )
+          )}
 
           {job && (
             <div className="panel" style={{ marginTop: 16 }}>
@@ -471,7 +599,11 @@ export default function App () {
           {res && (
             <Validation job={job} report={report} busy={validating} error={valError}
                         onFile={onReference} fileUrl={fileUrl} datum={res.datum}
-                        stamp={stamp} />
+                        stamp={stamp}
+                        onShowError={() => {
+                          setTab('3d'); setLayerId('error')
+                          document.querySelector('.stage')?.scrollIntoView({ behavior: 'smooth', block: 'center' })
+                        }} />
           )}
         </main>
       </div>

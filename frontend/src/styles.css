@@ -517,6 +517,26 @@ input[type=range]{width:100%;accent-color:var(--accent);height:18px;cursor:point
 .hud hr{border:0;border-top:1px solid var(--line-soft);margin:var(--s2) 0}
 .hud .probe{font-size:11.5px;color:var(--dim);line-height:1.5}
 
+.hud .probe.exact{color:var(--ink)}
+.hud .probe.exact b{color:var(--accent-dim);font-weight:700}
+
+/* the colour key for an analysis layer - same glass card as the HUD, pinned
+   to the other corner, never in the way of the pointer lock */
+.legend{
+  position:absolute;top:var(--s3);right:var(--s3);width:236px;
+  background:rgba(255,255,255,.94);backdrop-filter:blur(10px);
+  border:1px solid rgba(255,255,255,.6);border-radius:var(--r2);
+  padding:var(--s3) var(--s4);pointer-events:none;box-shadow:var(--shadow-md);
+  font-family:var(--f-mono);
+}
+.legend .k{color:var(--faint);font-size:10px;letter-spacing:.13em;text-transform:uppercase}
+.legend .ramp{height:10px;border-radius:5px;margin:8px 0 4px;
+  box-shadow:inset 0 0 0 1px rgba(17,17,23,.08)}
+.legend .ends{display:flex;justify-content:space-between;font-size:11px;
+  color:var(--ink);font-variant-numeric:tabular-nums}
+.legend .note2{font-family:var(--f-sans);font-size:11px;color:var(--dim);
+  line-height:1.45;margin-top:6px}
+
 /* the crosshair: two white bars with a dark glow, so it stays visible over
    both a bright roof and a dark shadow */
 .cross{position:absolute;left:50%;top:50%;width:15px;height:15px;
@@ -667,6 +687,44 @@ kbd{
   transition:width .5s var(--ease)}
 .bar-row .num{font-family:var(--f-mono);font-size:12px;text-align:right;
   color:var(--dim);font-variant-numeric:tabular-nums}
+
+/* -------------------------------------------------------------- profile --
+   Profile.jsx: one axis in metres, estimate and reference as 2px lines, the
+   ensemble uncertainty as a band. Gridlines are hairlines; text is ink, never
+   the series colour - the short line keys carry identity. */
+.profile-head{display:flex;align-items:center;justify-content:space-between;gap:var(--s3)}
+.profile-actions{display:flex;gap:var(--s2)}
+.btn.sm{padding:6px 12px;font-size:12px;width:auto;margin:0;text-decoration:none}
+.legend-row{display:flex;gap:var(--s4);flex-wrap:wrap;margin-top:var(--s4);
+  font-size:12px;color:var(--dim)}
+.legend-row span{display:flex;align-items:center;gap:7px}
+.legend-row i{display:inline-block;width:16px;height:2px;border-radius:1px}
+.legend-row i.band{height:9px;opacity:.22;border-radius:2px}
+.chart{position:relative;margin-top:var(--s2);user-select:none}
+.chart svg{display:block;overflow:visible;outline:none;cursor:crosshair}
+.chart svg:focus-visible{box-shadow:0 0 0 2px var(--accent-wash);border-radius:6px}
+.chart .grid{stroke:var(--line-soft);stroke-width:1}
+.chart .axis{stroke:var(--line);stroke-width:1}
+.chart .tick{font-family:var(--f-mono);font-size:10.5px;fill:var(--faint)}
+.chart .dlabel{font-size:11.5px;fill:var(--ink);font-weight:600}
+.chart .ab{font-family:var(--f-mono);font-size:11px;fill:var(--faint);font-weight:700}
+.chart .cross-line{stroke:var(--ink);stroke-opacity:.35;stroke-width:1}
+.chart .tip{position:absolute;pointer-events:none;min-width:170px;
+  background:#fff;border:1px solid var(--line);border-radius:var(--r1);
+  box-shadow:var(--shadow-md);padding:8px 10px;font-size:12px}
+.chart .tip-k{font-family:var(--f-mono);font-size:10.5px;color:var(--faint);margin-bottom:4px}
+.chart .tip-row{display:flex;align-items:center;gap:7px;line-height:1.7;white-space:nowrap}
+.chart .tip-row i{display:inline-block;width:12px;height:2px;border-radius:1px;flex:0 0 auto}
+.chart .tip-row i.none{background:transparent}
+.chart .tip-row b{font-family:var(--f-mono);color:var(--ink);font-variant-numeric:tabular-nums}
+.chart .tip-row span{color:var(--dim)}
+
+/* the layer switcher sits in the tab row, on the right */
+.stage-bar{display:flex;align-items:center;justify-content:space-between;gap:var(--s3);flex-wrap:wrap}
+.stage-bar .tabs{margin-bottom:var(--s3)}
+.layer-seg{display:flex;align-items:center;gap:var(--s2);margin-bottom:var(--s3)}
+.seg.layers button{flex:0 0 auto;padding:6px 12px;font-size:12px}
+.layer-seg .lbl{font-size:11px;color:var(--faint);letter-spacing:.1em;text-transform:uppercase;font-family:var(--f-mono)}
 
 /* matplotlib writes these figures on white, so the tile stays white on purpose */
 .figs{display:grid;grid-template-columns:repeat(auto-fit,minmax(230px,1fr));

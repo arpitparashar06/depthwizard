@@ -20,6 +20,13 @@ import { PointerLockControls } from 'three/examples/jsm/controls/PointerLockCont
  *             the crosshair and the slope of the face there. Clicking drops a
  *             pin; two pins measure the drop and the grade between them
  *   loop      move, raycast, render
+ *   layers    the photo on the ground and roofs can be swapped for an analysis
+ *             layer (height, slope, uncertainty, error) - same UVs, same mesh,
+ *             only the texture changes. L cycles them while flying
+ *   profile   pins are converted to SOURCE-IMAGE PIXELS and handed up to the
+ *             app, which asks the server for exact heights along the line from
+ *             the GeoTIFFs. The answer comes back and is draped on the terrain
+ *             as a line, with a marker that follows the chart's crosshair
  *
  * THE ONE THING TO GET RIGHT. The mesh is vertically exaggerated and its base
  * is offset, so raw world Y is NOT metres. Every number on screen goes back
@@ -53,7 +60,8 @@ const FLIGHT_KEYS = new Set([
   'Space', 'KeyC',                  // altitude (fly mode only)
   'ShiftLeft', 'ShiftRight',        // boost
   'KeyR',                           // clear probes
-  'KeyF'                            // toggle fly / walk
+  'KeyF',                           // toggle fly / walk
+  'KeyL'                            // cycle analysis layers
 ])
 
 const EYE_HEIGHT_M = 1.7      // average standing eye height
@@ -64,8 +72,26 @@ const RUN_SPEED = 5.0         // m/s with Shift held
 const FLY_SPEED = 70
 const FLY_BOOST = 260
 
-export default function Viewer({ url, exaggeration = 1, baseM = 0, units = 'm' }) {
+export default function Viewer({
+  url, exaggeration = 1, baseM = 0, units = 'm', pxSize = 1,
+  layerUrl = null, legend = null, exact = null, profile = null, profileHover = null,
+  onPins, onCycleLayer, clearSignal = 0
+}) {
   const mount = useRef(null)
+  // Props the long-lived three.js effect reads. Refs, not effect dependencies:
+  // a dependency would tear the whole scene down and re-download the .glb
+  // every time a layer or a pin changes.
+  const onPinsRef = useRef(onPins)
+  const onCycleRef = useRef(onCycleLayer)
+  const layerUrlRef = useRef(layerUrl)
+  const profileRef = useRef(profile)
+  const hoverRef = useRef(profileHover)
+  const applyLayerRef = useRef(null)
+  const drawProfileRef = useRef(null)
+  const moveMarkerRef = useRef(null)
+  const clearPinsRef = useRef(null)
+  onPinsRef.current = onPins
+  onCycleRef.current = onCycleLayer
   const lockRef = useRef(null)
   const modeRef = useRef('fly')          // read by the loop every frame
   const setModeRef = useRef(null)        // set by the effect, called by the UI
@@ -140,6 +166,88 @@ export default function Viewer({ url, exaggeration = 1, baseM = 0, units = 'm' }
 
     let terrain = null
     let bounds = null
+    const draped = []
+
+    // ---- analysis layers --------------------------------------------------
+    // Same image size and the same UVs as the photo, so a layer is nothing but
+    // a different texture on the same materials. glTF textures are loaded
+    // with flipY off and in sRGB; a layer loaded any other way would land
+    // upside down or washed out.
+    const texCache = new Map()
+    const texLoader = new THREE.TextureLoader()
+    const applyLayer = (u) => {
+      layerUrlRef.current = u
+      if (!draped.length) return
+      const put = (tex) => {
+        if (layerUrlRef.current !== u) return       // a newer choice won the race
+        for (const d of draped) { d.mat.map = tex || d.photo; d.mat.needsUpdate = true }
+      }
+      if (!u) return put(null)
+      if (texCache.has(u)) return put(texCache.get(u))
+      texLoader.load(u, (tex) => {
+        tex.flipY = false
+        tex.colorSpace = THREE.SRGBColorSpace
+        tex.anisotropy = renderer.capabilities.getMaxAnisotropy()
+        texCache.set(u, tex)
+        put(tex)
+      })
+    }
+    applyLayerRef.current = applyLayer
+
+    // ---- the measured profile, draped on the terrain ------------------------
+    // Drawn from the server's samples (true metres from dsm.tif), not from the
+    // mesh, so the line shows exactly what the chart below plots.
+    const profGroup = new THREE.Group()
+    scene.add(profGroup)
+    const marker = new THREE.Mesh(new THREE.SphereGeometry(1, 16, 12),
+      new THREE.MeshBasicMaterial({ color: 0xffffff, depthTest: false }))
+    marker.renderOrder = 10
+    marker.visible = false
+    scene.add(marker)
+    let profPts = []
+    const clearProfile = () => {
+      for (const c of profGroup.children) { c.geometry.dispose(); c.material.dispose() }
+      profGroup.clear()
+      profPts = []
+      marker.visible = false
+    }
+    const drawProfile = () => {
+      clearProfile()
+      const pr = profileRef.current
+      if (!bounds || !pr || !pr.dsm || pr.dsm.length < 2) return
+      const [r0, c0] = pr.start
+      const [r1, c1] = pr.end
+      const n = pr.dsm.length
+      const lift = Math.max(0.3, bounds.size.x * 0.0015)
+      for (let i = 0; i < n; i++) {
+        const z = pr.dsm[i]
+        if (z == null) continue
+        const t = n > 1 ? i / (n - 1) : 0
+        profPts.push(new THREE.Vector3(
+          bounds.box0.min.x + (c0 + t * (c1 - c0)) * pxSize,
+          toWorldY(z) + lift,
+          bounds.box0.min.z + (r0 + t * (r1 - r0)) * pxSize))
+      }
+      if (profPts.length < 2) return
+      const line = new THREE.Line(
+        new THREE.BufferGeometry().setFromPoints(profPts),
+        new THREE.LineBasicMaterial({ color: 0xffffff, depthTest: false, transparent: true, opacity: 0.95 }))
+      line.renderOrder = 9
+      profGroup.add(line)
+      moveMarker(hoverRef.current)
+    }
+    const moveMarker = (i) => {
+      hoverRef.current = i
+      const p = (i == null) ? null : profPts[Math.min(profPts.length - 1, Math.max(0, i))]
+      marker.visible = !!p
+      if (p) {
+        marker.position.copy(p)
+        marker.scale.setScalar(Math.max(0.4, camera.position.distanceTo(p) * 0.008))
+      }
+    }
+    drawProfileRef.current = drawProfile
+    moveMarkerRef.current = moveMarker
+
     setLoading(true)
     new GLTFLoader().load(
       url,
@@ -150,7 +258,16 @@ export default function Viewer({ url, exaggeration = 1, baseM = 0, units = 'm' }
         const box = new THREE.Box3().setFromObject(worldGroup)
         const size = box.getSize(new THREE.Vector3())
         const mid = box.getCenter(new THREE.Vector3())
-        bounds = { box, size, mid }
+        bounds = { box, size, mid, box0: box.clone() }
+        // Everything that wears the photo: the ground and the roof caps. The
+        // walls wear a procedural facade and keep it on every layer.
+        terrain.traverse((o) => {
+          if (!o.isMesh || /wall/i.test(o.name)) return
+          const mats = Array.isArray(o.material) ? o.material : [o.material]
+          for (const mt of mats) if (mt.map) draped.push({ mat: mt, photo: mt.map })
+        })
+        applyLayer(layerUrlRef.current)
+        drawProfile()
         scene.fog = new THREE.Fog(0x010110, size.length() * 0.3, size.length() * 1.8)
         camera.position.set(mid.x - size.x * 0.55,
                             box.max.y + size.y * 0.8 + size.z * 0.25,
@@ -200,6 +317,7 @@ export default function Viewer({ url, exaggeration = 1, baseM = 0, units = 'm' }
         p.position.y = (p.position.y) * (vScale / prevScale)
       }
       for (const v of pins) v.y = v.y * (vScale / prevScale)
+      drawProfile()
 
       if (next === 'walk') {
         // drop the viewer into the middle of the scene, on the ground
@@ -323,6 +441,7 @@ export default function Viewer({ url, exaggeration = 1, baseM = 0, units = 'm' }
       keys[e.code] = true
       if (e.code === 'KeyR') clearPins()
       if (e.code === 'KeyF') applyMode(modeRef.current === 'fly' ? 'walk' : 'fly')
+      if (e.code === 'KeyL') onCycleRef.current?.()
     }
     // Key-up always clears, locked or not: if the lock drops between press and
     // release the key would otherwise stay down forever.
@@ -367,10 +486,19 @@ export default function Viewer({ url, exaggeration = 1, baseM = 0, units = 'm' }
     const pins = []
     const pinGroup = new THREE.Group()
     scene.add(pinGroup)
+    // world metres -> source-image pixels. The mesh is laid out with column
+    // 0 at x = 0 and row 0 at the far edge (world z = box.min.z), one pixel
+    // per px metres, and neither axis is touched by the vertical rescale.
+    const toPx = (p) => ({
+      row: (p.z - bounds.box0.min.z) / pxSize,
+      col: (p.x - bounds.box0.min.x) / pxSize
+    })
+    const reportPins = () => onPinsRef.current?.(bounds ? pins.map(toPx) : [])
     function clearPins () {
       pins.length = 0
       pinGroup.clear()
       setHud((h) => ({ ...h, probe: 'click terrain' }))
+      reportPins()
     }
     const onClick = () => {
       if (!controls.isLocked) return
@@ -386,6 +514,7 @@ export default function Viewer({ url, exaggeration = 1, baseM = 0, units = 'm' }
       pinGroup.add(m)
       pins.push(hit.point.clone())
       if (pins.length > 2) { pins.shift(); pinGroup.remove(pinGroup.children[0]) }
+      reportPins()
       if (pins.length === 2) {
         const [a, b] = pins
         const ground = Math.hypot(b.x - a.x, b.z - a.z)
@@ -399,6 +528,7 @@ export default function Viewer({ url, exaggeration = 1, baseM = 0, units = 'm' }
       }
     }
     renderer.domElement.addEventListener('mousedown', onClick)
+    clearPinsRef.current = clearPins
 
     let last = performance.now(), probeAt = 0
     const vel = new THREE.Vector3()
@@ -469,6 +599,12 @@ export default function Viewer({ url, exaggeration = 1, baseM = 0, units = 'm' }
       lockRef.current = null
       setModeRef.current = null
       enterXRRef.current = null
+      applyLayerRef.current = null
+      drawProfileRef.current = null
+      moveMarkerRef.current = null
+      clearPinsRef.current = null
+      clearProfile()
+      for (const t of texCache.values()) t.dispose()
       renderer.setAnimationLoop(null)
       renderer.xr.getSession()?.end().catch(() => {})
       ro.disconnect()
@@ -486,7 +622,14 @@ export default function Viewer({ url, exaggeration = 1, baseM = 0, units = 'm' }
       })
       if (renderer.domElement.parentNode === host) host.removeChild(renderer.domElement)
     }
-  }, [url, exaggeration, baseM, units])
+  }, [url, exaggeration, baseM, units, pxSize])
+
+  // layer, profile and chart hover arrive after the scene exists; each is one
+  // call into the running effect rather than a rebuild of it
+  useEffect(() => { layerUrlRef.current = layerUrl; applyLayerRef.current?.(layerUrl) }, [layerUrl])
+  useEffect(() => { profileRef.current = profile; drawProfileRef.current?.() }, [profile])
+  useEffect(() => { hoverRef.current = profileHover; moveMarkerRef.current?.(profileHover) }, [profileHover])
+  useEffect(() => { if (clearSignal) clearPinsRef.current?.() }, [clearSignal])
 
   if (!url) return null
 
@@ -503,7 +646,34 @@ export default function Viewer({ url, exaggeration = 1, baseM = 0, units = 'm' }
         <hr />
         <div className="k">probe</div>
         <div className="probe">{hud.probe}</div>
+        {exact && exact.length > 0 && (
+          <>
+            <hr />
+            <div className="k">from the GeoTIFF</div>
+            {exact.map((e, i) => e && (
+              <div className="probe exact" key={i}>
+                <b>{exact.length > 1 ? (i ? 'B ' : 'A ') : ''}{e.dsm != null ? e.dsm.toFixed(2) : '—'} {units}</b>
+                {e.uncertainty != null && <> ±{e.uncertainty.toFixed(2)}</>}
+                {e.ndsm != null && <> · {e.ndsm.toFixed(1)} above ground</>}
+                {e.reference != null && <> · LiDAR {e.reference.toFixed(2)}</>}
+              </div>
+            ))}
+          </>
+        )}
       </div>
+
+      {legend && (
+        <div className="legend" aria-label={`${legend.label} layer legend`}>
+          <div className="k">{legend.label}</div>
+          <div className="ramp" style={{ background: `linear-gradient(90deg, ${legend.stops.join(', ')})` }} />
+          <div className="ends">
+            <span>{fmtLegend(legend.vmin)}</span>
+            {legend.kind === 'diverging' && <span>0</span>}
+            <span>{fmtLegend(legend.vmax)} {legend.unit}</span>
+          </div>
+          {legend.note && <div className="note2">{legend.note}</div>}
+        </div>
+      )}
 
       {inXR && (
         <p className="viewer-note">
@@ -534,9 +704,10 @@ export default function Viewer({ url, exaggeration = 1, baseM = 0, units = 'm' }
             {!walking && <span><kbd>Space</kbd><kbd>C</kbd> altitude</span>}
           </div>
           <div className="keys">
-            <span><kbd>click</kbd> drop a probe</span>
+            <span><kbd>click</kbd> drop a probe · two draw a profile</span>
             <span><kbd>R</kbd> clear probes</span>
             <span><kbd>F</kbd> fly / walk</span>
+            <span><kbd>L</kbd> layers</span>
             <span><kbd>Esc</kbd> release cursor</span>
           </div>
 
@@ -572,4 +743,10 @@ export default function Viewer({ url, exaggeration = 1, baseM = 0, units = 'm' }
       )}
     </div>
   )
+}
+
+function fmtLegend (v) {
+  if (v == null || !isFinite(v)) return '—'
+  const a = Math.abs(v)
+  return a >= 100 ? v.toFixed(0) : a >= 10 ? v.toFixed(1) : v.toFixed(2)
 }

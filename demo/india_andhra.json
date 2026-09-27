@@ -1,0 +1,20 @@
+{
+  "url": "https://oin-hotosm-temp.s3.us-east-1.amazonaws.com/685624e7e319ef725277456f/0/685624e7e319ef7252774570.tif",
+  "attribution": "Imagery: 'sadanand' by hareesh via OpenAerialMap, CC-BY 4.0",
+  "license": "CC-BY-4.0",
+  "note": "Andhra Pradesh, near Vizianagaram - acquired 2025-06-20, 0.10 m GSD",
+  "center": [
+    83.54999902289205,
+    18.25437909752054
+  ],
+  "size_m": 600.0,
+  "px_size_m": 0.5,
+  "crs": "EPSG:32644",
+  "footprint_wgs84": [
+    83.54484991392586,
+    18.24759250226706,
+    83.55514813185825,
+    18.261165692774018
+  ],
+  "valid_fraction": 0.9619354166666667
+}

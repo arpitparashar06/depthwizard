@@ -24,9 +24,11 @@ at the rasters - no .env, no refine, no mesh.
 
 Two things it will not do quietly:
 
-  * A georeferenced image with no scale anchor stops with an error instead of
-    defaulting. alpha is metres per model unit and one number sets it for the
-    whole scene, so a guess returns confident metres anchored to nothing.
+  * A georeferenced image with no scale anchor never gets a made-up default.
+    alpha is metres per model unit and one number sets it for the whole
+    scene, so a guess returns confident metres anchored to nothing. With no
+    flag it looks up GHSL's building height at the image's coordinates
+    (mathsandml/ghsl.py) and says so; if GHSL cannot answer either, it stops.
   * If the coarse DEM cannot be fetched the run still finishes, but it says so
     in capitals: the surface is then height above LOCAL GROUND, not above sea
     level, whatever the GeoTIFF tags claim.
@@ -48,7 +50,8 @@ from _bootstrap import load_env                                        # noqa: E
 load_env()
 
 from inference import (estimate_elevation, load_image, export_products,  # noqa: E402
-                       clip_below_ground)
+                       clip_below_ground, ghsl_height_prior, resolve_engine,
+                       engine_needs_anchor, ENGINE_LABEL, refine_by_default)
 from mesh_builder import build_mesh, build_city, export_mesh, slope_map  # noqa: E402
 from refine import refine                                              # noqa: E402
 
@@ -93,6 +96,13 @@ def main():
                         "priority order. Needs at least two sources; refuses "
                         "and keeps the tightest when they disagree beyond "
                         "their error bars")
+    g.add_argument("--no-auto-prior", action="store_true",
+                   help="with no scale flag, stop instead of using GHSL "
+                        "building height as the prior")
+    g.add_argument("--engine", default=None,
+                   choices=("auto", "zeroshot", "finetuned", "metric", "hybrid"),
+                   help="auto = hybrid when models/heightnet.pt exists (then no "
+                        "scale flag is needed), else zeroshot")
     g.add_argument("--alpha-gain", type=float, default=1.0,
                    help="multiplier on the fitted scale; feed back the value "
                         "the validation report suggests")
@@ -109,6 +119,9 @@ def main():
                    help="ensemble passes; 4 cancels the frame ramp, 1 is fastest")
     t.add_argument("--flatten", type=float, default=0.8)
     t.add_argument("--sharpen", type=float, default=0.4)
+    t.add_argument("--refine", default="auto", choices=("auto", "on", "off"),
+                   help="edge clean-up; auto = only for the zero-shot engine, "
+                        "where it helps (it smears the fine-tuned model's edges)")
 
     ap.add_argument("--reference", default=None, metavar="TIF",
                     help="reference LiDAR raster - scores the result when given")
@@ -130,25 +143,41 @@ def main():
 
     gcps = parse_gcps(args.gcp)
     az = el = None
+    prior_source, prior_info, auto_after_sun = "person", None, False
     if args.sun:
         az, el = args.sun
 
-    if mode == "absolute":
+    engine = resolve_engine(args.engine)
+    print(f"[engine] {ENGINE_LABEL[engine]}")
+    if mode == "absolute" and not engine_needs_anchor(engine):
+        # nothing to ask for: any flag given is used as a cross-check (GCPs
+        # correct the model, being measurements)
+        auto_after_sun = not args.no_auto_prior
+    elif mode == "absolute":
         # The same refusal server.py makes. estimate_elevation would raise
         # anyway; catching it here says which flag fixes it.
         if not args.tallest and len(gcps) < 2 and not args.sun:
             if meta.get("sun_azimuth") is not None and meta.get("sun_elevation") is not None:
+                auto_after_sun = not args.no_auto_prior
                 print(f"[scale] no flag given - calibrating from the sun angles "
                       f"in the tags ({meta['sun_azimuth']}, {meta['sun_elevation']})")
             else:
-                raise SystemExit(
-                    "\nThis image is georeferenced, so the output is in metres -\n"
-                    "and metres need a scale anchor. Pass one of:\n\n"
-                    "  --tallest 95            height of the tallest structure, in metres\n"
-                    "  --gcp r,c,h --gcp r,c,h at least two ground control points\n"
-                    "  --sun 145 52            sun azimuth and elevation\n\n"
-                    "There is no way to turn relative depth into metres without\n"
-                    "one, and a guessed value rescales every elevation in the scene.")
+                prior, why = ((None, "--no-auto-prior was given")
+                              if args.no_auto_prior else ghsl_height_prior(meta))
+                if prior is None:
+                    raise SystemExit(
+                        "\nThis image is georeferenced, so the output is in metres -\n"
+                        "and metres need a scale anchor. Pass one of:\n\n"
+                        "  --tallest 95            height of the tallest structure, in metres\n"
+                        "  --gcp r,c,h --gcp r,c,h at least two ground control points\n"
+                        "  --sun 145 52            sun azimuth and elevation\n\n"
+                        f"The automatic GHSL prior could not help: {why}.")
+                args.tallest = float(prior["known_height_m"])
+                prior_source, prior_info = "ghsl", prior
+                print(f"[scale] no flag given - GHSL building height under this "
+                      f"scene: {args.tallest:g} m ({prior['n_built']} of "
+                      f"{prior['n_cells']} 100 m cells built). A prior, not a "
+                      f"measurement: --tallest overrides it.")
     elif args.tallest:
         print(f"[scale] no coordinates in this file, so --tallest {args.tallest:g} "
               f"sets the full-scale height rather than calibrating metres")
@@ -158,11 +187,15 @@ def main():
         sun_azimuth=az, sun_elevation=el,
         use_dem=not args.no_dem, alpha_gain=args.alpha_gain,
         rotations=args.rotations, height_reference=args.height_reference,
-        fuse_scale=args.fuse_scale, outdir=out)
+        fuse_scale=args.fuse_scale, outdir=out,
+        prior_source=prior_source, prior_info=prior_info,
+        auto_prior=auto_after_sun, engine=engine,
+        gsd_hint=args.gsd if mode != "absolute" else None)
 
     px = meta.get("px_size_m") or args.gsd
     if mode == "relative":
-        scale = args.tallest or RELATIVE_FULL_SCALE_M
+        scale = (args.tallest or float(info.get("suggested_full_scale_m") or 0)
+                 or RELATIVE_FULL_SCALE_M)
         height = height * scale
         meta = dict(meta, px_size_m=px)
         info["relative_full_scale_m"] = scale
@@ -170,7 +203,9 @@ def main():
             meta["_uncertainty"] = meta["_uncertainty"] * scale
         print(f"[relative] scaled to a {scale:.0f} m full range")
 
-    if args.flatten or args.sharpen:
+    do_refine = (refine_by_default(info.get("engine") or "zeroshot") if args.refine == "auto"
+                 else args.refine == "on")
+    if do_refine and (args.flatten or args.sharpen):
         # the split this scene actually used, not refine's 15 m default
         height, rinfo = refine(height, rgb, px_size_m=px,
                                object_sigma_m=float(info.get("sigma_m") or 15.0),
@@ -231,7 +266,8 @@ def main():
         print("MEASURED FROM: nothing - relative surface, no metric datum")
 
     if info.get("alpha") is not None:
-        print(f"scale        alpha {info['alpha']:.3f} m per model unit")
+        print(f"scale        alpha {info['alpha']:.3f} m per model unit"
+              + (f" - from {info['scale_source']}" if info.get("scale_source") else ""))
     fus = info.get("scale_fusion")
     if fus:
         if fus.get("applied"):

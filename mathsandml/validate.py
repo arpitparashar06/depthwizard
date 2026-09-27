@@ -312,6 +312,9 @@ def attenuation(pred_obj, ref_obj, min_h=2.0, materiality=0.01):
 
     rmse_1, rmse_g = _rmse(1.0), _rmse(gain)
     out = dict(n=int(fin.sum()),
+               # the two sums behind the gain, so several scenes can be pooled
+               # into one least-squares gain (run_benchmark --loso-gain)
+               sxy=float(np.dot(p, r)), sxx=denom,
                suggested_alpha_gain=gain,
                gain_estimator="through-origin least squares over the full object band",
                rmse_at_gain_1=rmse_1,

@@ -6,7 +6,13 @@
 # Options:
 #   FAST=1     use the Small backbone (~100 MB, 8-10x quicker) for a first pass
 #   SIZE=200   smaller footprint in metres if the first run feels slow
-#   SOURCE=all fetch swisstopo and USGS too, not just AHN
+#   SOURCES="ahn swisstopo"   which reference services to build scenes from
+#              (default: both. usgs is bare-earth only - see BENCHMARK.md)
+#   REFETCH=1  re-download scenes that already exist (hand-entered priors in
+#              scene.json are kept either way)
+#
+# Scenes that already exist are NOT downloaded again, and the depth model runs
+# once per scene - later runs read cache/depth - so a second run takes seconds.
 set -uo pipefail
 
 cd "$(dirname "${BASH_SOURCE[0]}")/../.." || exit 1   # repo root
@@ -21,7 +27,7 @@ for f in "$BENCH/fetch_data.py" "$BENCH/run_benchmark.py" \
   exit 1
 done
 SIZE="${SIZE:-300}"
-SOURCE="${SOURCE:-ahn}"
+SOURCES="${SOURCES:-${SOURCE:-ahn swisstopo}}"
 
 echo "== DepthWizard benchmark =="
 echo "   project : $ROOT"
@@ -72,9 +78,23 @@ echo "== 2/4 probing the reference services =="
 }
 
 echo
-echo "== 3/4 fetching scenes (${SOURCE}, ${SIZE} m) =="
-"$PY" "$BENCH/fetch_data.py" --source "$SOURCE" --size-m "$SIZE" \
-      --out "$BENCH/scenes"
+echo "== 3/4 fetching scenes (${SOURCES}, ${SIZE} m) =="
+for src in $SOURCES; do
+  "$PY" "$BENCH/fetch_data.py" --source "$src" --size-m "$SIZE" \
+        --out "$BENCH/scenes" ${REFETCH:+--force}
+done
+
+# a scene without a prior is scored as a failure, never silently
+"$PY" - "$BENCH/scenes" <<'EOF2'
+import json, os, sys
+root = sys.argv[1]
+for n in sorted(os.listdir(root)):
+    p = os.path.join(root, n, "scene.json")
+    if os.path.isdir(os.path.join(root, n)) and (
+            not os.path.exists(p) or not json.load(open(p)).get("known_height_m")):
+        print(f"   NOTE: {n} has no known_height_m in scene.json - it will be "
+              f"reported as a failure until one is read off the ortho")
+EOF2
 
 if ! ls "$BENCH"/scenes/*/ref_dsm.tif >/dev/null 2>&1; then
   echo
@@ -86,7 +106,11 @@ echo "   scenes: $(ls -d "$BENCH"/scenes/*/ 2>/dev/null | wc -l | tr -d ' ')"
 
 echo
 echo "== 4/4 running the benchmark =="
-"$PY" "$BENCH/run_benchmark.py" --scenes "$BENCH/scenes" --out "$BENCH/results"
+# headline: one prior per scene, read off the imagery (independent of the
+# reference). Then the same scenes again with control points sampled from the
+# reference, as a clearly labelled diagnostic, and the held-out gain test.
+"$PY" "$BENCH/run_benchmark.py" --scenes "$BENCH/scenes" --out "$BENCH/results" \
+      --scale-source known-height --compare gcps-from-ref --loso-gain
 rc=$?
 
 echo

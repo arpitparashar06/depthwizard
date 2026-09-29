@@ -1,54 +1,4 @@
-"""
-heightnet.py - DepthWizard's TRAINED height model.
-=============================================================================
-
-One RGB image in, METRES ABOVE GROUND out. No scale anchor needed.
-
-The zero-shot path in inference.py uses Depth-Anything-V2 exactly as it was
-released: it can only RANK heights, so every absolute run needs one real
-measurement (shadows, control points, a landmark height or GHSL) to turn the
-ranking into metres. HeightNet is the same backbone after it has been shown
-thousands of LiDAR-measured scenes from above, so it answers in metres itself.
-
-WHAT IS IN THE NETWORK
-----------------------
-  Depth-Anything-V2 encoder + DPT neck   pretrained, fine-tuned. Keeps the
-                                         geometry the model already knows.
-  GSD conditioning (FiLM)                the model is TOLD how many metres one
-                                         pixel covers. The same 10 m block is
-                                         30 px wide at 0.33 m and 10 px wide
-                                         at 1 m; without this it has to guess.
-  semantic head (7 GAMUS classes)        ground / low vegetation / building /
-                                         water / road / tree. Trained next to
-                                         height because the two are strongly
-                                         tied (GAMUS paper, Xiong et al. 2023),
-                                         and its output FEEDS the height head.
-  relative-depth output (engine A)       the pretrained Depth-Anything head,
-                                         fine-tuned with a scale-and-shift-
-                                         invariant loss: relative depth made
-                                         for top-down images. Goes through the
-                                         pipeline's calibration module
-                                         (DEM + GCPs / shadows / scene prior)
-                                         exactly like the zero-shot model does.
-  adaptive-bin height head (engine B)    height is predicted as a probability
-                                         over 64 height bins, log-spaced so the
-                                         ground and low roofs get fine bins and
-                                         skyscrapers coarse ones. A global
-                                         token re-spaces the bins per image
-                                         (idea from AdaBins / HTC-DC Net).
-                                         Expected value = height, spread of
-                                         the distribution = uncertainty.
-
-WHY BINS AND NOT PLAIN REGRESSION: height maps are long-tailed - most pixels
-are ground (0-2 m), few are tall. A plain regressor learns to predict "low"
-everywhere and under-shoots tall buildings, which is exactly the error the
-zero-shot pipeline shows (towers above 30 m come out short). Classification
-over log-spaced bins plus the long-tail loss weighting in training/losses.py
-is the standard cure (HTC-DC Net, Chen et al. 2023).
-
-The checkpoint is self-contained: the architecture config travels inside it,
-so loading needs no internet and no Hugging Face download.
-"""
+"""DepthWizard's trained height model."""
 
 from __future__ import annotations
 
@@ -62,7 +12,7 @@ try:
     import torch
     import torch.nn as nn
     import torch.nn.functional as F
-except ImportError:          # the pipeline imports this only to ask "is a model there?"
+except ImportError:
     torch = None
 
 FORMAT = "depthwizard-heightnet-v1"
@@ -71,26 +21,23 @@ VARIANTS = {
     "base": "depth-anything/Depth-Anything-V2-Base-hf",     # CC-BY-NC-4.0
     "large": "depth-anything/Depth-Anything-V2-Large-hf",   # CC-BY-NC-4.0
 }
-# GAMUS label order. 0 ("others") is treated as unlabelled during training.
+# GAMUS label order.
 CLASSES = ("others", "ground", "low_vegetation", "building", "water", "road", "tree")
 IGNORE_INDEX = 255
 
-H0 = 2.0            # metres; the log-spacing knee: bins are ~linear below, ~log above
-H_MAX = 350.0       # tallest height the bins cover (NYC is in GAMUS)
+H0 = 2.0
+H_MAX = 350.0
 N_BINS = 64
-GSD_MIN, GSD_MAX = 0.30, 1.20     # metres per pixel the model was trained across
-GSD_DEFAULT = 0.5                 # assumed when an image carries no georeference
+GSD_MIN, GSD_MAX = 0.30, 1.20
+GSD_DEFAULT = 0.5
 PATCH = 14
-TILE = 518                        # 37 x 14, Depth-Anything's native grid
+TILE = 518
 MEAN = np.array([0.485, 0.456, 0.406], np.float32)
 STD = np.array([0.229, 0.224, 0.225], np.float32)
 
 _REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
 
-# ----------------------------------------------------------------------------
-# where is the model?  (no torch needed for this part)
-# ----------------------------------------------------------------------------
 def default_checkpoint():
     """Path the pipeline looks at: $DEPTHWIZARD_HEIGHTNET, else models/heightnet.pt."""
     p = os.environ.get("DEPTHWIZARD_HEIGHTNET", "").strip()
@@ -98,10 +45,6 @@ def default_checkpoint():
 
 
 def _is_unzipped_checkpoint(p):
-    """A .pt file is a zip archive, and Safari ('open safe files after
-    downloading') unpacks it into a FOLDER of the same name. That folder still
-    holds the whole model - data.pkl plus data/<n> tensors - so it is accepted
-    as-is rather than failing with a confusing error."""
     return os.path.isdir(p) and os.path.isfile(os.path.join(p, "data.pkl"))
 
 
@@ -130,7 +73,6 @@ def file_digest(path, n=1 << 20):
 
 
 def _rezip(folder):
-    """The unzipped folder back into the in-memory zip torch.load expects."""
     import io
     import zipfile
     buf = io.BytesIO()
@@ -154,23 +96,12 @@ def u_of(h):
     return torch.log1p(h.clamp(min=0) / H0)
 
 
-# ----------------------------------------------------------------------------
-# COMBINING THE TWO ENGINES  (numpy only - used by the pipeline and evaluate.py)
-# ----------------------------------------------------------------------------
-#   A  relative depth -> calibration module -> metres   (the problem statement's
-#      own workflow: relative depth mapped to absolute height)
-#   B  metres directly
-# In the hybrid, B plays two parts inside A's workflow:
-#   1. the SCENE-LEVEL PRIOR that sets A's scale when no measured anchor
-#      (GCPs, shadows) exists - it replaces the 100 m, 2018 GHSL prior;
-#   2. a second opinion, fused per pixel by uncertainty.
-
 def robust_affine(src, ref, iters=4, max_n=200_000):
     """Robust ref ~ a*src + b (Cauchy weights), on a subsample for speed."""
     x = np.asarray(src, np.float64).ravel()
     y = np.asarray(ref, np.float64).ravel()
-    m = np.isfinite(x) & np.isfinite(y)
-    x, y = x[m], y[m]
+    valid = np.isfinite(x) & np.isfinite(y)
+    x, y = x[valid], y[valid]
     if x.size > max_n:
         idx = np.random.default_rng(0).choice(x.size, max_n, replace=False)
         x, y = x[idx], y[idx]
@@ -184,16 +115,14 @@ def robust_affine(src, ref, iters=4, max_n=200_000):
         if not np.all(np.isfinite(coef)):
             return 1.0, 0.0
         r = y - A @ coef
-        sc = 1.4826 * np.median(np.abs(r - np.median(r))) + 1e-9
-        w = 1.0 / np.sqrt(1 + (r / (2 * sc)) ** 2)
+        scale = 1.4826 * np.median(np.abs(r - np.median(r))) + 1e-9
+        w = 1.0 / np.sqrt(1 + (r / (2 * scale)) ** 2)
     a, b = float(coef[0]), float(coef[1])
     return (a, b) if a > 0 else (1.0, 0.0)
 
 
 def ground_envelope(p, px_size_m, window_m=80.0, pct=2.0, step_m=2.0, max_cells=400):
-    """The ground under a relative surface: an 80 m robust opening. Same
-    algorithm as inference.ground_envelope, kept here so evaluate.py can run
-    without the full pipeline."""
+    """The ground under a relative surface: an 80 m robust opening."""
     from scipy.ndimage import gaussian_filter, maximum_filter, percentile_filter, zoom
     a = np.asarray(p, np.float64)
     H, W = a.shape
@@ -203,10 +132,10 @@ def ground_envelope(p, px_size_m, window_m=80.0, pct=2.0, step_m=2.0, max_cells=
     Hc, Wc = max(1, H // f), max(1, W // f)
     ds = a[:Hc * f, :Wc * f].reshape(Hc, f, Wc, f).mean(axis=(1, 3))
     k = max(3, int(round(window_m / (px * f))) | 1)
-    env = percentile_filter(ds, pct, size=k, mode="nearest")
-    env = maximum_filter(env, size=k, mode="nearest")
-    env = gaussian_filter(env, k / 4.0)
-    up = zoom(env, (H / env.shape[0], W / env.shape[1]), order=1)
+    envelope = percentile_filter(ds, pct, size=k, mode="nearest")
+    envelope = maximum_filter(envelope, size=k, mode="nearest")
+    envelope = gaussian_filter(envelope, k / 4.0)
+    up = zoom(envelope, (H / envelope.shape[0], W / envelope.shape[1]), order=1)
     if up.shape != (H, W):
         up = np.pad(up, ((0, max(0, H - up.shape[0])), (0, max(0, W - up.shape[1]))),
                     mode="edge")[:H, :W]
@@ -214,8 +143,6 @@ def ground_envelope(p, px_size_m, window_m=80.0, pct=2.0, step_m=2.0, max_cells=
 
 
 def relative_informative(rel, min_std=1e-4, min_cv=1e-3):
-    """False when the relative output carries no structure (a broken or
-    untrained head): calibrating it would only amplify noise."""
     r = np.asarray(rel, np.float64)
     r = r[np.isfinite(r)]
     if r.size < 100:
@@ -228,10 +155,6 @@ LEARNED_PRIOR_PCTS = (90.0, 95.0, 98.0, 99.0, 99.5)
 
 
 def learned_scale(detail, metric, valid=None, min_height_m=1.0):
-    """Metres per relative unit, from B: match the upper height distribution of
-    A's detail to B's metres (quantile matching - no pixel-to-pixel pairing, so
-    a slightly misplaced edge cannot bias it). None when the scene has nothing
-    standing on the ground to match."""
     d = np.asarray(detail, np.float64)
     m = np.asarray(metric, np.float64)
     ok = np.isfinite(d) & np.isfinite(m)
@@ -252,8 +175,6 @@ STACK_BANDS = (0.0, 2.0, 10.0, 30.0)     # metres, on B's own prediction
 
 
 def stack_weights_for(b_h, fusion):
-    """Per-pixel weight on A from the stacked calibration: one weight per band
-    of B's predicted height, learned on held-out tiles."""
     edges = list(fusion.get("bands", STACK_BANDS))
     w = np.asarray(fusion["w_a"], np.float64)
     idx = np.clip(np.searchsorted(edges, np.nan_to_num(b_h), side="right") - 1,
@@ -262,16 +183,7 @@ def stack_weights_for(b_h, fusion):
 
 
 def fuse(a_h, a_sig, b_h, b_sig, fusion=None, floor_m=0.3):
-    """Blend A (calibrated) and B per pixel. Returns (height, sigma, weight_of_B).
-
-    fusion["mode"] (written by evaluate.py after measuring on held-out tiles):
-      "ivw"      inverse-variance, each engine's own sigma scaled by its measured
-                 honesty factor (c_a, c_b). The default without a calibration.
-      "stacked"  a fixed weight per band of B's predicted height (w_a), fitted by
-                 least squares on held-out tiles. Chosen by evaluate.py when it
-                 beats ivw there - e.g. when A's sigma misses its biggest error,
-                 under-scaled tall buildings, which the rotation spread cannot see.
-    """
+    """Blend A (calibrated) and B per pixel."""
     f = fusion or {}
     ca, cb = float(f.get("c_a", 1.0)), float(f.get("c_b", 1.0))
     va = (ca * np.maximum(np.nan_to_num(a_sig, nan=1e3), floor_m)) ** 2
@@ -287,17 +199,14 @@ def fuse(a_h, a_sig, b_h, b_sig, fusion=None, floor_m=0.3):
 
 
 def combine(pred, px_size_m, fusion=None, alpha=None, envelope=None):
-    """A, B and A+B from one HeightPredictor.predict() result (heights above
-    ground, metres). `alpha` = A's scale if a measured anchor supplied one;
-    otherwise B sets it (the learned prior). `envelope` lets the pipeline pass
-    its own ground model."""
-    rel = np.asarray(pred["rel"], np.float64)
-    if not relative_informative(rel):
+    """A, B and A+B from one HeightPredictor.predict() result (heights above ground, metres)."""
+    relative = np.asarray(pred["rel"], np.float64)
+    if not relative_informative(relative):
         return dict(alpha=None, alpha_source="none: the relative output is flat",
                     a=None, a_sigma=None, fused=pred["height"], fused_sigma=pred["sigma"],
-                    w_b=np.ones_like(pred["height"]), detail=np.zeros_like(rel))
-    env = envelope(rel) if envelope else ground_envelope(rel, px_size_m)
-    detail = rel - env
+                    w_b=np.ones_like(pred["height"]), detail=np.zeros_like(relative))
+    env = envelope(relative) if envelope else ground_envelope(relative, px_size_m)
+    detail = relative - env
     src = "given"
     if alpha is None:
         alpha = learned_scale(detail, pred["height"])
@@ -307,10 +216,10 @@ def combine(pred, px_size_m, fusion=None, alpha=None, envelope=None):
                     a=None, a_sigma=None, fused=pred["height"], fused_sigma=pred["sigma"],
                     w_b=np.ones_like(pred["height"]), detail=detail)
     a_h = np.maximum(alpha * detail, 0.0)
-    a_sig = alpha * np.asarray(pred.get("rel_sigma", np.zeros_like(rel)), np.float64)
-    h, sig, wb = fuse(a_h, a_sig, pred["height"], pred["sigma"], fusion)
+    a_sig = alpha * np.asarray(pred.get("rel_sigma", np.zeros_like(relative)), np.float64)
+    h, sigma, wb = fuse(a_h, a_sig, pred["height"], pred["sigma"], fusion)
     return dict(alpha=float(alpha), alpha_source=src, a=a_h, a_sigma=a_sig,
-                fused=np.maximum(h, 0.0), fused_sigma=sig, w_b=wb, detail=detail)
+                fused=np.maximum(h, 0.0), fused_sigma=sigma, w_b=wb, detail=detail)
 
 
 if torch is not None:
@@ -321,7 +230,6 @@ if torch is not None:
                              nn.GroupNorm(min(8, cout), cout), nn.GELU())
 
     class GSDEmbed(nn.Module):
-        """metres-per-pixel -> a vector. Fourier features of log2(gsd / 0.5 m)."""
 
         def __init__(self, dim=128, n_freq=6):
             super().__init__()
@@ -336,27 +244,25 @@ if torch is not None:
             return self.mlp(torch.cat([x, z.sin(), z.cos()], -1))
 
     class HeightNet(nn.Module):
-        """Depth-Anything-V2 body + GSD FiLM + semantic head + adaptive-bin height head."""
 
         def __init__(self, da, n_bins=N_BINS, h_max=H_MAX, n_classes=len(CLASSES),
                      emb_dim=128):
             super().__init__()
             self.da = da
-            cfg = da.config
-            fch = int(cfg.fusion_hidden_size)
-            hid = int(cfg.backbone_config.hidden_size)
-            hh = int(cfg.head_hidden_size)
+            config = da.config
+            fch = int(config.fusion_hidden_size)
+            hid = int(config.backbone_config.hidden_size)
+            hh = int(config.head_hidden_size)
             self.n_bins, self.h_max = int(n_bins), float(h_max)
             self.n_classes, self.emb_dim = int(n_classes), int(emb_dim)
 
             self.gsd_embed = GSDEmbed(emb_dim)
-            # FiLM on the finest fused feature. Zero-initialised: at step 0 the
-            # network is exactly the pretrained one, the GSD signal fades in.
+            # FiLM on the finest fused feature.
             self.film = nn.Linear(emb_dim, 2 * fch)
             nn.init.zeros_(self.film.weight)
             nn.init.zeros_(self.film.bias)
 
-            cin = fch // 2 + hh + 1          # conv1 out + conv2 out + relative depth
+            cin = fch // 2 + hh + 1
             self.seg_head = nn.Sequential(_ConvGN(cin, 64), _ConvGN(64, 64),
                                           nn.Conv2d(64, n_classes, 1))
             self.height_trunk = nn.Sequential(_ConvGN(cin + n_classes, 96),
@@ -367,8 +273,6 @@ if torch is not None:
             edges_h = H0 * torch.expm1(edges_u)
             w = edges_h[1:] - edges_h[:-1]
             self.register_buffer("base_w", w / w.sum())
-            # start the height distribution near the ground rather than at the
-            # mean bin (~60 m): a long-tailed prior on the logits' bias
             cu = 0.5 * (edges_u[1:] + edges_u[:-1])
             with torch.no_grad():
                 self.height_logits.bias.copy_(-1.5 * cu)
@@ -378,9 +282,9 @@ if torch is not None:
             nn.init.zeros_(self.bin_mlp[-1].weight)
             nn.init.zeros_(self.bin_mlp[-1].bias)
 
-        # -- bins ----------------------------------------------------------
+        # bins
         def bin_centers(self, glob):
-            """Per-image bin centres (B, K) in metres. Zero MLP output = the base log grid."""
+            """Per-image bin centres (B, K) in metres."""
             t = 1.5 * torch.tanh(self.bin_mlp(glob.float()))
             w = self.base_w[None] * t.exp()
             w = w / w.sum(-1, keepdim=True)
@@ -388,14 +292,13 @@ if torch is not None:
             edges = torch.cat([torch.zeros_like(edges[:, :1]), edges], -1)
             return 0.5 * (edges[:, :-1] + edges[:, 1:])
 
-        # -- forward -------------------------------------------------------
+        # forward
         def forward(self, pixel_values, gsd):
-            """pixel_values (B,3,H,W) ImageNet-normalised, H and W multiples of 14.
-            gsd (B,) metres per pixel. Outputs are at H/2 x W/2."""
+            """pixel_values (B,3,H,W) ImageNet-normalised, H and W multiples of 14."""
             B, _, H, W = pixel_values.shape
             ph, pw = H // PATCH, W // PATCH
-            bb = self.da.backbone(pixel_values)
-            fmaps = list(bb.feature_maps)
+            bbox = self.da.backbone(pixel_values)
+            fmaps = list(bbox.feature_maps)
             cls = fmaps[-1][:, 0]
             fused = self.da.neck(fmaps, ph, pw)
             head = self.da.head
@@ -408,12 +311,8 @@ if torch is not None:
             oh, ow = ph * PATCH // 2, pw * PATCH // 2
             x1 = F.interpolate(head.conv1(f), (oh, ow), mode="bilinear", align_corners=True)
             x2 = F.relu(head.conv2(x1))
-            # the pretrained relative depth, made scale-free: its units change
-            # from image to image, a log turns that into an offset, and
-            # removing the mean removes the offset. (Dividing by the std
-            # instead explodes the gradient on flat scenes such as water.)
-            rel = F.relu(head.conv3(x2))[:, 0]                 # engine A output
-            d = torch.log1p(rel.float())[:, None]
+            relative = F.relu(head.conv3(x2))[:, 0]                 # engine A output
+            d = torch.log1p(relative.float())[:, None]
             d = (d - d.mean((2, 3), keepdim=True)).to(x2.dtype)
             feat = torch.cat([x1, x2, d], 1)
 
@@ -428,19 +327,15 @@ if torch is not None:
             h = (prob * c).sum(1)
             var = (prob * (c - h[:, None]) ** 2).sum(1)
             return dict(height=h, sigma=var.clamp_min(1e-6).sqrt(), logits=logits,
-                        centers=centers, seg=seg, rel=rel)
+                        centers=centers, seg=seg, rel=relative)
 
-    # ------------------------------------------------------------------------
     # build / save / load
-    # ------------------------------------------------------------------------
     def build(variant="small", pretrained=True, da_config=None, **kw):
-        """A fresh HeightNet. `pretrained` downloads Depth-Anything-V2 weights (training
-        machines only); `da_config` builds the same shape offline with random weights."""
         from transformers import DepthAnythingConfig, DepthAnythingForDepthEstimation
         if da_config is not None:
-            cfg = (DepthAnythingConfig.from_dict(dict(da_config))
+            config = (DepthAnythingConfig.from_dict(dict(da_config))
                    if isinstance(da_config, dict) else da_config)
-            da = DepthAnythingForDepthEstimation(cfg)
+            da = DepthAnythingForDepthEstimation(config)
         else:
             repo = VARIANTS.get(variant, variant)
             if pretrained:
@@ -450,12 +345,11 @@ if torch is not None:
         return HeightNet(da, **kw)
 
     def tiny_da_config():
-        """A few-MB Depth-Anything shape for tests - same code path, random weights."""
         from transformers import DepthAnythingConfig, Dinov2Config
-        bb = Dinov2Config(hidden_size=48, num_hidden_layers=4, num_attention_heads=2,
+        bbox = Dinov2Config(hidden_size=48, num_hidden_layers=4, num_attention_heads=2,
                           intermediate_size=96, image_size=518, patch_size=14,
                           out_indices=[1, 2, 3, 4], reshape_hidden_states=False)
-        return DepthAnythingConfig(backbone_config=bb, neck_hidden_sizes=[12, 24, 48, 48],
+        return DepthAnythingConfig(backbone_config=bbox, neck_hidden_sizes=[12, 24, 48, 48],
                                    fusion_hidden_size=32, head_hidden_size=16,
                                    reassemble_hidden_size=48, patch_size=14)
 
@@ -469,13 +363,12 @@ if torch is not None:
             return torch.load(src, map_location="cpu", weights_only=False)
 
     def set_fusion(path, fusion):
-        """Write evaluate.py's fusion calibration into an existing checkpoint."""
         ck = _torch_load(path)
         ck["fusion"] = {k: (v if isinstance(v, (str, list)) else float(v))
                         for k, v in fusion.items()}
         tmp = path + ".tmp"
         torch.save(ck, tmp)
-        if os.path.isdir(path):                 # replace a Safari folder with the file
+        if os.path.isdir(path):
             import shutil
             shutil.rmtree(path)
         os.replace(tmp, path)
@@ -514,16 +407,13 @@ if torch is not None:
         return torch.device("cpu")
 
     def normalise(rgb_u8):
-        """(N,H,W,3) or (H,W,3) uint8 -> float tensor (N,3,H,W), ImageNet stats."""
         a = rgb_u8.astype(np.float32) / 255.0
         a = (a - MEAN) / STD
         if a.ndim == 3:
             a = a[None]
         return torch.from_numpy(np.ascontiguousarray(a.transpose(0, 3, 1, 2)))
 
-    # ------------------------------------------------------------------------
     # inference on a whole scene
-    # ------------------------------------------------------------------------
     def _positions(n, tile, stride):
         if n <= tile:
             return [0]
@@ -533,7 +423,6 @@ if torch is not None:
         return p
 
     def _window(tile, ov):
-        """Blend weights: sin^2 ramp over the overlap, flat in the middle."""
         r = np.ones(tile, np.float32)
         if ov > 0:
             ramp = np.sin(np.linspace(0, np.pi / 2, ov + 2)[1:-1]) ** 2
@@ -542,7 +431,6 @@ if torch is not None:
         return np.maximum(np.outer(r, r), 1e-3)
 
     class HeightPredictor:
-        """Loads a checkpoint once; predict() handles any image size and GSD."""
 
         def __init__(self, path=None, device="auto", batch=None):
             path = path or default_checkpoint()
@@ -598,14 +486,10 @@ if torch is not None:
             for i in range(0, len(boxes), self.batch):
                 chunk = boxes[i:i + self.batch]
                 tiles = np.stack([img[y:y + T, x:x + T] for y, x in chunk])
-                h, s, p, rel = self._run(tiles, gsd)
+                h, s, p, relative = self._run(tiles, gsd)
                 for j, (y, x) in enumerate(chunk):
-                    # metres need no alignment; the RELATIVE output is only
-                    # defined up to scale and shift per tile, so each tile is
-                    # matched to what is already stitched in the overlap - the
-                    # same tile scale alignment the zero-shot engine uses
                     seen = acc_w[y:y + T, x:x + T] > 1e-6
-                    rj = rel[j]
+                    rj = relative[j]
                     if seen.sum() > 256:
                         ref = acc_r[y:y + T, x:x + T][seen] / acc_w[y:y + T, x:x + T][seen]
                         a, b = robust_affine(rj[seen], ref)
@@ -620,15 +504,7 @@ if torch is not None:
                     (acc_p / acc_w)[:, :H, :W], (acc_r / acc_w)[:H, :W], len(boxes))
 
         def predict(self, rgb, gsd_m=None, rotations=4, overlap=128, progress=None):
-            """rgb uint8 (H,W,3). gsd_m metres/pixel (None = not georeferenced).
-
-            Returns, on the input grid:
-              height      engine B: metres above ground
-              sigma       B's 1-sigma uncertainty, metres (bin spread + rotation spread)
-              rel         engine A: relative depth (scale and shift undefined)
-              rel_sigma   A's spread across rotations, in rel units
-              seg         class index per pixel (CLASSES), seg_conf its probability
-            """
+            """Rgb uint8 (H,W,3)."""
             import cv2
             H, W = rgb.shape[:2]
             gsd_in = float(gsd_m) if gsd_m else GSD_DEFAULT
@@ -645,27 +521,27 @@ if torch is not None:
             tiles = 0
             for i, k in enumerate(range(n_rot)):
                 r = np.ascontiguousarray(np.rot90(img, k))
-                h, sg, p, rel, nt = self._tiled(r, work, overlap)
+                h, sg, p, relative, nt = self._tiled(r, work, overlap)
                 tiles += nt
                 h = np.rot90(h, -k)
                 sg = np.rot90(sg, -k)
                 p = np.rot90(p, -k, axes=(1, 2))
-                rel = np.rot90(rel, -k)
+                relative = np.rot90(relative, -k)
                 if mean is None:
                     mean, m2 = h.copy(), np.zeros_like(h)
                     s2, pr = sg ** 2, p.copy()
-                    rmean, rm2 = rel.copy(), np.zeros_like(rel)
+                    rmean, rm2 = relative.copy(), np.zeros_like(relative)
                 else:                                   # Welford across rotations
                     d = h - mean
                     mean += d / (i + 1)
                     m2 += d * (h - mean)
                     s2 += sg ** 2
                     pr += p
-                    a, b = robust_affine(rel, rmean)    # onto the first pass's scale
-                    rel = a * rel + b
-                    d = rel - rmean
+                    a, b = robust_affine(relative, rmean)    # onto the first pass's scale
+                    relative = a * relative + b
+                    d = relative - rmean
                     rmean += d / (i + 1)
-                    rm2 += d * (rel - rmean)
+                    rm2 += d * (relative - rmean)
                 if progress:
                     progress((i + 1) / n_rot)
             s2 /= n_rot
@@ -687,31 +563,28 @@ if torch is not None:
                         georeferenced=bool(gsd_m))
 
 
-# ----------------------------------------------------------------------------
-# CLI: python heightnet.py image.tif [--ckpt models/heightnet.pt]
-# ----------------------------------------------------------------------------
 def _main():
     import argparse
-    ap = argparse.ArgumentParser(description="Run the trained height model on one image.")
-    ap.add_argument("image")
-    ap.add_argument("--ckpt", default=None)
-    ap.add_argument("--rotations", type=int, default=4)
-    ap.add_argument("--out", default=None, help="write height (m, float32) as .npy")
-    a = ap.parse_args()
+    parser = argparse.ArgumentParser(description="Run the trained height model on one image.")
+    parser.add_argument("image")
+    parser.add_argument("--ckpt", default=None)
+    parser.add_argument("--rotations", type=int, default=4)
+    parser.add_argument("--out", default=None, help="write height (m, float32) as .npy")
+    args = parser.parse_args()
     import sys
     sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
     import inference as I
-    rgb, meta = I.load_image(a.image)
-    hp = HeightPredictor(a.ckpt)
-    r = hp.predict(rgb, meta.get("px_size_m"), rotations=a.rotations)
+    rgb, meta = I.load_image(args.image)
+    predictor = HeightPredictor(args.ckpt)
+    r = predictor.predict(rgb, meta.get("px_size_m"), rotations=args.rotations)
     h = r["height"]
-    print(f"{hp.describe()}  gsd {r['gsd_input']:.2f} m -> model {r['gsd_model']:.2f} m  "
+    print(f"{predictor.describe()}  gsd {r['gsd_input']:.2f} m -> model {r['gsd_model']:.2f} m  "
           f"{r['tiles']} tile passes")
     print(f"height above ground: p50 {np.percentile(h, 50):.1f} m  p99 "
           f"{np.percentile(h, 99):.1f} m  max {h.max():.1f} m  "
           f"mean sigma {r['sigma'].mean():.2f} m")
-    if a.out:
-        np.save(a.out, h)
+    if args.out:
+        np.save(args.out, h)
 
 
 if __name__ == "__main__":

@@ -1,29 +1,3 @@
-/* ===========================================================================
- * api.js - the only file that knows the backend's URLs.
- * ===========================================================================
- *
- * Thin wrapper over the FastAPI backend. Vite proxies /api to :8000 in dev, and
- * in production server.py serves this bundle from the same origin, so the
- * relative paths work in both without a base-URL switch.
- *
- * THE WHOLE CONTRACT - these are the only things the browser can ask the
- * server to do, and server.py has a route for each:
- *
- *   createJob(file, params)      POST /api/jobs                  -> { job_id }
- *   getJob(id)                   GET  /api/jobs/:id              -> the job record
- *   fileUrl(id, name, v)         GET  /api/jobs/:id/files/:name  -> an artefact
- *   validateJob(id, ref)         POST /api/jobs/:id/validate     -> the report
- *   getLayers(id)                GET  /api/jobs/:id/layers       -> drapeable layers
- *   getProfile(id, a, b)         GET  /api/jobs/:id/profile      -> heights along a line
- *   getProbe(id, p)              GET  /api/jobs/:id/probe        -> heights at a pixel
- *
- * plus pollJob(), which is getJob() on a loop with a give-up rule.
- *
- * A run takes MINUTES on CPU, so nothing here blocks on it: createJob returns
- * an id immediately and the job is watched by polling. That is also why the
- * server writes each job to its own folder on disk - the browser can reload
- * mid-run, or come back later, and pick the job up from result.json.
- */
 
 export async function createJob (file, params) {
   const fd = new FormData()
@@ -46,9 +20,7 @@ export async function getJob (id) {
   return r.json()
 }
 
-// `v` is a cache-buster. The validator overwrites error_map.png / scatter.png /
-// stability.png at the SAME url on every run, so without it a second reference
-// raster shows the first one's figures.
+// `v` is a cache-buster.
 export function fileUrl (id, name, v) {
   return `/api/jobs/${id}/files/${name}${v ? `?v=${v}` : ''}`
 }
@@ -74,20 +46,12 @@ async function getJSON (url) {
 
 export const getLayers = (id) => getJSON(`/api/jobs/${id}/layers`)
 
-// a and b are {row, col} in source-image pixels
+// A and b are {row, col} in source-image pixels
 export const getProfile = (id, a, b, n = 256) =>
   getJSON(`/api/jobs/${id}/profile?r0=${a.row}&c0=${a.col}&r1=${b.row}&c1=${b.col}&n=${n}`)
 
 export const getProbe = (id, p) => getJSON(`/api/jobs/${id}/probe?r=${p.row}&c=${p.col}`)
 
-// Poll until the job leaves the running state. The Large backbone on CPU takes
-// minutes, so a single blocking request would time out in the browser.
-//
-// Not every failed poll is the same. A dropped connection or a server still
-// starting up is worth retrying. A 404 or 410 is permanent - the job is gone,
-// usually because the server was restarted - and retrying that forever leaves
-// the user watching a spinner with no explanation, which is what used to
-// happen. Give up on those and say why.
 const PERMANENT = new Set([404, 410])
 
 export function pollJob (id, onUpdate, intervalMs = 900) {
@@ -105,7 +69,7 @@ export function pollJob (id, onUpdate, intervalMs = 900) {
                      error: e.message })
           return
         }
-        // give a flaky connection a fair number of tries before quitting
+        // Give a flaky connection a fair number of tries before quitting
         if (++transient > 20) {
           onUpdate({ id, status: 'error', progress: 0, log: [], result: null,
                      error: 'Lost contact with the server. Is it still running?' })

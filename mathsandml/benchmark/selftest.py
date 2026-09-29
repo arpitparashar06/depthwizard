@@ -1,33 +1,5 @@
 #!/usr/bin/env python3
-"""selftest.py - prove the benchmark harness works without downloading anything.
-
-    python mathsandml/benchmark/selftest.py            # ~30 s, no weights
-    python mathsandml/benchmark/selftest.py --keep     # leave the artefacts behind
-    python mathsandml/benchmark/selftest.py --write-scenes DIR   # scenes only
-
-Three things live here because they are only ever used together, by the
-function at the bottom:
-
-  1. SYNTHETIC SCENES. Four georeferenced tiles - urban, sparse, hilly, forest
-     - with the truth known by construction rather than measured.
-
-  2. A STUB BACKBONE. The depth model replaced by something instant that
-     reproduces its three failure modes, so this is a real test of the pipeline
-     and not a plumbing check:
-       - output is scale-agnostic (normalised), so tile and pass alignment matter
-       - a large perspective ramp is painted DOWN THE FRAME, exactly as the real
-         model does, so rotating the input rotates the artefact with it
-       - structures are attenuated and blurred, so attenuation reporting has work
-     It derives depth from the IMAGE it is handed, not from a lookup, which is
-     what makes it behave correctly under the rotation ensemble.
-
-  3. THE SELFTEST ITSELF. Builds the scenes, installs the stub, runs the whole
-     benchmark over them, and checks every artefact came out.
-
-Exit code 0 means scenes were built, the pipeline ran, validation produced
-metrics and figures, and the report rendered. Nothing here validates the depth
-model - it validates the harness.
-"""
+"""Prove the benchmark harness works without downloading anything."""
 import json
 import os
 import shutil
@@ -47,14 +19,12 @@ for _p in (HERE, os.path.dirname(HERE)):        # benchmark/, then mathsandml/
 import inference as I  # noqa: E402
 
 
-# ===========================================================================
 # 1. SYNTHETIC SCENES
-# ===========================================================================
 def scene(kind, H=384, W=384, px=0.5, seed=0):
     rng = np.random.default_rng(seed)
     yy, xx = np.mgrid[0:H, 0:W].astype(float)
 
-    # --- terrain -----------------------------------------------------------
+    # terrain
     if kind == "hilly":
         terrain = 40 + 25 * np.sin(xx / 90) * np.cos(yy / 70) + 0.05 * yy
     else:
@@ -63,12 +33,12 @@ def scene(kind, H=384, W=384, px=0.5, seed=0):
 
     objects = np.zeros((H, W))
     rgb = np.zeros((H, W, 3), np.uint8)
-    # ground colour
+    # Ground colour
     rgb[..., 0], rgb[..., 1], rgb[..., 2] = 110, 105, 98
     if kind in ("sparse", "hilly"):
         rgb[..., 0], rgb[..., 1], rgb[..., 2] = 130, 128, 100
 
-    # --- structures --------------------------------------------------------
+    # structures
     if kind == "urban":
         for _ in range(46):
             h = float(rng.uniform(6, 65))
@@ -129,11 +99,6 @@ def write_scene(outdir, name, kind, seed):
                            height=H, width=W, count=1, dtype="float32",
                            crs=crs, transform=tr) as ds:
             ds.write(arr, 1)
-    # A synthetic scene is the one case where the tallest-structure prior is
-    # legitimately known without consulting a measurement: it is the
-    # generator's own construction parameter, fixed before any surface exists.
-    # run_benchmark refuses to invent this number, so it has to be written
-    # here, and it has to say where it came from.
     with open(os.path.join(d, "scene.json"), "w") as f:
         json.dump(dict(landscape=kind, synthetic=True,
                        true_max_object_m=float((dsm - dtm).max()),
@@ -143,27 +108,22 @@ def write_scene(outdir, name, kind, seed):
                   f, indent=2)
     print(f"{name:10s} {kind:8s} objects up to {float((dsm - dtm).max()):5.1f} m")
 
-# ===========================================================================
 # 2. THE STUB BACKBONE
-# ===========================================================================
 RAMP = float(os.environ.get("STUB_RAMP", "0.55"))
 ATTEN = float(os.environ.get("STUB_ATTEN", "0.72"))
 NOISE = float(os.environ.get("STUB_NOISE", "0.012"))
 
 
 def _stub_predict_depth(rgb, tile=None, overlap=None):
-    """Fake relative depth, computed from the image so it rotates with it."""
     a = np.asarray(rgb, np.float64)
     luma = 0.299 * a[..., 0] + 0.587 * a[..., 1] + 0.114 * a[..., 2]
 
-    # bright roofs read as tall; smooth a little so it is not pure texture
+    # Bright roofs read as tall; smooth a little so it is not pure texture
     s = gaussian_filter(luma, 1.6)
     lo, hi = np.percentile(s, [1, 99])
     p = np.clip((s - lo) / max(hi - lo, 1e-9), 0, 1)
     p = ATTEN * p
 
-    # THE ARTEFACT: the model reads the bottom of the FRAME as nearer and paints
-    # it high. Tied to the frame, so np.rot90 on the input moves it too.
     H, W = p.shape
     p = p + RAMP * (np.linspace(0, 1, H)[:, None] * np.ones((1, W)))
 
@@ -175,9 +135,7 @@ def install_stub():
     I.predict_depth = _stub_predict_depth
     print(f"[stub] backbone replaced (ramp={RAMP}, atten={ATTEN}, noise={NOISE})")
 
-# ===========================================================================
 # 3. THE SELFTEST
-# ===========================================================================
 def main():
     tmp = tempfile.mkdtemp(prefix="depthwizard-selftest-")
     scenes = os.path.join(tmp, "scenes")

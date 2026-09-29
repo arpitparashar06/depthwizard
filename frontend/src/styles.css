@@ -1,95 +1,43 @@
-/* DepthWizard UI
-   ===========================================================================
-   Cool studio theme: faintly blue paper, soft colour-wash blobs, glassy white
-   cards, one electric indigo and one mint.
-
-   HOW TO READ THIS FILE. It is one stylesheet, no framework, and it runs in
-   the order the interface is built:
-
-     tokens -> page shell (nav, hero) -> the left control panel (dropzone,
-     fields, segmented pills, buttons) -> the right output column (stage,
-     viewer HUD, progress, results, validation)
-
-   Class names come straight from the JSX, so searching this file for a class
-   you saw in App.jsx or a component always lands on the block that draws it.
-
-   THE PALETTE IS COOL, AND THAT IS THE WHOLE TRICK. Every neutral here has a
-   blue cast - the paper, the ink, the greys, the shadows, the black behind the
-   render. Nothing is warm and nothing is a true grey, so the two saturated
-   colours never look pasted on. There are only two of them:
-
-     INDIGO  #5B4FFF  everything you can press, focus, or read a value off
-     MINT    #8AEDBD  live, finished, measured
-
-   Mint is far too light to be text on paper, so it has a dark twin at the same
-   hue (--mint-deep) that carries the same meaning on the light half - the
-   bright one is kept for the live-dot and the head of the progress bar, where
-   it sits on ink. Amber and rose exist only for the caution and error states
-   and appear four times between them.
-
-   THREE TYPEFACES, EACH WITH A JOB. Inter is every piece of running text.
-   Playfair Display italic appears exactly once, on the empty-state line, and
-   nowhere else - the headline is Inter like everything else, because a second
-   display face there would compete with it. JetBrains Mono is for
-   anything that is a MEASUREMENT: metres, degrees, pixel counts, file sizes,
-   the log. Numbers that a judge might read off the screen are monospaced and
-   tabular so digits line up in a column.
-
-   THERE IS ONE DARK SURFACE AND IT IS THE RENDER. The stage is a tinted
-   panel until three.js mounts; the canvas then paints over it in its own
-   near-black, and the HUD, crosshair and lock overlay that sit on top of the
-   canvas are the only things in this file styled for a dark ground. Nothing
-   else on the page is dark, because nothing else on the page is a viewport.
-
-   Fonts are self-hosted through @fontsource (see main.jsx): the Docker image
-   is built to run with no network, and a webfont <link> would silently fall
-   back to system faces in exactly the offline deployment this is pitched at.
-   =========================================================================== */
 
 :root{
-  /* --- surfaces ------------------------------------------------------- */
+  /* surfaces */
   --bg:#F8F9FC;                     /* paper, faintly blue */
-  --surface:rgba(255,255,255,.92);  /* cards; translucent so the wash shows */
+  --surface:rgba(255,255,255,.92);
   --line:rgba(17,17,23,.10);
   --line-soft:rgba(17,17,23,.07);
 
-  /* --- text: three steps, never more ----------------------------------- */
-  --ink:#111117;                    /* headings, values, anything decisive */
+  /* text: three steps, never more */
+  --ink:#111117;
   --dim:#64668B;                    /* labels — 5.5:1 on white */
-  --faint:#70707D;                  /* hints and units — 4.9:1, the floor is 4.5 */
+  --faint:#70707D;
 
-  /* --- accents, each with ONE job -------------------------------------- */
-  --accent:#5B4FFF;                 /* interactive: focus, hover, the thing you press */
-  --accent-dim:#4A3EE8;             /* the same indigo, darkened for small text (6.7:1) */
-  --accent-soft:#7679FF;            /* the lighter end, for gradients only */
+  /* accents, each with ONE job */
+  --accent:#5B4FFF;
+  --accent-dim:#4A3EE8;
+  --accent-soft:#7679FF;
   --accent-wash:rgba(91,79,255,.09);
 
-  /* the soft lavender the reference uses to tint a whole section. Not an
-     accent - it is a SURFACE, and it is what stops a white page of white
-     cards from reading as a form. */
+  /* The soft lavender the reference uses to tint a whole section. */
   --lavender:#E7E9FD;
   --lavender-deep:#C6C3F5;
 
-  /* FILM GRAIN. This is the thing that makes the reference's big soft washes
-     look printed rather than like a cheap CSS blur, and it is one inline SVG -
-     fractal noise desaturated to grey at 22%. Used as a background LAYER, so
-     it composites over whatever gradient sits under it in the same rule. */
+  /* FILM grain. */
   --grain:url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg'%3E%3Cfilter id='g'%3E%3CfeTurbulence type='fractalNoise' baseFrequency='.9' numOctaves='3' stitchTiles='stitch'/%3E%3CfeColorMatrix type='saturate' values='0'/%3E%3C/filter%3E%3Crect width='100%25' height='100%25' filter='url(%23g)' opacity='.22'/%3E%3C/svg%3E");
 
-  /* the tinted panel itself: pale at the top, violet toward the bottom edge */
+  /* The tinted panel itself: pale at the top, violet toward the bottom edge */
   --panel-wash:radial-gradient(95% 70% at 50% -8%, #F7F8FF 0%, rgba(247,248,255,0) 62%),
                linear-gradient(180deg, rgba(198,195,245,0) 26%, rgba(146,138,240,.50) 100%);
 
-  --mint:#8AEDBD;                   /* live / finished — bright, so it belongs on the dark */
-  --mint-deep:#0E7A55;              /* the same hue, dark enough to be text on white (5.3:1) */
+  --mint:#8AEDBD;
+  --mint-deep:#0E7A55;
   --mint-wash:rgba(14,122,85,.08);
 
-  --amber:#965D08;                  /* caution: a result that needs a caveat (5.4:1) */
+  --amber:#965D08;
   --amber-wash:rgba(150,93,8,.09);
   --bad:#B3213F;                    /* errors only (6.6:1) */
   --bad-wash:rgba(179,33,63,.07);
 
-  /* --- spacing and radius scales --------------------------------------- */
+  /* spacing and radius scales */
   --s1:4px; --s2:8px; --s3:12px; --s4:16px; --s5:24px; --s6:32px;
   --r1:8px; --r2:12px; --r3:20px; --r-full:9999px;
 
@@ -97,8 +45,7 @@
   --f-serif:'Playfair Display',ui-serif,Georgia,serif;
   --f-mono:'JetBrains Mono',ui-monospace,"SF Mono",Menlo,Consolas,monospace;
 
-  /* blue-black shadows. A neutral grey shadow reads as dirt on a cool paper,
-     the same way a grey one read as dirt on the warm paper this replaced. */
+  /* Blue-black shadows. */
   --shadow-sm:0 2px 8px rgba(17,17,40,.05);
   --shadow-md:0 12px 32px rgba(17,17,40,.08);
   --shadow-lg:0 24px 56px rgba(17,17,40,.12);
@@ -109,8 +56,6 @@
 *{box-sizing:border-box}
 html,body{height:100%}
 html{overflow-x:clip}
-/* The four colour blobs are painted on the body itself and fixed, so they do
-   not scroll with the content and cost nothing to animate - they never move. */
 body{
   margin:0;color:var(--ink);
   font-family:var(--f-sans);font-size:14px;line-height:1.6;
@@ -124,16 +69,10 @@ body{
   background-attachment:fixed;
 }
 :focus-visible{outline:2px solid var(--accent);outline-offset:2px;border-radius:var(--r1)}
-/* everything that moves is a transition or an animation, so one rule disables
-   the lot for anyone who has asked their OS for less motion */
 @media (prefers-reduced-motion:reduce){
   *,*::before,*::after{animation-duration:.01ms!important;transition-duration:.01ms!important}
 }
 
-/* ------------------------------------------------------ ambient backdrop --
-   Both of these belong to AmbientBackground.jsx. They sit BELOW the interface
-   (z-index 1 and 2 against the shell's 10) and never take pointer events, so
-   they cannot swallow a click meant for a control. */
 #interactive-canvas{
   position:fixed;top:0;left:0;width:100vw;height:100vh;
   z-index:1;pointer-events:none;opacity:.85;
@@ -142,22 +81,16 @@ body{
   position:fixed;top:0;left:0;width:140px;height:140px;border-radius:50%;
   background:radial-gradient(circle, rgba(91,79,255,.20) 0%, rgba(138,237,189,.12) 50%, transparent 70%);
   pointer-events:none;z-index:2;
-  transform:translate(-50%,-50%) scale(0);   /* JS scales it to 1 on mouse move */
+  transform:translate(-50%,-50%) scale(0);
   transition:transform .25s cubic-bezier(.16,1,.3,1), opacity .25s ease;
   mix-blend-mode:multiply;filter:blur(6px);
 }
 
-/* ---------------------------------------------------------------- shell -- */
+/* shell */
 .app{max-width:1680px;margin:0 auto;padding:0 var(--s5) var(--s6)}
 
-/* ONE WIDE BAR, not a floating pill. It spans the working area so the page
-   reads as a studio site rather than a tool chrome, and it is sticky - which
-   is the point of moving the datum into it. */
+/* One WIDE BAR, not a floating pill. */
 .site-nav{position:sticky;top:14px;z-index:40;padding:18px 0 0}
-/* AT REST it has no chrome at all - no fill, no border, no shadow - so the
-   brand sits straight on the paper. `is-stuck` (App.jsx adds it past 8px of
-   scroll) fades the card in, because that is the moment the bar starts
-   overlapping content and needs to separate itself from it. */
 .nav-bar{
   display:flex;align-items:center;justify-content:space-between;gap:var(--s4);
   background:rgba(255,255,255,0);border:1px solid transparent;
@@ -175,8 +108,6 @@ body{
   text-decoration:none;color:var(--ink);
   font-weight:700;font-size:1.02rem;letter-spacing:-.02em;
 }
-/* the mark: a disc with a notch out of the bottom, drawn in CSS so there is
-   no logo file to ship */
 .nav-mark{
   width:19px;height:19px;border-radius:50%;flex:0 0 auto;
   background:linear-gradient(150deg,var(--accent-soft),var(--accent));
@@ -190,8 +121,6 @@ body{
   padding:4px 9px;border-radius:var(--r-full);letter-spacing:.05em;
   text-transform:uppercase;white-space:nowrap;
 }
-/* the DATUM, and its colour is the whole message:
-   mint = sea level, amber = local ground, plain ink = relative */
 .nav-chip{
   display:inline-flex;align-items:center;gap:7px;white-space:nowrap;
   background:var(--ink);color:#fff;padding:5px 14px;border-radius:var(--r-full);
@@ -205,16 +134,7 @@ body{
 }
 @media (max-width:620px){.nav-tag{display:none}}
 
-/* ------------------------------------------------------------------ hero --
-   Two-tone headline: the claim in ink, the deliverable in grey. One weight,
-   one size, no italic and no third colour - the restraint is the point, and
-   the colour in this design belongs to things you can press. */
 .hero{position:relative;z-index:10;text-align:center;padding:60px 24px 10px;max-width:900px;margin:0 auto}
-/* The lavender bloom behind the headline, and the GRAIN over it. The grain is
-   what stops a big soft gradient from looking like a cheap CSS blur: the
-   reference puts fine noise over every one of these washes. It is one inline
-   SVG turbulence, no image file, soft-light so it darkens and lightens the
-   gradient rather than greying it out. */
 .hero::before{
   content:"";position:absolute;top:-40px;bottom:0;left:50%;width:100vw;
   transform:translateX(-50%);z-index:-1;pointer-events:none;
@@ -240,13 +160,12 @@ body{
   max-width:56ch;margin:0 auto;line-height:1.6;
 }
 
-/* the two-column working area. One breakpoint: below 1080 the control panel
-   stops being a sidebar and stacks above the output. */
+/* The two-column working area. */
 .layout{position:relative;z-index:10;display:grid;grid-template-columns:340px minmax(0,1fr);
   gap:var(--s5);align-items:start;margin-top:var(--s5)}
 @media (max-width:1080px){.layout{grid-template-columns:1fr}}
 
-/* ---------------------------------------------------------------- panel -- */
+/* panel */
 .panel{
   background:var(--surface);backdrop-filter:blur(16px);-webkit-backdrop-filter:blur(16px);
   border:1px solid var(--line);
@@ -254,8 +173,6 @@ body{
   box-shadow:var(--shadow-md);
 }
 .panel + .panel{margin-top:var(--s4)}
-/* the controls follow you down the page while the output scrolls; the offsets
-   are the sticky nav's own height so the panel never slides under it */
 aside{position:sticky;top:calc(14px + 46px + var(--s4));
   max-height:calc(100vh - 14px - 46px - var(--s5) - var(--s4));overflow-y:auto;
   scrollbar-width:thin;scrollbar-color:var(--line) transparent}
@@ -269,9 +186,6 @@ aside::-webkit-scrollbar-thumb{background:var(--line);border-radius:4px}
 }
 .panel > .section-label:not(:first-child){margin-top:var(--s5)}
 
-/* ------------------------------------------------------------ dropzone --
-   The <input type=file> is stretched invisibly over the whole box, so the
-   entire area is clickable without any JS. See Dropzone.jsx. */
 .drop{
   position:relative;border:2px dashed rgba(17,17,23,.15);border-radius:var(--r2);
   padding:22px 16px;text-align:center;cursor:pointer;
@@ -279,7 +193,7 @@ aside::-webkit-scrollbar-thumb{background:var(--line);border-radius:4px}
   background:rgba(248,249,252,.75);
 }
 .drop:hover{border-color:var(--accent);background:var(--accent-wash);transform:translateY(-2px)}
-.drop.over{border-color:var(--accent);background:var(--accent-wash)}  /* .over = a file is being dragged over it */
+.drop.over{border-color:var(--accent);background:var(--accent-wash)}
 .drop input{position:absolute;inset:0;opacity:0;cursor:pointer;width:100%;height:100%}
 .drop .icon{
   width:42px;height:42px;margin:0 auto 10px;display:flex;align-items:center;justify-content:center;
@@ -290,7 +204,7 @@ aside::-webkit-scrollbar-thumb{background:var(--line);border-radius:4px}
 .drop .lead b{color:var(--ink);font-weight:600}
 .drop .formats{font-size:.72rem;color:var(--dim);font-family:var(--f-sans)}
 
-/* the chosen file, with a thumbnail read straight off the File object */
+/* The chosen file, with a thumbnail read straight off the File object */
 .picked{display:flex;gap:var(--s3);align-items:center;
   background:#fff;border:1px solid var(--line);
   border-radius:var(--r2);padding:var(--s2);box-shadow:var(--shadow-sm)}
@@ -298,7 +212,7 @@ aside::-webkit-scrollbar-thumb{background:var(--line);border-radius:4px}
   width:52px;height:52px;flex:0 0 52px;border-radius:var(--r1);
   object-fit:cover;background:var(--bg);border:1px solid var(--line);
 }
-.picked .meta{min-width:0;flex:1}          /* min-width:0 lets the name ellipsis */
+.picked .meta{min-width:0;flex:1}
 .picked .fname{
   font-size:13px;font-weight:600;white-space:nowrap;overflow:hidden;
   text-overflow:ellipsis;display:block;color:var(--ink);
@@ -310,9 +224,6 @@ aside::-webkit-scrollbar-thumb{background:var(--line);border-radius:4px}
 }
 .picked .clear:hover{color:var(--bad);background:var(--bad-wash)}
 
-/* --------------------------------------------------------------- fields --
-   One <Field> = label row, control, hint. Drawn by the Field() helper in
-   App.jsx, so every setting in the panel has the same rhythm. */
 .field{display:block;margin-bottom:var(--s4)}
 .field:last-child{margin-bottom:0}
 .field .label{
@@ -321,7 +232,7 @@ aside::-webkit-scrollbar-thumb{background:var(--line);border-radius:4px}
 }
 .field .label .val{font-family:var(--f-mono);font-size:12px;font-weight:700;color:var(--accent-dim)}
 .field .hint{display:block;font-size:11.5px;color:var(--faint);margin-top:5px;line-height:1.5}
-.field.required .label{color:var(--ink)}   /* darker label = the run refuses without it */
+.field.required .label{color:var(--ink)}
 
 input[type=number],input[type=text],select{
   width:100%;background:#fff;color:var(--ink);
@@ -334,8 +245,6 @@ input[type=number]:focus,input[type=text]:focus,select:focus{
   border-color:var(--accent);box-shadow:0 0 0 3px var(--accent-wash);outline:none;
 }
 input::placeholder{color:var(--faint)}
-/* the two gradients are the dropdown caret - drawn in CSS so there is no icon
-   file to ship and it inherits the text colour */
 select{appearance:none;cursor:pointer;
   background-image:linear-gradient(45deg,transparent 50%,var(--faint) 50%),
                    linear-gradient(135deg,var(--faint) 50%,transparent 50%);
@@ -344,8 +253,7 @@ select{appearance:none;cursor:pointer;
 
 input[type=range]{width:100%;accent-color:var(--accent);height:18px;cursor:pointer}
 
-/* segmented control: a rail with the pressed pill inked in. aria-pressed is
-   what styles it, so the visual state and the accessible state cannot drift. */
+/* Segmented control: a rail with the pressed pill inked in. */
 .seg{display:flex;gap:2px;background:rgba(17,17,23,.045);border:1px solid var(--line);
   border-radius:var(--r-full);padding:3px}
 .seg button{
@@ -356,9 +264,6 @@ input[type=range]{width:100%;accent-color:var(--accent);height:18px;cursor:point
 .seg button:hover{color:var(--ink)}
 .seg button[aria-pressed="true"]{background:var(--ink);color:#fff;font-weight:600;box-shadow:var(--shadow-sm)}
 
-/* ----------------------------------------------- ground control points --
-   Four columns - row, col, height, remove - and the header uses the same grid
-   so the labels sit over their inputs. */
 .gcps{display:flex;flex-direction:column;gap:6px}
 .gcp-head,.gcp-row{display:grid;grid-template-columns:1fr 1fr 1fr 22px;gap:6px;
   align-items:center}
@@ -370,7 +275,7 @@ input[type=range]{width:100%;accent-color:var(--accent);height:18px;cursor:point
 .gcp-row .x:hover{color:var(--bad)}
 .gcps .btn.ghost{margin-top:4px;padding:7px;font-size:12.5px}
 
-/* checkbox rows in the advanced panel: bold claim, then the explanation */
+/* Checkbox rows in the advanced panel: bold claim, then the explanation */
 .check{display:flex;gap:9px;align-items:flex-start;cursor:pointer;
   margin-bottom:var(--s4)}
 .check input{margin-top:2px;accent-color:var(--accent);cursor:pointer}
@@ -378,7 +283,7 @@ input[type=range]{width:100%;accent-color:var(--accent);height:18px;cursor:point
 .check .hint{display:block;font-size:11.5px;color:var(--faint);margin-top:4px;
   line-height:1.5}
 
-/* --------------------------------------------------------------- advanced */
+/* advanced */
 .adv{border-top:1px solid var(--line-soft);margin-top:var(--s4);padding-top:var(--s3)}
 .adv > summary{
   cursor:pointer;list-style:none;font-family:var(--f-mono);font-size:10.5px;
@@ -396,11 +301,7 @@ input[type=range]{width:100%;accent-color:var(--accent);height:18px;cursor:point
 .adv[open] > summary::before{transform:rotate(90deg)}
 .adv .body{padding-top:var(--s4)}
 
-/* -------------------------------------------------------------- buttons -- */
-/* TWO BUTTONS, one pair of behaviours, taken straight from the reference:
-   the solid one is BLACK and turns indigo on hover; the outlined one keeps its
-   white fill and only its TEXT AND BORDER turn indigo. Nothing else moves -
-   no fill swap on the ghost, no colour on the solid until you reach for it. */
+/* buttons */
 .btn{
   width:100%;padding:13px;border-radius:var(--r-full);
   border:1px solid var(--ink);background:var(--ink);color:#fff;
@@ -421,7 +322,7 @@ input[type=range]{width:100%;accent-color:var(--accent);height:18px;cursor:point
   background:#fff;border-color:rgba(17,17,23,.20);color:var(--ink);
   font-weight:600;box-shadow:var(--shadow-sm);width:auto;
 }
-/* text and outline only - the fill stays white */
+/* Text and outline only - the fill stays white */
 .btn.ghost:hover:not(:disabled){
   background:#fff;border-color:var(--accent);color:var(--accent);
   transform:none;box-shadow:var(--shadow-sm);
@@ -441,17 +342,6 @@ input[type=range]{width:100%;accent-color:var(--accent);height:18px;cursor:point
 }
 .alert.info{background:var(--accent-wash);border-color:rgba(91,79,255,.25);color:var(--accent-dim)}
 
-/* --------------------------------------------------------------- viewer --
-   The stage is a fixed-height window. Its background matches the viewer's
-   clear colour in Viewer.jsx, so there is no seam while the .glb downloads. */
-/* THE STAGE IS A TINTED PANEL, not a black box. It only ever goes black when
-   three.js is actually rendering - the canvas is opaque and paints over all of
-   this - so the near-black that used to sit here was only ever the colour of
-   an EMPTY box, and an empty box has no reason to be black.
-
-   What is left is the reference's tinted panel: grain over a wash that runs
-   pale at the top into violet at the bottom edge. The white card that floats
-   in it is .empty .steps below. */
 .stage{
   position:relative;border:1px solid var(--line);border-radius:var(--r3);
   overflow:hidden;height:min(62vh,620px);min-height:380px;
@@ -471,16 +361,8 @@ input[type=range]{width:100%;accent-color:var(--accent);height:18px;cursor:point
 }
 .tabs button:hover:not(:disabled){color:var(--ink)}
 .tabs button[aria-selected="true"]{background:var(--ink);color:#fff;font-weight:700;box-shadow:var(--shadow-sm)}
-.tabs button:disabled{opacity:.35;cursor:not-allowed}   /* the map tab until a run finishes */
+.tabs button:disabled{opacity:.35;cursor:not-allowed}
 
-/* empty state: the thesis of the project, then the three steps. This is what
-   a judge reads before anything has been run, so it explains the problem
-   rather than listing features.
-
-   The headline sits straight on the tint - it is large, so it has contrast to
-   spare. The three steps do NOT: at 12.5px, --dim over the wash measured 4.4:1,
-   under the floor. So they go in a white card, which is also exactly what the
-   reference does with a tinted panel. */
 .empty{
   position:absolute;inset:0;display:flex;flex-direction:column;
   align-items:center;justify-content:center;gap:var(--s5);padding:var(--s5);
@@ -502,8 +384,7 @@ input[type=range]{width:100%;accent-color:var(--accent);height:18px;cursor:point
 .empty .headline{font-family:var(--f-serif);font-style:italic;font-size:clamp(17px,1.7vw,21px);
   color:var(--ink);max-width:40ch;line-height:1.5;font-weight:400}
 
-/* hud - the live readout while flying. pointer-events:none so it can never
-   steal the click that locks the pointer. */
+/* Hud - the live readout while flying. */
 .hud{
   position:absolute;top:var(--s3);left:var(--s3);
   background:rgba(255,255,255,.94);backdrop-filter:blur(10px);
@@ -520,8 +401,6 @@ input[type=range]{width:100%;accent-color:var(--accent);height:18px;cursor:point
 .hud .probe.exact{color:var(--ink)}
 .hud .probe.exact b{color:var(--accent-dim);font-weight:700}
 
-/* the colour key for an analysis layer - same glass card as the HUD, pinned
-   to the other corner, never in the way of the pointer lock */
 .legend{
   position:absolute;top:var(--s3);right:var(--s3);width:236px;
   background:rgba(255,255,255,.94);backdrop-filter:blur(10px);
@@ -537,15 +416,13 @@ input[type=range]{width:100%;accent-color:var(--accent);height:18px;cursor:point
 .legend .note2{font-family:var(--f-sans);font-size:11px;color:var(--dim);
   line-height:1.45;margin-top:6px}
 
-/* the crosshair: two white bars with a dark glow, so it stays visible over
-   both a bright roof and a dark shadow */
 .cross{position:absolute;left:50%;top:50%;width:15px;height:15px;
   margin:-7.5px 0 0 -7.5px;pointer-events:none;opacity:.95}
 .cross:before,.cross:after{content:"";position:absolute;background:#fff;box-shadow:0 0 3px rgba(0,0,0,.6)}
 .cross:before{left:6.5px;top:0;width:2px;height:15px}
 .cross:after{top:6.5px;left:0;height:2px;width:15px}
 
-/* shown until the pointer is locked, and again the moment it is released */
+/* Shown until the pointer is locked, and again the moment it is released */
 .overlay{
   position:absolute;inset:0;display:flex;flex-direction:column;
   align-items:center;justify-content:center;gap:var(--s4);
@@ -566,17 +443,12 @@ kbd{
   font-size:11.5px;color:rgba(255,255,255,.55);pointer-events:none;text-align:center;
 }
 
-/* the Elevation map tab - the stage's own tint shows through, and the raster
-   is the card floating on it */
 .flat-view{position:absolute;inset:0;display:flex;align-items:center;
   justify-content:center;padding:var(--s5)}
 .flat-view img{max-width:100%;max-height:100%;object-fit:contain;
   border-radius:var(--r2);image-rendering:auto;background:#fff;
   border:1px solid var(--line);box-shadow:var(--shadow-md)}
 
-/* ------------------------------------------------------------- progress --
-   Drawn by RunProgress.jsx from the job record the poll loop returns: a bar,
-   one pill per pipeline stage, and the backend's own stdout. */
 .run{display:flex;flex-direction:column;gap:var(--s3)}
 .track{height:4px;background:var(--line-soft);border-radius:2px;overflow:hidden}
 .track div{height:100%;background:linear-gradient(90deg,var(--mint),var(--accent));transition:width .5s var(--ease)}
@@ -593,10 +465,7 @@ kbd{
 .st.live .dot{background:var(--accent);animation:pulse 1.4s ease-in-out infinite}
 @keyframes pulse{0%,100%{opacity:1}50%{opacity:.25}}
 
-/* The backend's own stdout. It used to be a black terminal with green text,
-   which read as a second dark box on a light page AND coloured failures green.
-   It is now a white card on a tinted well - the reference's pattern again -
-   with the type still monospaced, because the alignment is the point. */
+/* The backend's own stdout. */
 .log{
   margin:5px 0 0;max-height:132px;overflow:auto;
   font-family:var(--f-mono);font-size:11.5px;line-height:1.7;
@@ -609,9 +478,6 @@ kbd{
 .log::-webkit-scrollbar{width:8px}
 .log::-webkit-scrollbar-thumb{background:rgba(17,17,23,.18);border-radius:4px}
 
-/* -------------------------------------------------------------- results --
-   The 1px grid gap over a --line background is what draws the hairlines
-   BETWEEN the stat cells without any of them carrying a border. */
 .stats{display:grid;grid-template-columns:repeat(auto-fit,minmax(132px,1fr));
   gap:1px;background:var(--line);border:1px solid var(--line);
   border-radius:var(--r2);overflow:hidden}
@@ -629,9 +495,7 @@ kbd{
 .rows td:first-child{color:var(--faint);width:38%;font-size:12.5px;font-weight:500}
 .rows .mono{font-family:var(--f-mono);font-variant-numeric:tabular-nums;color:var(--ink)}
 
-/* the datum callout - the same three states as the hero badge, spelled out.
-   Never let these three look alike; confusing them is how a run gets scored
-   against the wrong reference. */
+/* The datum callout - the same three states as the hero badge, spelled out. */
 .datum{display:flex;gap:var(--s2);align-items:flex-start;
   padding:var(--s4);border-radius:var(--r2);margin-top:var(--s4);
   font-size:12.5px;line-height:1.55;border:1px solid;}
@@ -641,7 +505,7 @@ kbd{
 .datum.risk b{color:var(--amber)}
 .datum.rel{background:rgba(17,17,23,.03);border-color:var(--line);color:var(--dim)}
 
-/* every artefact the run wrote, as download cards */
+/* Every artefact the run wrote, as download cards */
 .files{display:grid;grid-template-columns:repeat(auto-fill,minmax(168px,1fr));
   gap:var(--s2);margin-top:var(--s3)}
 .file{
@@ -661,9 +525,6 @@ kbd{
 .file .d{display:block;font-size:11px;color:var(--faint);white-space:nowrap;
   overflow:hidden;text-overflow:ellipsis}
 
-/* ----------------------------------------------------------- validation --
-   Numbers right-aligned and tabular so columns of RMSE line up; the headline
-   row is the alignment the report says to quote. See validate.py. */
 .metrics{width:100%;border-collapse:collapse;margin-top:var(--s3)}
 .metrics th{
   font-family:var(--f-mono);font-size:10px;letter-spacing:.11em;text-transform:uppercase;
@@ -677,8 +538,6 @@ kbd{
 .metrics tr.headline td{color:var(--accent-dim);font-weight:700}
 .metrics tr.headline td:first-child{color:var(--ink);font-weight:700}
 
-/* per-landscape stability: bars are scaled to the WORST band, so the shape of
-   this list is the answer to "is it stable across terrain types" */
 .bars{margin-top:var(--s4);display:flex;flex-direction:column;gap:var(--s2)}
 .bar-row{display:grid;grid-template-columns:66px 1fr 58px;gap:var(--s3);align-items:center}
 .bar-row .lbl{font-size:12px;color:var(--dim);font-weight:500}
@@ -688,10 +547,6 @@ kbd{
 .bar-row .num{font-family:var(--f-mono);font-size:12px;text-align:right;
   color:var(--dim);font-variant-numeric:tabular-nums}
 
-/* -------------------------------------------------------------- profile --
-   Profile.jsx: one axis in metres, estimate and reference as 2px lines, the
-   ensemble uncertainty as a band. Gridlines are hairlines; text is ink, never
-   the series colour - the short line keys carry identity. */
 .profile-head{display:flex;align-items:center;justify-content:space-between;gap:var(--s3)}
 .profile-actions{display:flex;gap:var(--s2)}
 .btn.sm{padding:6px 12px;font-size:12px;width:auto;margin:0;text-decoration:none}
@@ -719,14 +574,14 @@ kbd{
 .chart .tip-row b{font-family:var(--f-mono);color:var(--ink);font-variant-numeric:tabular-nums}
 .chart .tip-row span{color:var(--dim)}
 
-/* the layer switcher sits in the tab row, on the right */
+/* The layer switcher sits in the tab row, on the right */
 .stage-bar{display:flex;align-items:center;justify-content:space-between;gap:var(--s3);flex-wrap:wrap}
 .stage-bar .tabs{margin-bottom:var(--s3)}
 .layer-seg{display:flex;align-items:center;gap:var(--s2);margin-bottom:var(--s3)}
 .seg.layers button{flex:0 0 auto;padding:6px 12px;font-size:12px}
 .layer-seg .lbl{font-size:11px;color:var(--faint);letter-spacing:.1em;text-transform:uppercase;font-family:var(--f-mono)}
 
-/* matplotlib writes these figures on white, so the tile stays white on purpose */
+/* Matplotlib writes these figures on white, so the tile stays white on purpose */
 .figs{display:grid;grid-template-columns:repeat(auto-fit,minmax(230px,1fr));
   gap:var(--s3);margin-top:var(--s4)}
 .figs a{display:block;border:1px solid var(--line);border-radius:var(--r2);
@@ -737,8 +592,6 @@ kbd{
 .note{font-size:12px;color:var(--faint);line-height:1.55;margin:var(--s3) 0 0}
 .hidden-input{display:none}
 
-/* The overlay swallows clicks so it can grab pointer lock, so the human-scale
-   button has to claim its own pointer events back. */
 .mode-toggle {
   margin-top: 18px;
   pointer-events: auto;

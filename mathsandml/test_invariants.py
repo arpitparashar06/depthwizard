@@ -1,24 +1,4 @@
-"""
-test_invariants.py - the properties the pipeline must never violate.
-=============================================================================
-
-Not accuracy tests. Accuracy lives in benchmark/. These are the statements
-that have to hold for ANY input, because if one breaks, a number somewhere
-downstream is quietly wrong and nothing errors:
-
-  * dsm = dtm + ndsm, pixel for pixel. If this drifts, the elevation map on
-    disk and the 3D model are different surfaces, and the validator scores a
-    raster nobody ever sees.
-  * nothing sits below its own ground.
-  * the preprocessing chain is monotonic per band - it may remap intensity,
-    it may not reorder it. Reordering would mean we changed the geometry the
-    model reads, which would make every accuracy claim ours instead of the
-    sensor's.
-  * the mask cannot be moved by the pixels it is looking for.
-
-Run:  python -m pytest mathsandml/test_invariants.py -q
-  or: python mathsandml/test_invariants.py
-"""
+"""The properties the pipeline must never violate."""
 
 import os
 import sys
@@ -30,9 +10,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import preprocess as P
 
 
-# ---------------------------------------------------------------------------
 # helpers
-# ---------------------------------------------------------------------------
 def synthetic_scene(h=160, w=200, seed=0):
     """A little city: sloped ground, three flat roofs, a patch of canopy."""
     rng = np.random.default_rng(seed)
@@ -46,15 +24,13 @@ def synthetic_scene(h=160, w=200, seed=0):
     return dtm, np.maximum(ndsm, 0.0)
 
 
-# ---------------------------------------------------------------------------
 # the surface invariants
-# ---------------------------------------------------------------------------
 def test_dsm_equals_dtm_plus_ndsm():
-    """The one that matters. dsm = dtm + ndsm, everywhere, exactly."""
+    """The one that matters."""
     dtm, ndsm = synthetic_scene()
     dsm = dtm + ndsm
 
-    # re-derive the way inference.py does, from dsm and the terrain baseline
+    # Re-derive the way inference.py does, from dsm and the terrain baseline
     derived_ndsm = np.maximum(dsm - dtm, 0.0)
     derived_dtm = dsm - derived_ndsm
 
@@ -77,16 +53,9 @@ def test_structures_survive_the_round_trip():
     assert abs(back[80:110, 120:170].mean() - 32.0) < 1e-9
 
 
-# ---------------------------------------------------------------------------
 # the preprocessing invariants
-# ---------------------------------------------------------------------------
 def test_stretch_is_monotonic_per_band():
-    """Preprocessing may remap intensity. It may NOT reorder it.
-
-    If a darker pixel could come out brighter than a lighter one, we would
-    have altered the structure the depth model reads - and every accuracy
-    number after that would be measuring our preprocessing, not the sensor.
-    """
+    """Preprocessing may remap intensity."""
     rng = np.random.default_rng(1)
     raw = rng.integers(500, 4000, (64, 64, 3)).astype(np.uint16)
     out, _ = P.stretch_per_band(raw)
@@ -94,7 +63,7 @@ def test_stretch_is_monotonic_per_band():
         a = raw[..., c].ravel()
         b = out[..., c].ravel()
         order = np.argsort(a, kind="stable")
-        # allow ties and the clipped tails to flatten, but never invert
+        # Allow ties and the clipped tails to flatten, but never invert
         assert np.all(np.diff(b[order].astype(np.int16)) >= 0), \
             f"band {c} reordered by the stretch"
 
@@ -115,13 +84,7 @@ def test_hazy_8bit_is_stretched():
 
 
 def test_mask_is_not_dragged_by_the_cloud_it_looks_for():
-    """The regression this file exists for.
-
-    With a min/max or percentile normalisation, a bright cloud covering a few
-    percent of the frame pushes every ordinary surface toward zero, and the
-    shadow test then flags almost the whole scene. Median/IQR cannot be moved
-    by anything smaller than a quarter of the image.
-    """
+    """The regression this file exists for."""
     rng = np.random.default_rng(4)
     a = np.zeros((240, 320, 3), np.uint16)
     a[..., 0] = rng.integers(800, 1400, (240, 320))
@@ -130,24 +93,24 @@ def test_mask_is_not_dragged_by_the_cloud_it_looks_for():
     a[20:60, 20:80] = 64000      # cloud, 3.1% of the frame
     a[180:220, 240:300] = 5      # shadow, 3.1%
 
-    mask, rep = P.valid_mask(a)
+    mask, report = P.valid_mask(a)
     assert 0.90 < mask.mean() < 0.96, \
         f"expected ~6% masked, got {100 * (1 - mask.mean()):.1f}%"
-    assert 0.02 < rep["cloud_frac"] < 0.05
-    assert 0.02 < rep["shadow_frac"] < 0.05
+    assert 0.02 < report["cloud_frac"] < 0.05
+    assert 0.02 < report["shadow_frac"] < 0.05
 
 
 def test_clean_scene_masks_nothing():
     rng = np.random.default_rng(5)
     a = rng.integers(800, 1400, (120, 160, 3)).astype(np.uint16)
-    mask, rep = P.valid_mask(a)
-    assert rep["masked_frac"] < 0.01
+    mask, report = P.valid_mask(a)
+    assert report["masked_frac"] < 0.01
 
 
 def test_uniform_frame_does_not_mask_itself():
     a = np.full((80, 80, 3), 250, np.uint8)
-    mask, rep = P.valid_mask(a)
-    assert mask.all() and rep["masked_frac"] == 0.0
+    mask, report = P.valid_mask(a)
+    assert mask.all() and report["masked_frac"] == 0.0
 
 
 def test_nan_holes_do_not_poison_the_output():
@@ -180,7 +143,6 @@ def test_condition_never_changes_the_grid():
     assert mask.shape == (97, 133)
 
 
-# ---------------------------------------------------------------------------
 if __name__ == "__main__":
     fns = [v for k, v in sorted(globals().items()) if k.startswith("test_")]
     failed = 0

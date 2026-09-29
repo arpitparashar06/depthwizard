@@ -1,40 +1,5 @@
 #!/usr/bin/env python
-"""run_geotiff.py - the whole pipeline in one command, no browser involved.
-
-===========================================================================
-READ THIS FIRST
-===========================================================================
-This is server.py's _run() without the HTTP around it, and it runs the SAME
-sequence, so the CLI and the UI produce the same surface:
-
-    load_image -> estimate_elevation -> refine -> clip -> export -> mesh
-                                                            -> optional scoring
-
-    python backend/run_geotiff.py <image> --tallest 40
-    python backend/run_geotiff.py <image> --gcp 120,340,18 --gcp 400,90,25
-    python backend/run_geotiff.py <image> --sun 145 52
-    python backend/run_geotiff.py <image> --tallest 40 --reference lidar.tif
-
-It writes dsm.tif, ndsm.tif, dtm.tif, terrain.glb and the figures, prints what
-the heights are measured FROM, and with --reference scores itself in the same
-run. `--help` lists everything.
-
-Use this, not `python mathsandml/inference.py`: that file's own __main__ stops
-at the rasters - no .env, no refine, no mesh.
-
-Two things it will not do quietly:
-
-  * A georeferenced image with no scale anchor never gets a made-up default.
-    alpha is metres per model unit and one number sets it for the whole
-    scene, so a guess returns confident metres anchored to nothing. With no
-    flag it looks up GHSL's building height at the image's coordinates
-    (mathsandml/ghsl.py) and says so; if GHSL cannot answer either, it stops.
-  * If the coarse DEM cannot be fetched the run still finishes, but it says so
-    in capitals: the surface is then height above LOCAL GROUND, not above sea
-    level, whatever the GeoTIFF tags claim.
-
-Add --reference <lidar.tif> to score the result in the same command.
-"""
+"""The whole pipeline in one command, no browser involved."""
 import argparse
 import os
 import sys
@@ -43,8 +8,6 @@ import time
 import numpy as np
 
 
-# mathsandml/ onto the import path, and the repo-root .env read BEFORE
-# inference is imported - it binds OPENTOPO_KEY at import time.
 from _bootstrap import load_env                                        # noqa: E402
 
 load_env()
@@ -59,7 +22,7 @@ RELATIVE_FULL_SCALE_M = 60.0
 
 
 def parse_gcps(items):
-    """--gcp row,col,height  (repeatable, needs at least two)."""
+    """Gcp row,col,height (repeatable, needs at least two)."""
     out = []
     for s in items or []:
         parts = s.split(",")
@@ -71,14 +34,14 @@ def parse_gcps(items):
 
 
 def main():
-    ap = argparse.ArgumentParser(
+    parser = argparse.ArgumentParser(
         description="single-view optical image -> DSM + navigable mesh",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter)
-    ap.add_argument("image", help="PNG/JPG (relative) or GeoTIFF with a CRS (metres)")
-    ap.add_argument("-o", "--out", default=None,
+    parser.add_argument("image", help="PNG/JPG (relative) or GeoTIFF with a CRS (metres)")
+    parser.add_argument("-o", "--out", default=None,
                     help="output directory (default: outputs/<image stem>)")
 
-    g = ap.add_argument_group("scale (georeferenced input needs exactly one)")
+    g = parser.add_argument_group("scale (georeferenced input needs exactly one)")
     g.add_argument("--tallest", type=float, default=None, metavar="M",
                    help="height of the TALLEST structure you can identify, in metres")
     g.add_argument("--height-reference", default="tallest",
@@ -107,7 +70,7 @@ def main():
                    help="multiplier on the fitted scale; feed back the value "
                         "the validation report suggests")
 
-    t = ap.add_argument_group("terrain and geometry")
+    t = parser.add_argument_group("terrain and geometry")
     t.add_argument("--no-dem", action="store_true",
                    help="skip the COP30 baseline; output becomes height above ground")
     t.add_argument("--gsd", type=float, default=0.5, metavar="M",
@@ -123,9 +86,9 @@ def main():
                    help="edge clean-up; auto = only for the zero-shot engine, "
                         "where it helps (it smears the fine-tuned model's edges)")
 
-    ap.add_argument("--reference", default=None, metavar="TIF",
+    parser.add_argument("--reference", default=None, metavar="TIF",
                     help="reference LiDAR raster - scores the result when given")
-    args = ap.parse_args()
+    args = parser.parse_args()
 
     if not os.path.exists(args.image):
         raise SystemExit(f"no such file: {args.image}")
@@ -142,20 +105,17 @@ def main():
           f"   crs={meta['crs']}   px={meta['px_size_m']}")
 
     gcps = parse_gcps(args.gcp)
-    az = el = None
+    azimuth = el = None
     prior_source, prior_info, auto_after_sun = "person", None, False
     if args.sun:
-        az, el = args.sun
+        azimuth, el = args.sun
 
     engine = resolve_engine(args.engine)
     print(f"[engine] {ENGINE_LABEL[engine]}")
     if mode == "absolute" and not engine_needs_anchor(engine):
-        # nothing to ask for: any flag given is used as a cross-check (GCPs
-        # correct the model, being measurements)
         auto_after_sun = not args.no_auto_prior
     elif mode == "absolute":
-        # The same refusal server.py makes. estimate_elevation would raise
-        # anyway; catching it here says which flag fixes it.
+        # The same refusal server.py makes.
         if not args.tallest and len(gcps) < 2 and not args.sun:
             if meta.get("sun_azimuth") is not None and meta.get("sun_elevation") is not None:
                 auto_after_sun = not args.no_auto_prior
@@ -184,7 +144,7 @@ def main():
 
     height, meta, info = estimate_elevation(
         args.image, known_height_m=args.tallest, gcps=gcps or None,
-        sun_azimuth=az, sun_elevation=el,
+        sun_azimuth=azimuth, sun_elevation=el,
         use_dem=not args.no_dem, alpha_gain=args.alpha_gain,
         rotations=args.rotations, height_reference=args.height_reference,
         fuse_scale=args.fuse_scale, outdir=out,
@@ -206,7 +166,7 @@ def main():
     do_refine = (refine_by_default(info.get("engine") or "zeroshot") if args.refine == "auto"
                  else args.refine == "on")
     if do_refine and (args.flatten or args.sharpen):
-        # the split this scene actually used, not refine's 15 m default
+        # The split this scene actually used, not refine's 15 m default
         height, rinfo = refine(height, rgb, px_size_m=px,
                                object_sigma_m=float(info.get("sigma_m") or 15.0),
                                flatten=args.flatten, sharpen=args.sharpen)
@@ -215,13 +175,8 @@ def main():
     else:
         rinfo = {}
 
-    # refine overshoots at rooflines; re-apply the no-DEM clip to the surface
-    # that is actually exported, meshed and scored
     height, info = clip_below_ground(height, info)
 
-    # The surface moved after estimate_elevation exported it, so rewrite the
-    # rasters. Otherwise dsm.tif and the mesh are two different surfaces and
-    # the validator scores one nobody ever sees.
     info = export_products(height, rgb, meta, out, info,
                            uncertainty=meta.get("_uncertainty"))
 
@@ -235,13 +190,13 @@ def main():
         rinfo.update(cinfo)
         glb = os.path.join(out, "terrain.glb")
         mesh.export(glb)
-        tris = cinfo["ground_tris"] + cinfo["roof_tris"] + cinfo["wall_tris"]
+        triangles = cinfo["ground_tris"] + cinfo["roof_tris"] + cinfo["wall_tris"]
     else:
         mesh = build_mesh(height, rgb, px_size_m=px, target_grid=args.grid,
                           z_exaggeration=args.exaggeration, style=args.style,
                           is_relative=False)
         glb = export_mesh(mesh, os.path.join(out, "terrain.glb"))
-        tris = len(mesh.faces)
+        triangles = len(mesh.faces)
 
     slope = slope_map(height, px)
     calib = info.get("calibration", "")
@@ -284,23 +239,23 @@ def main():
     if rinfo.get("n") is not None:
         print(f"buildings    {rinfo['n']} extruded, tallest "
               f"{float(rinfo.get('height_max_m', 0)):.0f} m")
-    print(f"mesh         {tris:,} triangles ({args.style}) -> {glb}")
+    print(f"mesh         {triangles:,} triangles ({args.style}) -> {glb}")
     print(f"elapsed      {time.time() - t0:.0f}s")
     print("-" * 66)
 
     if args.reference:
         import validate as V
         print("\nscoring against", args.reference)
-        rep, refarr, rgbarr = V.validate_files(
+        report, refarr, rgbarr = V.validate_files(
             os.path.join(out, "dsm.tif"), args.reference, args.image, outdir=out)
-        V.error_figures(rep, refarr, rgbarr, outdir=out)
-        V.save_report(rep, out)
-        h = rep["headline"]
+        V.error_figures(report, refarr, rgbarr, outdir=out)
+        V.save_report(report, out)
+        h = report["headline"]
         print(f"\nRMSE {h['rmse']:.2f} m   MAE {h['mae']:.2f} m   "
               f"r {h.get('r', float('nan')):.3f}   "
-              f"(alignment: {rep.get('headline_alignment', '?')})")
+              f"(alignment: {report.get('headline_alignment', '?')})")
         print(f"raw, no alignment: RMSE "
-              f"{rep['alignment']['raw']['rmse']:.2f} m")
+              f"{report['alignment']['raw']['rmse']:.2f} m")
         print("full report ->", os.path.join(out, "validation.md"))
 
     print("\noutputs in", os.path.abspath(out))

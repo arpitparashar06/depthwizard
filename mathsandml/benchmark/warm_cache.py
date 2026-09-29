@@ -1,14 +1,5 @@
 #!/usr/bin/env python3
-"""warm_cache.py - run the depth model once per image and fetch each DEM once.
-
-    python mathsandml/benchmark/warm_cache.py --scenes mathsandml/benchmark/scenes
-    python mathsandml/benchmark/warm_cache.py demo1.tif demo2.png
-
-After this, every later run over the same images - the benchmark, a sweep of
-calibration settings, a live demo with no internet - reads cache/depth,
-cache/dem and cache/ghsl instead of calling the backbone, OpenTopography or
-the GHSL server.
-"""
+"""Run the depth model once per image and fetch each DEM once."""
 import argparse
 import os
 import sys
@@ -51,17 +42,17 @@ def warm(path, dem=True, ghsl=True):
 
 
 def main():
-    ap = argparse.ArgumentParser()
-    ap.add_argument("images", nargs="*")
-    ap.add_argument("--scenes", default=None)
-    ap.add_argument("--no-dem", action="store_true")
-    ap.add_argument("--no-ghsl", action="store_true",
+    parser = argparse.ArgumentParser()
+    parser.add_argument("images", nargs="*")
+    parser.add_argument("--scenes", default=None)
+    parser.add_argument("--no-dem", action="store_true")
+    parser.add_argument("--no-ghsl", action="store_true",
                     help="skip the GHSL building-height tile")
-    a = ap.parse_args()
-    paths = list(a.images)
-    if a.scenes:
-        for n in sorted(os.listdir(a.scenes)):
-            p = os.path.join(a.scenes, n, "rgb.tif")
+    args = parser.parse_args()
+    paths = list(args.images)
+    if args.scenes:
+        for n in sorted(os.listdir(args.scenes)):
+            p = os.path.join(args.scenes, n, "rgb.tif")
             if os.path.exists(p):
                 paths.append(p)
     if not paths:
@@ -70,7 +61,7 @@ def main():
     bad = 0
     for p in paths:
         try:
-            warm(p, dem=not a.no_dem, ghsl=not a.no_ghsl)
+            warm(p, dem=not args.no_dem, ghsl=not args.no_ghsl)
         except Exception as e:
             bad += 1
             print(f"[warm] {p}: FAILED {type(e).__name__}: {e}")

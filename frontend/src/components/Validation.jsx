@@ -1,50 +1,21 @@
 import { useRef, useState } from 'react'
 
-/* ===========================================================================
- * Validation.jsx - drop a reference raster, get scored against it.
- * ===========================================================================
- *
- * This panel only appears once a run has finished. Drop a LiDAR GeoTIFF on it
- * and the backend reprojects that raster onto our grid, compares the two
- * surfaces and returns the report this file renders. All of the maths is in
- * mathsandml/validate.py; nothing here computes an accuracy number.
- *
- * WHY EVERY SCORE IS QUOTED THREE TIMES. Our surface and a reference DSM are
- * often on different vertical datums - if the coarse DEM could not be fetched,
- * ours is height above LOCAL GROUND while theirs is metres above sea level.
- * Score those against each other raw and you measure the datum, not the model.
- * Quietly subtracting the difference flatters us. So all three are shown side
- * by side and the report says which one it used as the headline:
- *
- *   raw     nothing removed - the honest number
- *   shift   one constant offset removed - normal practice between datums
- *   affine  offset AND scale removed - diagnostic only, it can hide a bad alpha
- *
- * Rendering all three is the point. Do not "simplify" this to one row.
- */
 const ALIGN = {
   raw:    ['Raw', 'nothing removed — the honest number'],
   shift:  ['Datum shift', 'one constant offset removed'],
   affine: ['Robust affine', 'offset and scale removed']
 }
 
-/* `stamp` is a cache-buster, not decoration: a second validation overwrites the
- * same five filenames in the job folder, so without a version on the URL the
- * browser serves the FIRST run's figures. See App.jsx::onReference. */
 export default function Validation ({ job, report, busy, error, onFile, fileUrl,
                                       datum, stamp, onShowError }) {
   const inputRef = useRef(null)
-  const [over, setOver] = useState(false)   // a file is being dragged over the well
+  const [over, setOver] = useState(false)
   if (!job) return null
 
-  /* Worst landscape first. "Stability across landscapes" is half of what the
-   * problem statement marks, so the band we do worst on is the one a judge
-   * should see at the top - not the one that happens to sort first by name. */
+  // Worst landscape first.
   const classes = report?.by_landscape
     ? Object.entries(report.by_landscape).sort((a, b) => (b[1].rmse || 0) - (a[1].rmse || 0))
     : []
-  // bars are scaled to the worst band, so the shape of the list IS the answer
-  // to "is it stable?" - a flat list of similar bars means yes.
   const worst = classes.length ? Math.max(...classes.map(([, v]) => v.rmse || 0)) : 1
 
   return (
@@ -56,10 +27,7 @@ export default function Validation ({ job, report, busy, error, onFile, fileUrl,
         rather than the model.
       </p>
 
-      {/* The single most important warning in the app. A local-ground surface
-          scored raw against a sea-level DSM produces an RMSE of hundreds of
-          metres that says nothing about the model, and someone WILL quote it.
-          So the panel says so before the numbers appear, not after. */}
+      {/* The single most important warning in the app. */}
       {datum === 'local ground' && (
         <p className="datum risk" style={{ marginTop: 0 }}>
           <span>
@@ -73,8 +41,6 @@ export default function Validation ({ job, report, busy, error, onFile, fileUrl,
         </p>
       )}
 
-      {/* Same .drop styling as the source-image well, deliberately: it is the
-          same gesture, so it should look like the same control. */}
       <div className={`drop${over ? ' over' : ''}`} style={{ padding: '16px 12px' }}
            onDragOver={(e) => { e.preventDefault(); setOver(true) }}
            onDragLeave={() => setOver(false)}
@@ -97,18 +63,13 @@ export default function Validation ({ job, report, busy, error, onFile, fileUrl,
               <tr><th>Alignment</th><th>RMSE</th><th>MAE</th><th>Bias</th><th>r</th></tr>
             </thead>
             <tbody>
-              {/* Fixed order, honest first. The headline row is the one
-                  validate.py chose, and it is marked rather than reordered so
-                  you can still see what the other two said. */}
+              {/* Fixed order, honest first. */}
               {['raw', 'shift', 'affine'].map((k) => {
                 const m = report.alignment?.[k]
-                if (!m) return null          // the backend may omit an alignment
+                if (!m) return null
                 const [label, sub] = ALIGN[k]
                 return (
                   <tr key={k} className={report.headline_alignment === k ? 'headline' : ''}>
-                    {/* on a local-ground run the raw row's caption is
-                        rewritten, because there its number is the datum gap
-                        and calling it "the honest number" would mislead */}
                     <td>{label}<br /><span style={{ fontSize: 11, color: 'var(--faint)' }}>
                       {k === 'raw' && datum === 'local ground' ? 'datum offset, not model error' : sub}
                     </span></td>
@@ -149,8 +110,7 @@ export default function Validation ({ job, report, busy, error, onFile, fileUrl,
             </button>
           )}
 
-          {/* the three figures validate.py wrote, each linking to itself at
-              full size. lazy, because they are large PNGs below the fold. */}
+          {/* The three figures validate.py wrote, each linking to itself at full size. */}
           <div className="figs">
             {['error_map.png', 'scatter.png', 'stability.png'].map((f) => (
               <a key={f} href={fileUrl(job.id, f, stamp)} target="_blank" rel="noreferrer">

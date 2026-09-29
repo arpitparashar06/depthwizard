@@ -1,18 +1,4 @@
 #!/usr/bin/env bash
-# One command to produce mathsandml/benchmark/results/report.md.
-#
-#   cd <the depthwizard folder> && bash mathsandml/benchmark/run_all.sh
-#
-# Options:
-#   FAST=1     use the Small backbone (~100 MB, 8-10x quicker) for a first pass
-#   SIZE=200   smaller footprint in metres if the first run feels slow
-#   SOURCES="ahn swisstopo"   which reference services to build scenes from
-#              (default: both. usgs is bare-earth only - see BENCHMARK.md)
-#   REFETCH=1  re-download scenes that already exist (hand-entered priors in
-#              scene.json are kept either way)
-#
-# Scenes that already exist are NOT downloaded again, and the depth model runs
-# once per scene - later runs read cache/depth - so a second run takes seconds.
 set -uo pipefail
 
 cd "$(dirname "${BASH_SOURCE[0]}")/../.." || exit 1   # repo root
@@ -32,11 +18,11 @@ SOURCES="${SOURCES:-${SOURCE:-ahn swisstopo}}"
 echo "== DepthWizard benchmark =="
 echo "   project : $ROOT"
 
-# --- venv -------------------------------------------------------------------
+# venv
 if [ -x ".venv/bin/python" ]; then
   PY="$ROOT/.venv/bin/python"
 elif [ -f ".venv/bin/activate" ]; then
-  # shellcheck disable=SC1091
+  # Shellcheck disable=SC1091
   source .venv/bin/activate && PY="$(command -v python3)"
 else
   echo "   no .venv found - using system python3"
@@ -51,7 +37,7 @@ else
   echo "   backbone: Large (default) - minutes per scene on CPU; FAST=1 to speed up"
 fi
 
-# --- preflight --------------------------------------------------------------
+# preflight
 echo
 echo "== 1/4 checking dependencies =="
 "$PY" - <<'EOF' || { echo "   -> pip install -r requirements.txt"; exit 1; }
@@ -84,7 +70,7 @@ for src in $SOURCES; do
         --out "$BENCH/scenes" ${REFETCH:+--force}
 done
 
-# a scene without a prior is scored as a failure, never silently
+# A scene without a prior is scored as a failure, never silently
 "$PY" - "$BENCH/scenes" <<'EOF2'
 import json, os, sys
 root = sys.argv[1]
@@ -106,9 +92,6 @@ echo "   scenes: $(ls -d "$BENCH"/scenes/*/ 2>/dev/null | wc -l | tr -d ' ')"
 
 echo
 echo "== 4/4 running the benchmark =="
-# headline: one prior per scene, read off the imagery (independent of the
-# reference). Then the same scenes again with control points sampled from the
-# reference, as a clearly labelled diagnostic, and the held-out gain test.
 "$PY" "$BENCH/run_benchmark.py" --scenes "$BENCH/scenes" --out "$BENCH/results" \
       --scale-source known-height --compare gcps-from-ref --loso-gain
 rc=$?

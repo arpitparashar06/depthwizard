@@ -1,13 +1,5 @@
 #!/usr/bin/env python3
-"""check_device.py - is the Apple-silicon GPU (MPS) safe and faster here?
-
-    python backend/check_device.py
-
-Runs the depth backbone on one 518 px tile of a real scene on the CPU and on
-MPS, and prints the time per tile and the correlation between the two outputs.
-Only switch DEPTH_DEVICE=mps on if the correlation is ~1.000 - a faster device
-that paints a different surface is not an optimisation.
-"""
+"""Is the Apple-silicon GPU (MPS) safe and faster here?"""
 import os
 import sys
 import time
@@ -39,10 +31,10 @@ def main():
         print(f"{dev}: {(time.time() - t) / 3:.2f} s per tile")
     if len(out) == 2:
         r = float(np.corrcoef(out["cpu"].ravel(), out["mps"].ravel())[0, 1])
-        rel = float(np.abs(out["cpu"] - out["mps"]).max()
+        relative = float(np.abs(out["cpu"] - out["mps"]).max()
                     / max(np.ptp(out["cpu"]), 1e-9))
-        print(f"cpu vs mps: r = {r:.6f}, worst pixel differs by {100 * rel:.3f}% of range")
-        print("MPS is safe to use (export DEPTH_DEVICE=mps)" if r > 0.9999 and rel < 0.01
+        print(f"cpu vs mps: r = {r:.6f}, worst pixel differs by {100 * relative:.3f}% of range")
+        print("MPS is safe to use (export DEPTH_DEVICE=mps)" if r > 0.9999 and relative < 0.01
               else "MPS output differs - keep the CPU")
 
 

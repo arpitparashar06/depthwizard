@@ -1,22 +1,8 @@
-/* ===========================================================================
- * Profile.jsx - the elevation profile between the two probe pins.
- * ===========================================================================
- *
- * The numbers come from the server (GET /api/jobs/:id/profile), sampled
- * bilinearly from dsm.tif, uncertainty.tif and - after a validation - the
- * reference on the same grid. Not from the mesh: the mesh is block-reduced and
- * quantised for display, and the GeoTIFF is what gets scored.
- *
- * One chart, one axis (metres). Estimate and reference share it because they
- * are the same quantity; the uncertainty is a band around the estimate, not a
- * third line. Hovering (or arrow keys on focus) moves a crosshair here AND a
- * marker on the 3D line, so a bump in the chart can be found on the terrain.
- */
 import { useEffect, useMemo, useRef, useState } from 'react'
 
 const M = { l: 52, r: 76, t: 14, b: 30 }
 const H = 230
-const SERIES = { est: '#2a78d6', ref: '#eb6834' }   // categorical slots 1 and 2, validated
+const SERIES = { est: '#2a78d6', ref: '#eb6834' }
 
 function ticks (lo, hi, n = 5) {
   const span = Math.max(hi - lo, 1e-9)
@@ -127,7 +113,7 @@ export default function Profile ({ profile, units = 'm', hover, onHover, onClear
   const rz = hi != null && hasRef ? d.reference[hi] : null
   const vr = d.vs_reference
 
-  // direct labels at the right end, nudged apart when the lines finish close
+  // Direct labels at the right end, nudged apart when the lines finish close
   let yEst = geo.lastEst != null ? geo.Y(geo.lastEst) : null
   let yRef = geo.lastRef != null ? geo.Y(geo.lastRef) : null
   if (yEst != null && yRef != null && Math.abs(yEst - yRef) < 14) {

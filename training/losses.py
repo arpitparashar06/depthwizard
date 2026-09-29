@@ -1,30 +1,4 @@
-"""
-losses.py - what HeightNet is trained to minimise.
-
-  ENGINE B (metres):
-  total = l1        per-pixel |height - LiDAR|, with LONG-TAIL WEIGHTS
-        + w_ce      soft cross-entropy over the height bins
-        + w_grad    multi-scale gradient matching (sharp building edges)
-        + w_chamfer bin centres pulled toward the heights actually present
-        + w_seg     semantic cross-entropy (GAMUS labels; skipped where absent)
-  ENGINE A (relative depth - the problem statement's workflow):
-        + w_ssi     scale-and-shift-invariant L1 (MiDaS / Depth-Anything's own
-                    training loss): prediction and LiDAR are each normalised by
-                    median and mean absolute deviation, then compared. Teaches
-                    the pretrained relative-depth head to RANK heights correctly
-                    from above, while leaving metres to the calibration module.
-        + w_ssi_grad  gradient matching on the normalised maps
-
-LONG-TAIL WEIGHTS. Most pixels are ground (0-2 m). A plain mean loss is then
-dominated by ground and the network learns to under-shoot tall buildings - the
-exact failure of the zero-shot pipeline. Every pixel is weighted by
-(frequency of its height band in this batch) ^ -power, normalised to mean 1,
-so a 40 m roof pixel counts for more than a lawn pixel. power 0.5 is a
-deliberately mild rebalancing (1.0 would be full inverse frequency).
-
-Everything is computed at the network's output resolution (half the input);
-targets are area-averaged down to it with nodata respected.
-"""
+"""What HeightNet is trained to minimise."""
 
 import torch
 import torch.nn.functional as F
@@ -78,8 +52,6 @@ def gradient_loss(pred, target, valid, scales=4):
 
 
 def chamfer_loss(centers, h, valid, n_samples=2048):
-    """Bidirectional chamfer (in log-height space) between each image's bin
-    centres and a sample of its true heights - AdaBins' bin-placement loss."""
     uc = HN.u_of(centers)                        # (B,K)
     losses = []
     for b in range(h.shape[0]):
@@ -98,8 +70,7 @@ def chamfer_loss(centers, h, valid, n_samples=2048):
 
 
 def ssi_loss(rel, h, valid, min_mad_m=0.3):
-    """Scale-and-shift-invariant L1 + gradient matching, per image. Flat tiles
-    (nothing taller than ~min_mad_m) carry no ranking to learn and are skipped."""
+    """Scale-and-shift-invariant L1 + gradient matching, per image."""
     l_abs, l_grad = [], []
     for b in range(rel.shape[0]):
         v = valid[b]
@@ -120,14 +91,13 @@ def ssi_loss(rel, h, valid, min_mad_m=0.3):
         l_grad.append(gradient_loss(pn[None], torch.where(v, tn, torch.zeros_like(tn))[None],
                                     v[None]))
     if not l_abs:
-        z = rel.float().sum() * 0.0          # keeps the graph (DDP) on flat batches
+        z = rel.float().sum() * 0.0
         return z, z
     return torch.stack(l_abs).mean(), torch.stack(l_grad).mean()
 
 
 def compute_losses(out, batch, weights=None, longtail_power=0.5):
-    """out: HeightNet.forward() dict. batch: dict(height (B,H,W) nan=nodata,
-    cls (B,H,W) long with 255 = unlabelled). Returns (total, parts dict of floats)."""
+    """Out: HeightNet.forward() dict."""
     w = dict(DEFAULT_WEIGHTS, **(weights or {}))
     pred = out["height"].float()
     size = pred.shape[-2:]
@@ -141,7 +111,7 @@ def compute_losses(out, batch, weights=None, longtail_power=0.5):
     l1 = ((pred - th).abs() * pw).sum() / denom
     parts["l1"] = l1
 
-    # soft labels over bins: a Gaussian in log-height space, one base bin wide
+    # Soft labels over bins: a Gaussian in log-height space, one base bin wide
     logits = out["logits"].float()
     uc = HN.u_of(out["centers"].float())[:, :, None, None]         # (B,K,1,1)
     ut = HN.u_of(th)[:, None]                                        # (B,1,h,w)

@@ -1,36 +1,5 @@
 #!/usr/bin/env python3
-"""
-fetch_data.py - build benchmark scenes from open LiDAR + orthophoto services.
-
-Each scene is a matched pair: a georeferenced optical image and a reference
-elevation surface over the same footprint, in the same CRS, at a comparable
-date. Everything here is open data that needs no registration, with one
-exception (ISPRS) which is handled as a manual drop-in.
-
-    python fetch_data.py --check                 probe every service, download nothing
-    python fetch_data.py --list                  show the built-in areas of interest
-    python fetch_data.py --source ahn            fetch the Dutch scenes
-    python fetch_data.py --source ahn --aoi rotterdam_centre --size-m 400
-    python fetch_data.py --source all --out benchmark/scenes
-
-Layer and coverage names are DISCOVERED from each service's GetCapabilities
-rather than hard-coded, because published names drift. If discovery fails the
-script says exactly which service and which pattern missed, so the fix is a
-one-line change to the SOURCES table below rather than a debugging session.
-
-Sources
--------
-ahn        Netherlands. AHN LiDAR DSM + DTM at 0.5 m, and the national 8 cm
-           orthophoto. Both EPSG:28992. The cleanest pairing available: true
-           LiDAR surface, dense low-rise and high-rise cities, flat farmland.
-swisstopo  Switzerland. swissSURFACE3D Raster DSM at 0.5 m + SWISSIMAGE.
-           EPSG:2056. This is where the hilly and forested rows come from.
-usgs       United States. 3DEP elevation + NAIP imagery. NOTE 3DEP is a BARE
-           EARTH model, so a USGS scene scores terrain, not building heights.
-           Useful for the hilly row, misleading for the urban one.
-isprs      Vaihingen / Potsdam. Requires a registration form, so this source
-           only verifies and normalises files you downloaded yourself.
-"""
+"""Build benchmark scenes from open LiDAR + orthophoto services."""
 
 import argparse
 import io
@@ -51,9 +20,6 @@ TIMEOUT = 120
 UA = {"User-Agent": "depthwizard-benchmark/1.0"}
 
 
-# ---------------------------------------------------------------------------
-# areas of interest:  name -> (crs, centre_x, centre_y, landscape, note)
-# ---------------------------------------------------------------------------
 AOIS = {
     "ahn": {
         "rotterdam_centre": ("EPSG:28992", 92600, 436700, "urban",
@@ -68,11 +34,9 @@ AOIS = {
     "swisstopo": {
         "zurich_centre":    ("EPSG:2056", 2683400, 1247500, "urban",
                              "mid-rise European core on a slope"),
-        # named for the region, not the relief: this footprint turned out to
-        # be chalets and meadow with only 22 m of relief, so it scores as sparse
         "interlaken_hills": ("EPSG:2056", 2633000, 1170000, "sparse",
                              "detached chalets and meadow on a gentle slope"),
-        # the genuinely steep ones - the hilly row of the marking scheme
+        # The genuinely steep ones - the hilly row of the marking scheme
         "wengen_slope":     ("EPSG:2056", 2637000, 1161750, "hilly",
                              "car-free village on a ~30% mountainside: hotels, "
                              "chalets and forest strips on real relief"),
@@ -91,15 +55,10 @@ AOIS = {
 }
 
 SOURCES = {
-    # Verified live against the running services on 2026-09-03:
-    #   WCS coverages  -> dsm_05m, dtm_05m   (AHN4, 0.5 m, EPSG:28992 only,
-    #                                         GEOTIFF only, >=10 pts/m2)
-    #   WMS layers     -> Actueel_orthoHR (8 cm), Actueel_ortho25 (25 cm)
-    #   WMS GetMap offers image/jpeg ONLY, and caps size at 2500 x 2500.
     "ahn": dict(
         wcs="https://service.pdok.nl/rws/actueel-hoogtebestand-nederland/wcs/v1_0",
         wms="https://service.pdok.nl/hwh/luchtfotorgb/wms/v1_0",
-        # priority order: the sharpest product first, a generic catch last
+        # Priority order: the sharpest product first, a generic catch last
         dsm_pat=[r"dsm[_\-]?0?5", r"\bdsm\b", r"dsm"],
         dtm_pat=[r"dtm[_\-]?0?5", r"\bdtm\b", r"dtm"],
         rgb_pat=[r"ortho.*(hr|8\s*cm)", r"actueel.*ortho", r"ortho"],
@@ -109,8 +68,6 @@ SOURCES = {
     "swisstopo": dict(
         stac="https://data.geo.admin.ch/api/stac/v0.9",
         dsm_collection="ch.swisstopo.swisssurface3d-raster",
-        # the matching LiDAR terrain model; with it the reference nDSM is a
-        # measured difference instead of a low-pass approximation
         dtm_collection="ch.swisstopo.swissalti3d",
         rgb_collection="ch.swisstopo.swissimage-dop10",
         native_px=0.5,
@@ -139,8 +96,6 @@ def bbox_from_centre(cx, cy, size_m):
 
 
 def write_geotiff(path, arr, bbox, crs, count=None):
-    """Write an array with an explicit bbox, so georeferencing never depends on
-    whatever the service chose to embed (WMS often embeds nothing)."""
     import rasterio
     from rasterio.transform import from_bounds
     a = np.asarray(arr)
@@ -159,16 +114,8 @@ def write_geotiff(path, arr, bbox, crs, count=None):
     return path
 
 
-# ---------------------------------------------------------------------------
 # OGC discovery
-# ---------------------------------------------------------------------------
 def _best(names, patterns):
-    """First name matching the first pattern that matches anything.
-
-    Patterns are a priority list, so the highest-resolution product wins over a
-    generic fallback: an 8 cm ortho and a 25 cm ortho both match /ortho/, and
-    without an order the choice would come down to XML document order.
-    """
     if isinstance(patterns, str):
         patterns = [patterns]
     for pat in patterns:
@@ -190,12 +137,7 @@ def discover_wcs(base, patterns):
 
 
 def discover_wms(base, patterns):
-    """Return (layer, all layers, GetMap formats).
-
-    The formats matter: PDOK's orthophoto WMS advertises image/jpeg and nothing
-    else, so a hard-coded image/png request comes back as a ServiceException.
-    Read what the service actually offers instead of assuming.
-    """
+    """Return (layer, all layers, GetMap formats)."""
     x = get(base, dict(SERVICE="WMS", VERSION="1.3.0",
                        REQUEST="GetCapabilities")).content
     root = ET.fromstring(x)
@@ -242,9 +184,7 @@ def wms_image(base, layer, bbox, crs, width, height, fmt="image/jpeg"):
     from PIL import Image
     r = get(base, {"SERVICE": "WMS", "VERSION": "1.3.0", "REQUEST": "GetMap",
                    "LAYERS": layer, "STYLES": "", "CRS": crs,
-                   # WMS 1.3.0 honours the CRS axis order. EPSG:28992 and
-                   # EPSG:2056 are both easting-first, so minx,miny,maxx,maxy
-                   # is correct here - EPSG:4326 would need lat first.
+                   # WMS 1.3.0 honours the CRS axis order.
                    "BBOX": ",".join(f"{v:.3f}" for v in bbox),
                    "WIDTH": width, "HEIGHT": height, "FORMAT": fmt})
     head = r.content[:2000]
@@ -253,9 +193,7 @@ def wms_image(base, layer, bbox, crs, width, height, fmt="image/jpeg"):
     return np.array(Image.open(io.BytesIO(r.content)).convert("RGB"))
 
 
-# ---------------------------------------------------------------------------
 # sources
-# ---------------------------------------------------------------------------
 def fetch_ahn(aoi, cfg, size_m, px, outdir):
     S = SOURCES["ahn"]
     crs, cx, cy, landscape, note = cfg
@@ -303,13 +241,6 @@ def fetch_swisstopo(aoi, cfg, size_m, px, outdir, parts=("dsm", "dtm", "rgb")):
     wgs = transform_bounds(crs, "EPSG:4326", *bbox, densify_pts=21)
 
     def tile_hrefs(collection, ext=(".tif", ".tiff")):
-        """Every tile covering the AOI, newest revision of each, finest GSD.
-
-        swisstopo publishes these as 1 km2 tiles, so any AOI can straddle two
-        or four of them - taking a single asset would leave blank strips. Each
-        tile is also published at several resolutions (SWISSIMAGE ships 0.1 m
-        and 2.0 m), so the asset is chosen by eo:gsd, not by document order.
-        """
         url = f"{S['stac']}/collections/{collection}/items"
         j = get(url, dict(bbox=",".join(f"{v:.6f}" for v in wgs), limit=100)).json()
         feats = j.get("features") or []
@@ -318,18 +249,18 @@ def fetch_swisstopo(aoi, cfg, size_m, px, outdir, parts=("dsm", "dtm", "rgb")):
 
         best = {}
         for f in feats:
-            cands = [(a.get("eo:gsd", 9e9), a["href"])
+            candidates = [(a.get("eo:gsd", 9e9), a["href"])
                      for a in (f.get("assets") or {}).values()
                      if a.get("href", "").lower().endswith(ext)]
-            if not cands:
+            if not candidates:
                 continue
-            cands.sort()
+            candidates.sort()
             fid = f.get("id", "")
             key = re.search(r"(\d{4}-\d{4})", fid)          # the tile's km coords
             key = key.group(1) if key else fid
             when = (f.get("properties") or {}).get("datetime") or ""
             if key not in best or when > best[key][0]:
-                best[key] = (when, cands[0][1])
+                best[key] = (when, candidates[0][1])
         if not best:
             raise RuntimeError(f"no GeoTIFF asset among {len(feats)} {collection} items")
         print(f"    {collection}: {len(best)} tile(s)")
@@ -341,7 +272,6 @@ def fetch_swisstopo(aoi, cfg, size_m, px, outdir, parts=("dsm", "dtm", "rgb")):
     n = int(round(size_m / px))
 
     def crop_mosaic(hrefs, bands):
-        """Window each remote COG onto the output grid; no whole-tile download."""
         dst_tr = from_bounds(*bbox, n, n)
         dst = np.full((bands, n, n), np.nan, np.float32)
         for href in hrefs:
@@ -382,7 +312,7 @@ def fetch_swisstopo(aoi, cfg, size_m, px, outdir, parts=("dsm", "dtm", "rgb")):
 def fetch_usgs(aoi, cfg, size_m, px, outdir):
     S = SOURCES["usgs"]
     _, lon, lat, landscape, note = cfg
-    # work in Web Mercator so size_m is metres
+    # Work in Web Mercator so size_m is metres
     from rasterio.warp import transform
     crs = "EPSG:3857"
     xs, ys = transform("EPSG:4326", crs, [lon], [lat])
@@ -412,9 +342,8 @@ def fetch_usgs(aoi, cfg, size_m, px, outdir):
 FETCHERS = dict(ahn=fetch_ahn, swisstopo=fetch_swisstopo, usgs=fetch_usgs)
 
 
-# ---------------------------------------------------------------------------
 def check():
-    """Probe every endpoint. Downloads nothing; prints what is reachable."""
+    """Probe every endpoint."""
     print("Probing services (no downloads)\n")
     ok = True
     for name, S in SOURCES.items():
@@ -454,21 +383,21 @@ def check():
 
 
 def main():
-    ap = argparse.ArgumentParser(description=__doc__,
+    parser = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("--source", default="ahn",
+    parser.add_argument("--source", default="ahn",
                     choices=["ahn", "swisstopo", "usgs", "all"])
-    ap.add_argument("--aoi", default=None, help="one area of interest by name")
-    ap.add_argument("--out", default="benchmark/scenes")
-    ap.add_argument("--size-m", type=float, default=300.0,
+    parser.add_argument("--aoi", default=None, help="one area of interest by name")
+    parser.add_argument("--out", default="benchmark/scenes")
+    parser.add_argument("--size-m", type=float, default=300.0,
                     help="square footprint in metres (300 m at 0.5 m = 600 px)")
-    ap.add_argument("--px", type=float, default=0.5, help="output GSD in metres")
-    ap.add_argument("--force", action="store_true",
+    parser.add_argument("--px", type=float, default=0.5, help="output GSD in metres")
+    parser.add_argument("--force", action="store_true",
                     help="re-download scenes that already exist (hand-entered "
                          "keys in scene.json are kept either way)")
-    ap.add_argument("--check", action="store_true")
-    ap.add_argument("--list", action="store_true")
-    args = ap.parse_args()
+    parser.add_argument("--check", action="store_true")
+    parser.add_argument("--list", action="store_true")
+    args = parser.parse_args()
 
     if args.check:
         return check()
@@ -484,7 +413,7 @@ def main():
     made, failed = [], []
 
     for src in sources:
-        for name, cfg in AOIS[src].items():
+        for name, config in AOIS[src].items():
             if args.aoi and name != args.aoi:
                 continue
             scene = f"{src}_{name}"
@@ -492,29 +421,23 @@ def main():
             have = all(os.path.exists(os.path.join(d, f))
                        for f in ("rgb.tif", "ref_dsm.tif"))
             if have and not args.force:
-                # This used to re-download every scene on every run_all.sh AND
-                # overwrite scene.json - which silently deleted the
-                # known_height_m a person had read off the ortho, so the next
-                # benchmark failed every scene with "no known_height_m".
                 print(f"\n[{scene}] already present - skipped (--force to refetch)")
                 if src == "swisstopo" and not os.path.exists(
                         os.path.join(d, "ref_dtm.tif")):
-                    # older swisstopo scenes were built before the terrain
-                    # model was fetched; add just that
                     print("    adding the swissALTI3D terrain model")
                     try:
-                        fetch_swisstopo(name, cfg, args.size_m, args.px, d,
+                        fetch_swisstopo(name, config, args.size_m, args.px, d,
                                         parts=("dtm",))
                     except Exception as e:
                         print(f"    (no DTM: {type(e).__name__}: {str(e)[:120]})")
                 made.append(scene)
                 continue
             os.makedirs(d, exist_ok=True)
-            print(f"\n[{scene}] {cfg[3]} - {cfg[4]}")
+            print(f"\n[{scene}] {config[3]} - {config[4]}")
             try:
-                info = FETCHERS[src](name, cfg, args.size_m, args.px, d)
+                info = FETCHERS[src](name, config, args.size_m, args.px, d)
                 info.update(aoi=name, size_m=args.size_m)
-                # keep what a human wrote into an existing scene.json
+                # Keep what a human wrote into an existing scene.json
                 old = {}
                 sj = os.path.join(d, "scene.json")
                 if os.path.exists(sj):
@@ -533,10 +456,6 @@ def main():
                 if info.get("known_height_m"):
                     made.append(scene)
                     continue
-                # run_benchmark refuses to invent the scale prior, and it must
-                # never come from the reference raster this scene is scored
-                # against. So a freshly fetched scene is not runnable until a
-                # human looks at the ortho and writes the number down.
                 print(f"       ACTION NEEDED: open {os.path.join(d, 'rgb.tif')} "
                       f"and add to scene.json:")
                 print(f'         "known_height_m": <height of the tallest '

@@ -4,18 +4,15 @@ outputs/
 __pycache__/
 *.pyc
 frontend/node_modules/
-# frontend/dist IS committed: a clone runs without Node. Rebuild it after
-# editing frontend/src (cd frontend && npm run build) and commit the result.
+# Frontend/dist is committed: a clone runs without Node.
 .DS_Store
 dem_coarse.tif
-# depth predictions and DEM downloads - rebuilt on demand
+# Depth predictions and DEM downloads - rebuilt on demand
 cache/
 mathsandml/benchmark/scenes/
 mathsandml/benchmark/results/
 .env
 *.bak
-# training data and runs - tens of GB, rebuilt by training/prepare_*.py
+# Training data and runs - tens of GB, rebuilt by training/prepare_*.py
 training/data/
 training/runs/
-# models/heightnet.pt: a Small checkpoint (~50 MB) fits in git; Base (~200 MB)
-# exceeds GitHub's 100 MB limit - use Git LFS or attach it to a release

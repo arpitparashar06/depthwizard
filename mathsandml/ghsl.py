@@ -1,57 +1,4 @@
-"""
-ghsl.py - an automatic height prior from the GHSL building-height grid.
-
-===========================================================================
-WHY THIS EXISTS
-===========================================================================
-Absolute mode needs one real measurement to turn relative depth into metres
-(inference.py, step 8). Until now that measurement had to come from the user:
-a landmark height, control points, or sun angles. A georeferenced image with
-none of them stopped and asked - honest, but it means a person uploading a
-GeoTIFF they know nothing about gets an error instead of a DSM.
-
-The EU Joint Research Centre's Global Human Settlement Layer publishes the
-average building height of every 100 m cell on Earth (GHS-BUILT-H R2023A,
-ANBH, epoch 2018), derived from satellite data and free to use. The image
-already carries its coordinates, so the pipeline can look up how tall the
-buildings around it are, with no input from anyone. That is exactly the kind
-of "semantic prior" the problem statement allows for scale calibration.
-
-It is a PRIOR, not a measurement of this image: 100 m cells, 2018, and a
-global model's own error. The run says where its scale came from, and a
-person's number, control points or sun angles always take precedence.
-
-===========================================================================
-WHAT IT RETURNS
-===========================================================================
-height_prior(meta) -> dict or None
-
-    known_height_m   the 95th percentile of ANBH over the built cells under the
-                     scene - "how tall is the tallest block here", the same
-                     question the landmark prior answers
-    n_cells, n_built how many 100 m cells the scene covers, and how many hold
-                     buildings
-    source           which file the numbers came from
-
-None means GHSL could not answer: no tile on disk and no network, or no
-buildings under the scene (open country, forest, water). The caller then falls
-back to asking, exactly as before.
-
-===========================================================================
-WHERE THE DATA COMES FROM
-===========================================================================
-GHSL tiles are 1000 km squares in World Mollweide (ESRI:54009), 10000 x 10000
-cells at 100 m. The tile covering a point is
-
-    column = floor((x + 18 041 000) / 1e6) + 1
-    row    = floor((9 000 000 - y) / 1e6) + 1
-
-(checked against all 375 land tiles in the GHSL tiling schema). Lookup order:
-any GeoTIFF in GHSL_DIR or cache/ghsl that covers the tile (a tile, or the
-global mosaic), then a download of the tile from the JRC server, kept in
-cache/ghsl. So each region downloads once, and after
-`warm_cache.py` a demo machine needs no network.
-"""
+"""An automatic height prior from the GHSL building-height grid."""
 import glob
 import math
 import os
@@ -68,27 +15,18 @@ MOLLWEIDE = "ESRI:54009"
 TILE_M = 1_000_000.0
 X0 = -18_041_000.0          # left edge of column 1
 Y0 = 9_000_000.0            # top edge of row 1
-N_COLS, N_ROWS = 36, 18     # column 36 is 1082 km wide: it runs to +18 041 000
+N_COLS, N_ROWS = 36, 18
 
-# A cell counts as built when its average building height clears this. The
-# real tiles floor every built cell at exactly 2.5 m: "there are buildings,
-# too low to measure". That says nothing about how tall anything is - in the
-# Andhra demo scene 36 of 64 cells sit on the floor and none above it - so a
-# prior anchored on it would squash the whole scene to 2.5 m.
 MIN_BUILT_HEIGHT_M = 3.0
 GHSL_FLOOR_M = 2.5
 # Heights above this are no-data codes or corrupt reads, not buildings.
 MAX_PLAUSIBLE_M = 500.0
-# Which built cell sets the prior. The landmark prior asks for "the tallest
-# structure you can identify"; p95 of the cell averages is the tallest block,
-# without letting one mis-classified cell set the scale for the whole scene.
+# Which built cell sets the prior.
 PRIOR_PCT = 95.0
 DOWNLOAD_TIMEOUT_S = int(os.environ.get("GHSL_TIMEOUT_S", "180"))
 
 
-# ----------------------------------------------------------------------------
 # tiles
-# ----------------------------------------------------------------------------
 def tile_id(x, y):
     """GHSL tile holding Mollweide point (x, y), e.g. 'R4_C19'."""
     c = min(int(math.floor((x - X0) / TILE_M)) + 1, N_COLS)
@@ -120,7 +58,6 @@ def search_dirs(cache_root):
 
 
 def _covers(path, bounds_moll):
-    """Does the raster at `path` cover the Mollweide box? False on any error."""
     import rasterio
     from rasterio.warp import transform_bounds
     try:
@@ -136,8 +73,6 @@ def _covers(path, bounds_moll):
 
 
 def _local_file(tid, tile_bounds, dirs):
-    """A GeoTIFF on disk for this tile: the tile itself, or anything that
-    covers it (the global mosaic, a regional clip someone prepared)."""
     for d in dirs:
         if not d or not os.path.isdir(d):
             continue
@@ -155,7 +90,6 @@ def _local_file(tid, tile_bounds, dirs):
 
 
 def _download_tile(tid, cache_dir):
-    """Fetch one tile zip, keep only its GeoTIFF. Returns the path or raises."""
     import requests
     os.makedirs(cache_dir, exist_ok=True)
     url = tile_url(tid)
@@ -186,23 +120,14 @@ def _tile_bounds(tid):
     return (left, top - TILE_M, right, top)
 
 
-# ----------------------------------------------------------------------------
 # values under the scene
-# ----------------------------------------------------------------------------
 def _read_cells(path, meta):
-    """Average building height of every 100 m cell the scene touches, in metres.
-
-    Returns a 1-D float array. Cells with no data are dropped; cells with no
-    buildings stay in as 0 so the caller can report how built-up the scene is.
-    """
     import rasterio
     from rasterio.warp import transform_bounds
     from rasterio.windows import Window, from_bounds
     with rasterio.open(path) as ds:
         l, b, r, t = transform_bounds(meta["crs"], ds.crs, *meta["bounds"],
                                       densify_pts=21)
-        # every cell the footprint touches, rounded outward by hand -
-        # Window.round_* changed signature between rasterio 1.3 and 1.4
         w = from_bounds(l, b, r, t, ds.transform)
         c0 = max(0, int(math.floor(w.col_off + 1e-9)))
         r0 = max(0, int(math.floor(w.row_off + 1e-9)))
@@ -263,11 +188,7 @@ def cell_heights(meta, cache_root, allow_download=True, log=print):
 
 def height_prior(meta, cache_root, pct=PRIOR_PCT, min_height_m=MIN_BUILT_HEIGHT_M,
                  allow_download=True, log=print):
-    """The automatic landmark height for a georeferenced scene, or None.
-
-    Returns (prior_dict_or_None, reason). The reason is always filled in so a
-    caller that has to fall back can say why.
-    """
+    """The automatic landmark height for a georeferenced scene, or None."""
     v, src = cell_heights(meta, cache_root, allow_download=allow_download, log=log)
     if v is None:
         return None, src
@@ -293,16 +214,7 @@ def height_prior(meta, cache_root, pct=PRIOR_PCT, min_height_m=MIN_BUILT_HEIGHT_
     return prior, "ok"
 
 
-# ----------------------------------------------------------------------------
-# command line: fetch the tiles for some images and print their priors
-# ----------------------------------------------------------------------------
 def _main(argv):
-    """python mathsandml/ghsl.py image.tif [more.tif ...]
-
-    Downloads (once) the GHSL tile under each georeferenced image into
-    cache/ghsl and prints the prior the pipeline would use. fetch_ghsl.command
-    runs this over the benchmark scenes and the demo image.
-    """
     import rasterio
     root = os.environ.get("DEPTHWIZARD_CACHE", os.path.join(
         os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "cache"))

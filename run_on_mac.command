@@ -1,10 +1,4 @@
 #!/bin/bash
-# Double-click this file in Finder (macOS). It opens a Terminal window and:
-#   1. fetches any missing benchmark scenes (existing ones are skipped)
-#   2. checks whether the Apple-silicon GPU gives the same depth as the CPU
-#   3. runs the depth model once per scene and downloads each DEM once, into
-#      cache/ - after that the benchmark needs neither the model nor the network
-# Everything is logged to cache/logs/mac_run.log. Safe to run again.
 cd "$(dirname "$0")" || exit 1
 mkdir -p cache/logs
 LOG="cache/logs/mac_run.log"

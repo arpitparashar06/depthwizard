@@ -1,16 +1,3 @@
-# DepthWizard - one image, no internet at run time.
-#
-#   docker build -t depthwizard .
-#   docker run --rm -p 8000:8000 depthwizard
-#   open http://localhost:8000
-#
-# Two things are baked in so the container never reaches the network:
-#   * the Depth Anything V2 checkpoint, pre-downloaded into the image
-#   * the React bundle, built at image-build time and served by FastAPI
-#
-# ---------------------------------------------------------------------------
-# stage 1: build the front end
-# ---------------------------------------------------------------------------
 FROM node:20-slim AS web
 WORKDIR /web
 COPY frontend/package*.json ./
@@ -18,9 +5,7 @@ RUN npm ci --no-audit --no-fund || npm install --no-audit --no-fund
 COPY frontend/ ./
 RUN npm run build
 
-# ---------------------------------------------------------------------------
 # stage 2: the app
-# ---------------------------------------------------------------------------
 FROM python:3.11-slim
 
 ENV PYTHONUNBUFFERED=1 \
@@ -30,8 +15,6 @@ ENV PYTHONUNBUFFERED=1 \
 
 WORKDIR /app
 
-# rasterio and opencv ship manylinux wheels with GDAL bundled; these are the
-# only system libraries OpenCV dlopens at import
 RUN apt-get update && apt-get install -y --no-install-recommends \
         libgl1 libglib2.0-0 \
     && rm -rf /var/lib/apt/lists/*
@@ -40,20 +23,16 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 RUN pip install --index-url https://download.pytorch.org/whl/cpu "torch>=2.0"
 
 COPY requirements.txt .
-# torch is installed above; installing it again from PyPI would pull the CUDA build
 RUN grep -viE '^torch' requirements.txt > /tmp/req.txt && pip install -r /tmp/req.txt
 
-# backend/ = API + CLI, mathsandml/ = the science. Nothing else is needed
-# at run time; the benchmark scenes and results are excluded by
-# .dockerignore because they are hundreds of megabytes of LiDAR.
+# Backend/ = API + CLI, mathsandml/ = the science.
 COPY backend/ ./backend/
 COPY mathsandml/ ./mathsandml/
-# the fine-tuned model (hybrid engine). Without it the app falls back to
-# the zero-shot engine below.
+# The fine-tuned model (hybrid engine).
 COPY models/ ./models/
 COPY --from=web /web/dist ./frontend/dist
 
-# bake the checkpoint in, so the first run needs no network
+# Bake the checkpoint in, so the first run needs no network
 RUN python -c "\
 from transformers import pipeline; import os; \
 pipeline('depth-estimation', model=os.environ['DEPTH_MODEL']); \

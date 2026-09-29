@@ -1,34 +1,4 @@
-"""tests.py - every bug found in review, locked down. No weights, no network.
-
-    python mathsandml/benchmark/tests.py
-
-Two parts, one process, one exit code:
-
-  PART A - REGRESSIONS. Each check names the failure it prevents and, where the
-           bug produced a wrong NUMBER, asserts against the measured value
-           rather than against "it runs".
-
-  PART B - THE DATUM GUARD. The two ways an absolute run used to lie, both of
-           them silent, which is what made them expensive:
-
-             1. server.py defaulted a missing height prior to 40 m. alpha is
-                metres per model unit and that one number sets it for the
-                entire scene, so a GeoTIFF uploaded with the field untouched
-                came back in confident metres anchored to a guess.
-                estimate_elevation was already written to refuse; the server
-                never let it.
-
-             2. fetch_dem catches its own failure and returns None, at which
-                point the surface is height above LOCAL GROUND - but dsm.tif
-                still says MODE=absolute, UNITS=metres, with a valid CRS. The
-                only trace was a print() on the server's stdout, which the
-                browser never sees. Scored against a sea-level reference that
-                reads as a huge model error.
-
-           Part B stubs the pipeline and drives the real server module, so it
-           tests the decisions rather than the depth model. It runs last
-           because it monkeypatches server's globals.
-"""
+"""Every bug found in review, locked down."""
 import os
 import sys
 import types
@@ -39,14 +9,11 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.dirname(HERE)              # mathsandml/
 REPO = os.path.dirname(ROOT)
 BACKEND = os.path.join(REPO, "backend")
-# the science, then the server that calls into it
+# The science, then the server that calls into it
 for _p in (ROOT, BACKEND):
     if _p not in sys.path:
         sys.path.insert(0, _p)
 
-# Pin the zero-shot engine: these checks were written against it, and a
-# trained checkpoint installed in models/ must not silently re-route them.
-# A24 and B6-B7 switch to the trained engines explicitly.
 os.environ["DEPTHWIZARD_ENGINE"] = "zeroshot"
 
 FAILED = []
@@ -62,20 +29,9 @@ def check(name, cond, detail=""):
 print("=" * 62)
 print("PART A - regressions")
 print("=" * 62)
-# ===========================================================================
 print("\nA1. attenuation() must recommend a gain that REDUCES error")
-# The old median(r/p) estimator recommended x2.83 on the Rotterdam tile when
-# the error-minimising gain was x0.74; applying its advice moved object-band
-# RMSE from 6.06 m to 10.83 m. Reproduced here with a surface built to a known
-# scale plus the two things that broke the estimator: misses and false
-# positives.
 import validate as V  # noqa: E402
 
-# The pathology, built explicitly. Most structure pixels are PARTIAL misses -
-# the reference has a building, the prediction has a stub. Those clear the old
-# mask (pred > 0.25*min_h) and each contributes a ratio near 10, so the median
-# of ratios lands on ~10 while the roofs that carry the actual height are only
-# 20% short. This is the shape of the real Rotterdam distribution.
 rng = np.random.default_rng(0)
 partial_ref, partial_pred = np.full(8000, 10.0), np.full(8000, 1.0)
 roof_ref, roof_pred = np.full(2000, 30.0), np.full(2000, 30.0 * 0.8)
@@ -100,8 +56,6 @@ check("suggested gain is the error-minimising one",
 check("it does not make things worse",
       band_rmse(g) <= band_rmse(1.0) + 1e-9,
       f"RMSE {band_rmse(1.0):.3f} -> {band_rmse(g):.3f}")
-# the old estimator, reproduced verbatim from the code that was replaced:
-#     m = (ref_obj > min_h) & (pred_obj > 0.25 * min_h);  median(r / p)
 old_mask = np.isfinite(pred) & np.isfinite(ref) & (ref > 2.0) & (pred > 0.5)
 legacy = float(np.median(ref[old_mask] / pred[old_mask]))
 check("the old estimator pointed somewhere much worse (bug reproduced)",
@@ -114,22 +68,19 @@ check("report carries the evidence for its own recommendation",
       {"rmse_at_gain_1", "rmse_at_suggested", "improves"} <= set(at),
       sorted(at))
 
-# a clean surface that is genuinely 0.7x should recover 1/0.7 = 1.43
+# A clean surface that is genuinely 0.7x should recover 1/0.7 = 1.43
 clean_ref = np.concatenate([np.full(4000, 20.0), np.zeros(20000)])
 at2 = V.attenuation(clean_ref * 0.7, clean_ref)
 check("recovers a known pure scale error",
       abs(at2["suggested_alpha_gain"] - 1 / 0.7) < 0.02,
       f"got {at2['suggested_alpha_gain']:.3f}, want {1/0.7:.3f}")
 
-# ===========================================================================
 print("\nA2. no spurious BLAS warnings, and singular fits never leak inf")
 import warnings  # noqa: E402
 import refine as R  # noqa: E402
 import buildings as B  # noqa: E402
 
 # The contract is: never hand back a coefficient vector that is not finite.
-# A merely rank-deficient system is fine - lstsq returns the minimum-norm
-# solution - so the guard exists for the cases that genuinely blow up.
 x = np.arange(40.0)
 cases = [("singular", np.c_[x, x, np.ones(40)], x),
          ("inf in y", np.c_[x, np.ones(40)], np.where(x == 3, np.inf, x)),
@@ -160,7 +111,6 @@ check("degenerate geometry raises no RuntimeWarning",
 out, _ = R.flatten_structures(surf, px_size_m=0.5, object_sigma_m=15.0)
 check("flatten output stays finite", bool(np.all(np.isfinite(out))))
 
-# ===========================================================================
 print("\nA3. the benchmark must refuse to calibrate from the reference")
 import json  # noqa: E402
 
@@ -169,10 +119,6 @@ check("the reference-percentile fallback is gone",
       "median of reference nDSM above p" not in src)
 check("it errors instead", "no known_height_m in scene.json" in src)
 
-# scenes/ is gitignored - it holds hundreds of megabytes of LiDAR - so a fresh
-# clone has no scenes at all. An unguarded listdir here crashed the whole suite
-# with a traceback before the later sections ran, which is the opposite of what
-# a test that advertises "no weights, no network, runs in seconds" should do.
 SCENES = os.path.join(HERE, "scenes")
 if not os.path.isdir(SCENES):
     print("  SKIP  no benchmark/scenes yet - run benchmark/fetch_data.py to "
@@ -188,7 +134,6 @@ for d in sorted(os.listdir(SCENES) if os.path.isdir(SCENES) else []):
           "NOT" in str(cfg.get("known_height_source", "")).upper(),
           cfg.get("known_height_source"))
 
-# ===========================================================================
 print("\nA4. the no-DEM clip survives refine()")
 import inference as I  # noqa: E402
 
@@ -205,7 +150,6 @@ check("below-sea-level elevations are left alone with a DEM",
       float(out2.min()) == -3.0,
       "the Netherlands is largely below NAP; clipping here would be wrong")
 
-# ===========================================================================
 print("\nA5. refine gets the split the pipeline measured, not its own default")
 for f in ("server.py", "run_geotiff.py"):
     src = open(os.path.join(BACKEND, f)).read()
@@ -213,12 +157,7 @@ for f in ("server.py", "run_geotiff.py"):
           'object_sigma_m=float(info.get("sigma_m")' in src)
     check(f"{f} re-clips after refine", "clip_below_ground(height, info)" in src)
 
-# ===========================================================================
 print("\nA6. the tile grid must not emit the same tile twice")
-# Clamping the starts AFTER deduping let two distinct starts collapse onto the
-# same clamped origin and both survive: 600x600 ran 9 tiles where 4 cover the
-# image, 2352x1222 ran 40 where 28 do. Every duplicate is a full backbone
-# forward pass, multiplied again by the rotation ensemble.
 import server as _S  # noqa: E402
 
 
@@ -243,22 +182,11 @@ for H, W, want in ((600, 600, 4), (700, 700, 4), (519, 519, 4), (2352, 1222, 28)
     check(f"{H}x{W}: the grid still covers the last row and column",
           r[-1] == max(0, H - 518) and c[-1] == max(0, W - 518), (r[-1], c[-1]))
 
-# ===========================================================================
 print("\nA7. shadow calibration must find its control points, and get the scale right")
-# Two bugs stopped this producing ANY pairs, and a third made the ones it did
-# produce too tall:
-#   * it required shadows to be elongated along the sun, so a wide block
-#     casting a shorter shadow (ratio 0.74) was rejected as "too circular";
-#   * it read the depth AT the shadow's object end, which is the pavement at
-#     the foot of the wall - exactly 0 m above ground;
-#   * it measured length across the whole shadow blob, which includes the
-#     building's own depth along the sun direction (+71% at azimuth 135).
 import inference as I2  # noqa: E402
 
 
 def _shadow_scene(az, elev, alpha_true=3.0, h_m=30.0, size=30, px=1.0):
-    """Twelve flat blocks, geometrically cast shadows, a depth field whose
-    scale is known. Recovering alpha_true is the whole test."""
     H = W = 380
     a = np.deg2rad(az)
     dc, dr = -np.sin(a), np.cos(a)
@@ -291,17 +219,13 @@ for az, elev in ((90, 45), (135, 50), (315, 60)):
           a_est is not None and abs(a_est / 3.0 - 1) < 0.10,
           f"alpha={a_est} against a true 3.0")
 
-# ===========================================================================
 print("\nA8. the held-out shadow error must be scored against its own truth")
-# e is concatenated fold by fold (idx[f::folds]); reading the truth back as
-# Y[idx[:e.size]] paired every residual with an unrelated control point.
 _X = np.linspace(1, 10, 60)
 _Y = 3.0 * _X
 _d = I2._cv_ratio(_X, _Y)
 check("a perfectly linear set has zero relative error",
       _d.get("median_rel_pct", 1) < 1e-6, _d.get("median_rel_pct"))
 
-# ===========================================================================
 print("\nA9. flipping the surface must leave a trace outside stdout")
 _info = {}
 _rgb = np.zeros((64, 64, 3), np.uint8)
@@ -317,20 +241,15 @@ I2.validate_depth(-_p, _rgb, _info2)
 check("a healthy scene records that it was checked and left alone",
       _info2.get("depth_inverted") is False, _info2)
 
-# ===========================================================================
 print("\nA10. fusing scale sources must respect how much each one is worth")
 # The point of inverse-variance fusion is that a measured source beats a guess.
-# A plain average of a validated shadow estimate and a bad landmark guess is
-# WORSE than the shadow estimate alone, which is why this is not an average.
 
 
 def _cc(**kw):
-    """{name: (alpha, sigma_rel)} -> the shape cross_check_scale returns."""
     return dict(estimates={k: v[0] for k, v in kw.items()},
                 sigma_rel={k: v[1] for k, v in kw.items()})
 
 
-# a tight source and a vague one, 50% apart: the answer must sit near the tight one
 f = I2.fuse_scale_estimates(_cc(shadow=(3.0, 0.05), prior=(4.5, 0.25)))
 check("it fuses when the sources are compatible", f.get("applied") is True, f)
 check("the tight source dominates the vague one",
@@ -342,12 +261,6 @@ check("the plain average would have been materially worse",
 check("the fused estimate is tighter than either input",
       f["alpha_sigma_rel"] < 0.05, f.get("alpha_sigma_rel"))
 
-# Equal confidence -> the geometric mean, not the arithmetic one. x2 and x0.5
-# are equally wrong for a SCALE factor, so they must cancel to 1.0; averaging
-# them linearly gives 1.25, which is biased towards the larger. max_z is lifted
-# here because these two would (rightly) trip the disagreement guard - the
-# point of this check is the arithmetic, which the next check covers in a case
-# the guard allows.
 f2 = I2.fuse_scale_estimates(_cc(a=(2.0, 0.10), b=(0.5, 0.10)), max_z=1e9)
 check("equal-weight fusion is multiplicative (x2 and x0.5 cancel to 1.0)",
       f2.get("alpha") is not None and abs(f2["alpha"] - 1.0) < 1e-9,
@@ -357,7 +270,7 @@ check("...and it holds for a pair the guard actually allows",
       abs(f2b["alpha"] - np.sqrt(2.0 * 1.8)) < 1e-9,
       f"got {f2b.get('alpha')}, want {np.sqrt(2.0*1.8):.6f}")
 
-# the guard: a gap too big for the error bars is a broken source, not noise
+# The guard: a gap too big for the error bars is a broken source, not noise
 f3 = I2.fuse_scale_estimates(_cc(shadow=(3.0, 0.05), prior=(9.0, 0.10)))
 check("it REFUSES when two sources disagree beyond their error bars",
       f3.get("applied") is False and f3.get("refused") is True, f3)
@@ -368,13 +281,13 @@ check("...and names the tightest source to fall back on",
 check("...and returns no alpha, so the caller keeps what it had",
       f3.get("alpha") is None, f3.get("alpha"))
 
-# one source is not a fusion
+# One source is not a fusion
 f4 = I2.fuse_scale_estimates(_cc(prior=(4.0, 0.25)))
 check("a single source is left alone", f4.get("applied") is False and
       f4.get("alpha") is None, f4)
 check("...and it says why", "fewer than two" in f4.get("reason", ""), f4.get("reason"))
 
-# guessed sun angles must carry a wider error bar than tags-derived ones
+# Guessed sun angles must carry a wider error bar than tags-derived ones
 d, rgb = _shadow_scene(135, 50)
 _, tag_diag = I2.alpha_from_shadows(d, rgb, 135, 50, 1.0, sun_sigma_deg=0.0)
 _, guess_diag = I2.alpha_from_shadows(d, rgb, 135, 50, 1.0,
@@ -386,26 +299,16 @@ check("a 5-degree guess costs roughly the 18% the docstring claims",
       0.12 < guess_diag["alpha_sigma_rel"] < 0.30,
       guess_diag["alpha_sigma_rel"])
 
-# ---------------------------------------------------------------------------
-# Control points fitted with a free intercept returned a NEGATIVE alpha from two
-# perfectly good points (54.3 m and 30.5 m on a synthetic scene): alpha = -123.3,
-# which inverts the whole surface. alpha multiplies (detail - ground), so a
-# ground pixel has x = 0 and must give y = 0 - the fit belongs through the
-# origin, and with two points a free intercept leaves no degrees of freedom at
-# all.
 print("\nA11. control points must fit through the origin, and never flip the scene")
 _det = np.zeros((64, 64))
 _det[10:20, 10:20] = 0.40          # a tall roof
-_det[40:50, 40:50] = 0.20          # a shorter one
-# true alpha 100: 0.40 -> 40 m, 0.20 -> 20 m
+_det[40:50, 40:50] = 0.20
+# True alpha 100: 0.40 -> 40 m, 0.20 -> 20 m
 _a, _s = I2.alpha_from_gcps(_det, [(15, 15, 40.0), (45, 45, 20.0)], with_sigma=True)
 check("two consistent points recover the known scale",
       _a is not None and abs(_a - 100.0) < 1.0, f"alpha={_a}")
 check("...and it reports an uncertainty for the fusion to weigh",
       _s is not None and 0 < _s < 1.0, _s)
-# Through the origin, two POSITIVE points can never produce a negative slope -
-# which is the whole point of the change. Points that rank backwards now yield
-# a compromise with an honestly huge error bar, instead of a confident flip.
 _a2, _s2 = I2.alpha_from_gcps(_det, [(15, 15, 20.0), (45, 45, 40.0)],
                               with_sigma=True)
 check("points that rank backwards can no longer produce a negative alpha",
@@ -413,10 +316,8 @@ check("points that rank backwards can no longer produce a negative alpha",
 check("...and their disagreement shows up as a much wider error bar",
       _a2 is None or _s2 > 5 * _s, f"consistent {_s:.3f} vs backwards {_s2:.3f}")
 
-# A control point placed BELOW local ground is the case that can still flip the
-# sum, and that one is refused outright rather than inverting the scene.
 _det2 = np.zeros((64, 64))
-_det2[10:20, 10:20] = -0.50        # a pixel the model puts below ground
+_det2[10:20, 10:20] = -0.50
 _det2[40:50, 40:50] = 0.10
 _flip = I2.alpha_from_gcps(_det2, [(15, 15, 40.0), (45, 45, 5.0)])
 check("a control point that implies a negative scale is REFUSED",
@@ -426,12 +327,11 @@ _cc_neg = dict(estimates={"gcps": -123.0, "prior": 113.0},
 check("a negative estimate never reaches the fusion",
       I2.fuse_scale_estimates(_cc_neg).get("alpha") is None)
 
-# fusion must stay OFF unless asked for
+# Fusion must stay off unless asked for
 import inspect  # noqa: E402
 check("fuse_scale defaults to off",
       inspect.signature(I2.estimate_elevation).parameters["fuse_scale"].default is False)
 
-# ===========================================================================
 print("\nA12. the depth cache: one backbone run per image, never a stale answer")
 import tempfile as _tf  # noqa: E402
 _cdir = _tf.mkdtemp(prefix="dw-cache-")
@@ -466,13 +366,12 @@ I2.predict_depth = _stub_saved
 I2._predict_depth_ensemble = _real_inner
 I2.CACHE_ROOT, I2.DEPTH_CACHE = _old_root, _old_on
 
-# the key follows the conditioning code, not only the file
+# The key follows the conditioning code, not only the file
 _f = os.path.join(_cdir, "x.png")
 from PIL import Image as _Im  # noqa: E402
 _Im.fromarray(_img).save(_f)
 check("source_key is stable for the same file", I2.source_key(_f) == I2.source_key(_f))
 
-# ===========================================================================
 print("\nA13. a cached or local DEM that covers the scene is used without a key")
 import rasterio as _rio  # noqa: E402
 from rasterio.transform import from_bounds as _fb  # noqa: E402
@@ -497,7 +396,6 @@ check("a DEM that does not cover the scene is not used",
 check("...and the reason is recorded", "no cached DEM" in _info2.get("dem_source", ""), _info2)
 I2.DEM_DIRS, I2.OPENTOPO_KEY = _old_dirs, _old_key
 
-# ===========================================================================
 print("\nA14. fetch_data never overwrites a prior someone typed into scene.json")
 import fetch_data as _FD  # noqa: E402
 _sd = _tf.mkdtemp(prefix="dw-scene-")
@@ -521,7 +419,6 @@ with open(os.path.join(_scene, "scene.json")) as _fh:
 check("an existing scene is skipped, not re-downloaded", _rc == 0)
 check("its known_height_m survives", _kept.get("known_height_m") == 40, _kept)
 
-# ===========================================================================
 print("\nA15. analysis layers and the profile read the rasters, in true units")
 import layers as _LY  # noqa: E402
 _jd = _tf.mkdtemp(prefix="dw-job-")
@@ -554,16 +451,8 @@ check("the error layer is diverging and symmetric about zero",
 check("re-writing the other layers keeps the error layer",
       "error" in {l["id"] for l in _LY.write_layers(_jd, _dsm, 0.5)})
 
-# ---------------------------------------------------------------------------
-# The prior correction must stay what was measured, and only where measured.
-# 0.80 is the amplitude ratio (reference / predicted structure spread) over the
-# seven ortho-prior LiDAR scenes. The least-squares gain the report prints
-# (~0.52) scores better only by shrinking every building toward zero, and it
-# must not creep in as the default.
 print("\nA20. the landmark-prior correction is the measured amplitude, and scoped")
 _env_gain = os.environ.get("DEPTHWIZARD_PRIOR_GAIN")
-# measured per split: none with the envelope split (amplitude ratio 1.08, a
-# held-out factor made 9 of 9 worse), 0.80 with the old Gaussian split
 check("default correction matches the split it was measured with",
       _env_gain is not None
       or abs(I2.PRIOR_GAIN - (0.80 if I2.SPLIT == "gauss" else 1.0)) < 1e-9,
@@ -574,17 +463,10 @@ check("never to a reference nobody measured",
       I2.prior_gain("typical", "person") == 1.0 and I2.prior_gain("tall") == 1.0)
 check("GHSL carries its own factor, not the person's 0.80",
       I2.prior_gain("tallest", "ghsl") == I2.GHSL_PRIOR_GAIN)
-# Measured on five LiDAR scenes: a held-out GHSL factor made 3 of 5 worse, so
-# the default is no correction at all. Keep it that way unless re-measured.
 check("GHSL's default is no correction - none transferred between scenes",
       os.environ.get("DEPTHWIZARD_GHSL_GAIN") is not None
       or I2.GHSL_PRIOR_GAIN == 1.0, I2.GHSL_PRIOR_GAIN)
 
-# ---------------------------------------------------------------------------
-# GHSL tile arithmetic. A wrong tile id downloads the wrong continent and the
-# prior comes back as "no buildings" - or worse, as someone else's buildings.
-# Column 36 is wider than the rest (it runs to +18 041 000), which is the edge
-# a naive floor() gets wrong.
 print("\nA21. GHSL: the right tile, the right cells, and an honest refusal")
 import ghsl as _GH  # noqa: E402
 from rasterio.warp import transform as _tr  # noqa: E402
@@ -601,14 +483,14 @@ check("the last column is 1082 km wide",
 check("a box across a tile edge asks for both tiles",
       _GH.tiles_for_bounds(-5000, -5000, 5000, 5000) == ["R9_C19", "R10_C19"])
 
-# a synthetic GHSL file: 10 km of Mollweide around Rotterdam, one 30 m block
+# A synthetic GHSL file: 10 km of Mollweide around Rotterdam, one 30 m block
 _gd = _tf.mkdtemp()
 _cx, _cy = _tr("EPSG:4326", _GH.MOLLWEIDE, [4.48], [51.915])
 _cx, _cy = round(_cx[0], -2), round(_cy[0], -2)
 _gh = np.zeros((100, 100), np.float32)
 _gh[48:52, 48:52] = 30.0            # the block under the scene
 _gh[48:52, 52:53] = 6.0             # a low neighbour
-_gh[0, 0] = 65535                   # a no-data code must never read as a tower
+_gh[0, 0] = 65535
 with _rio.open(os.path.join(_gd, f"{_GH.PRODUCT}_V1_0_R3_C19.tif"), "w",
                driver="GTiff", width=100, height=100, count=1, dtype="float32",
                crs=_CRS.from_string(_GH.MOLLWEIDE), nodata=65535,
@@ -627,8 +509,6 @@ _empty = dict(_scene, bounds=(_cx - 3000, _cy - 3000, _cx - 2600, _cy - 2600))
 _p0, _w0 = _GH.height_prior(_empty, _tf.mkdtemp(), allow_download=False)
 check("no buildings -> no prior, and the reason says so",
       _p0 is None and "no buildings" in _w0, _w0)
-# the real tiles floor every built cell at 2.5 m; a scene of nothing but floor
-# cells (the Andhra demo) has no height to anchor on and must say why
 _flo = np.zeros((100, 100), np.float32)
 _flo[48:52, 48:55] = 2.5
 _fd = _tf.mkdtemp()
@@ -650,24 +530,14 @@ check("no tile and no download -> no prior, and it names the fix",
 check("a relative image never asks GHSL",
       _GH.height_prior(dict(mode="relative"), _gd)[0] is None)
 
-# ---------------------------------------------------------------------------
-# The lowest histogram peak of the detail band used to be taken as the ground.
-# Where a scene has water, that peak IS the water - the depth model reads
-# canals and rivers as the lowest surface - and every street and field was
-# lifted by the difference: +11 m in Delft, +7.6 m in Zurich. The envelope
-# must put ground at ~0 whatever sits in a canal, and keep a block narrower
-# than its window at full height.
 print("\nA22. ground comes from an envelope, not from the lowest histogram peak")
 _g = np.zeros((200, 200))
-_g[:, 90:130] = -8.0                 # a 20 m canal, read lower than the ground
+_g[:, 90:130] = -8.0
 _g[20:60, 20:60] = 10.0              # a 20 m block at 0.5 m/px
 _g += 0.3 * np.random.default_rng(0).standard_normal(_g.shape)
 _env = I2.ground_envelope(_g, 0.5)
 _h = _g - _env
 _street = np.zeros_like(_g, bool); _street[120:190, 20:80] = True
-# Next to water wider than a few % of the window the envelope still dips a
-# little (measured on Delft: 2.4 m left of the old 11 m), so the check is
-# "small, and far smaller than before", not "zero".
 _old = (_g - I2.gaussian_filter(_g, 30)); _old = _old - I2.ground_level(_old)
 _lift_new = float(np.median(_h[_street])); _lift_old = float(np.median(_old[_street]))
 check("streets beside a canal are no longer lifted by the canal depth",
@@ -678,10 +548,6 @@ check("a block narrower than the window keeps its height",
 check("the envelope is the default split", I2.SPLIT == "envelope"
       or os.environ.get("DEPTHWIZARD_SPLIT") is not None, I2.SPLIT)
 
-# ---------------------------------------------------------------------------
-# The DEM debias is an opening 200 m wide. On real relief it cut hilltops off
-# with the rooftops: terrain shape error went 1.95 -> 5.82 m in the Jura and
-# 5.49 -> 7.33 m in Zurich. It is now capped at DEM_DEBIAS_MAX_M.
 print("\nA23. the DEM debias removes rooftops but never real relief")
 _yy, _xx = np.mgrid[0:300, 0:300]
 _hill = 60.0 * np.exp(-((_xx - 150) ** 2 + (_yy - 150) ** 2) / (2 * 40.0 ** 2))
@@ -695,10 +561,6 @@ check("rooftop clutter on flat ground still comes off",
       float(np.median(_deb[40:60, 40:70])) < 1.5, float(np.median(_deb[40:60, 40:70])))
 
 
-# ---------------------------------------------------------------------------
-# The trained engine. A tiny random-weight HeightNet exercises every line the
-# real one does (same class, same checkpoint format, same predictor) - these
-# check the plumbing and the promises, not accuracy.
 print("\nA24. the trained engines: A, B and A+B - metres honestly, fallbacks honestly")
 try:
     import torch  # noqa: F401
@@ -714,9 +576,6 @@ if _have_torch:
     from PIL import Image as _Im
     _tmp = tempfile.mkdtemp(prefix="hn_tests_")
     torch.manual_seed(0)
-    # two tiny random-weight models, same class and checkpoint format as the
-    # real one: "flat" has an empty relative output (a random ReLU head), "rel"
-    # has a varying one, so both branches of the hybrid get exercised
     _ck = os.path.join(_tmp, "tiny.pt")
     HN.save_checkpoint(_ck, HN.build(da_config=HN.tiny_da_config()), "tiny")
     _mr = HN.build(da_config=HN.tiny_da_config())
@@ -764,7 +623,7 @@ if _have_torch:
           float(np.abs(np.rot90(_a) - _b).max()) < 1e-3,
           float(np.abs(np.rot90(_a) - _b).max()))
 
-    # the combining maths, on answers known exactly
+    # The combining maths, on answers known exactly
     _det = np.zeros((200, 200)); _det[50:100, 50:100] = 3.0; _det[120:140, 20:180] = 1.0
     check("learned prior recovers a known scale exactly",
           abs(HN.learned_scale(_det, 7.5 * _det) - 7.5) < 1e-9)
@@ -782,7 +641,7 @@ if _have_torch:
     check("stacked fusion: one weight per band of B's height, B alone for towers",
           np.allclose(_fh3, [5.5, 6.25, 20.0, 40.0]) and np.allclose(_wb3, [0.5, 0.75, 1, 1]),
           (_fh3, _wb3))
-    # a checkpoint that a browser unzipped into a folder still loads
+    # A checkpoint that a browser unzipped into a folder still loads
     import zipfile as _zf
     _dirck = os.path.join(_tmp, "unzipped.pt")
     with _zf.ZipFile(_ck) as _z:
@@ -799,7 +658,7 @@ if _have_torch:
               torch.equal(x, y) for x, y in zip(_m1.state_dict().values(),
                                                 _m2.state_dict().values())))
 
-    # a georeferenced scene with NO scale source
+    # A georeferenced scene with no scale source
     _tif = os.path.join(_tmp, "geo.tif")
     with rasterio.open(_tif, "w", driver="GTiff", width=200, height=160, count=3,
                        dtype="uint8", crs="EPSG:28992",
@@ -874,7 +733,7 @@ print("=" * 62)
 print("PART B - the datum guard")
 print("=" * 62)
 
-# the same server module part A borrowed _tile_count from, now driven for real
+# The same server module part A borrowed _tile_count from, now driven for real
 import server as S  # noqa: E402
 
 RGB = np.zeros((32, 32, 3), np.uint8)

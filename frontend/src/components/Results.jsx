@@ -1,6 +1,4 @@
-/* Friendly names for the products. The raw filenames are correct but opaque -
- * "ndsm.tif" tells a judge nothing, "height above ground" tells them what the
- * layer is for. The filename stays visible underneath. */
+// Friendly names for the products.
 const FILES = {
   'dsm.tif':         ['Surface model', 'top of everything · DSM'],
   'ndsm.tif':        ['Height above ground', 'buildings and canopy · nDSM'],
@@ -54,9 +52,7 @@ function Datum ({ res }) {
 export default function Results ({ res, job, fileUrl, extraFiles = [] }) {
   if (!res) return null
   const u = res.datum === 'relative' ? 'm*' : 'm'
-  // res.files is the folder listing as it stood when the run finished. The
-  // validator writes five more files into it afterwards, so they are merged in
-  // here rather than being undownloadable until the page is reloaded.
+  // Res.files is the folder listing as it stood when the run finished.
   const files = [...new Set([...(res.files || []), ...extraFiles])]
     .filter((f) => !f.startsWith('source'))
     .sort()

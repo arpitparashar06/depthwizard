@@ -1,30 +1,5 @@
 #!/usr/bin/env python3
-"""
-prepare_lidar.py - Dutch (AHN4) and Swiss (swissSURFACE3D) LiDAR tiles for
-the landscapes GAMUS does not have: forest, farmland, hills and mountains,
-plus European towns.
-
-GAMUS is five US cities. The marking scheme scores urban, sparse, hilly and
-forested scenes, and a model that has only ever seen American downtowns has
-no reason to get a Swiss mountainside or a Dutch pine plantation right. These
-tiles close that gap. Same open services the benchmark uses (fetch_data.py),
-so no account and no key:
-
-  Netherlands  AHN4 DSM + DTM at 0.5 m (PDOK WCS) + national orthophoto (WMS)
-  Switzerland  swissSURFACE3D raster (DSM) + swissALTI3D (DTM) at 0.5 m +
-               SWISSIMAGE, all from the swisstopo STAC API
-
-Target = DSM - DTM = height above ground, the same quantity GAMUS labels.
-
-THE BENCHMARK STAYS UNSEEN. Every sampled tile centre must be at least
---exclude-km (default 3 km) from every benchmark scene in fetch_data.AOIS, and
-whole regions are reserved for validation. A model is never trained within
-sight of what it is scored on.
-
-    python prepare_lidar.py --out /kaggle/working/data/lidar
-    python prepare_lidar.py --out data/lidar --per-region 5     # quick look
-    python prepare_lidar.py --list                              # regions only
-"""
+"""Dutch (AHN4) and Swiss (swissSURFACE3D) LiDAR tiles for the landscapes GAMUS"""
 
 import argparse
 import math
@@ -44,13 +19,8 @@ sys.path.insert(0, os.path.join(os.path.dirname(HERE), "mathsandml"))
 sys.path.insert(0, os.path.join(os.path.dirname(HERE), "mathsandml", "benchmark"))
 import data as D  # noqa: E402
 
-# name: (source, centre_x, centre_y, radius_m, landscape, split)
-# Coordinates in the national grid: EPSG:28992 (RD New) for NL, EPSG:2056
-# (LV95) for CH. Centres are approximate on purpose - tiles are sampled at
-# random inside the radius and anything over sea, lake or outside coverage
-# is rejected by the quality checks.
 REGIONS = {
-    # --- Netherlands: AHN4 ------------------------------------------------
+    # Netherlands: AHN4
     "amsterdam_zuidas":     ("ahn", 120000, 484500, 2000, "urban", "train"),
     "den_haag_centre":      ("ahn", 81000, 455000, 1500, "urban", "train"),
     "utrecht_centre":       ("ahn", 136000, 456000, 2000, "urban", "train"),
@@ -64,7 +34,7 @@ REGIONS = {
     "zeeland_farmland":     ("ahn", 50000, 390000, 6000, "sparse", "train"),
     "groningen_farmland":   ("ahn", 242000, 594000, 6000, "sparse", "val"),
     "zuid_limburg_hills":   ("ahn", 189000, 311000, 5000, "hilly", "train"),
-    # --- Switzerland: swisstopo --------------------------------------------
+    # Switzerland: swisstopo
     "bern_centre":          ("swisstopo", 2600500, 1199700, 1500, "urban", "train"),
     "basel_centre":         ("swisstopo", 2611300, 1267300, 1500, "urban", "train"),
     "lausanne_centre":      ("swisstopo", 2538200, 1152600, 1500, "urban", "train"),
@@ -123,9 +93,6 @@ def sample_centres(regions, per_region, tile_m, exclude_km, seed=0):
     return out
 
 
-# ----------------------------------------------------------------------------
-# fetching (the benchmark's own, verified service code)
-# ----------------------------------------------------------------------------
 _AHN_NAMES = {}
 
 
@@ -157,16 +124,16 @@ def _stac_hrefs(collection, bbox, crs):
     j = FD.get(url, dict(bbox=",".join(f"{v:.6f}" for v in wgs), limit=100)).json()
     best = {}
     for f in j.get("features") or []:
-        cands = [(a.get("eo:gsd", 9e9), a["href"]) for a in (f.get("assets") or {}).values()
+        candidates = [(a.get("eo:gsd", 9e9), a["href"]) for a in (f.get("assets") or {}).values()
                  if a.get("href", "").lower().endswith((".tif", ".tiff"))]
-        if not cands:
+        if not candidates:
             continue
-        cands.sort()
+        candidates.sort()
         key = re.search(r"(\d{4}-\d{4})", f.get("id", ""))
         key = key.group(1) if key else f.get("id", "")
         when = (f.get("properties") or {}).get("datetime") or ""
         if key not in best or when > best[key][0]:
-            best[key] = (when, cands[0])
+            best[key] = (when, candidates[0])
     if not best:
         raise RuntimeError(f"STAC: nothing for {collection}")
     return [c for _, c in best.values()]          # [(gsd, href)]
@@ -179,8 +146,6 @@ def _mosaic(hrefs, bbox, crs, n, bands, px):
     dst_tr = from_bounds(*bbox, n, n)
     dst = np.full((bands, n, n), np.nan, np.float32)
     for gsd, href in hrefs:
-        # read a COG overview near the target GSD instead of the 10 cm original
-        # (a 1 km SWISSIMAGE tile is 10000 x 10000 px at full resolution)
         level = -1
         g = float(gsd) if gsd and gsd < 9e8 else px
         while g * 2 ** (level + 2) <= px * 1.01:
@@ -220,9 +185,6 @@ def fetch_swisstopo_tile(cx, cy, size_m, px, outdir):
     FD.write_geotiff(os.path.join(outdir, "rgb.tif"), rgb, bbox, crs)
 
 
-# ----------------------------------------------------------------------------
-# folder of rgb.tif / ref_dsm.tif / ref_dtm.tif  ->  one training tile
-# ----------------------------------------------------------------------------
 def _read(path, band_count=None):
     import rasterio
     with rasterio.open(path) as ds:
@@ -250,15 +212,12 @@ def fill_nearest(a):
 
 
 def ndsm_from(dsm, dtm):
-    """Height above ground. AHN leaves both rasters empty on water, and the DTM
-    empty under buildings: water becomes 0 m (true, and exactly the trap the
-    zero-shot pipeline fell into), building footprints get the ground filled
-    in from the nearest street."""
+    """Height above ground."""
     water = ~np.isfinite(dsm) & ~np.isfinite(dtm)
     ground = fill_nearest(dtm)
     h = dsm - ground
     h[water] = 0.0
-    h[h < -1.5] = np.nan                  # a real DSM is never far below its DTM
+    h[h < -1.5] = np.nan
     return np.where(np.isfinite(h), np.clip(h, 0, 400), np.nan).astype(np.float32), water
 
 
@@ -268,23 +227,23 @@ def convert_folder(folder, out, entry, quality=95):
     dsm = _read(os.path.join(folder, "ref_dsm.tif"))[0]
     dtm = _read(os.path.join(folder, "ref_dtm.tif"))[0]
     h, water = ndsm_from(dsm, dtm)
-    # quality gates
+    # Quality gates
     lum = rgb.mean(2)
     blank = float(((lum < 4) | (rgb.min(2) > 250)).mean())
     valid = float(np.isfinite(h).mean())
-    wfrac = float(water.mean())
+    water_fraction = float(water.mean())
     reason = None
     if blank > 0.15:
-        reason = "blank image"          # outside the orthophoto coverage
+        reason = "blank image"
     elif valid < 0.8:
         reason = "missing height"
-    elif wfrac > 0.5:
+    elif water_fraction > 0.5:
         reason = "mostly water"
     if reason:
         return None, reason
     rp, hp, cp = D.write_tile(out, entry["split"], entry["id"], rgb, h, None, jpeg_q=quality)
     v = h[np.isfinite(h)]
-    e = dict(entry, rgb=rp, height=hp, cls=None, valid=valid, water=wfrac,
+    e = dict(entry, rgb=rp, height=hp, cls=None, valid=valid, water=water_fraction,
              h_p50=float(np.percentile(v, 50)), h_p99=float(np.percentile(v, 99)),
              h_max=float(v.max()))
     return e, None
@@ -292,8 +251,8 @@ def convert_folder(folder, out, entry, quality=95):
 
 def work(rec, out, tile_m, px, quality):
     fetchers = {"ahn": fetch_ahn_tile, "swisstopo": fetch_swisstopo_tile}
-    hp = os.path.join(out, rec["split"], f"{rec['id']}_h.png")
-    if os.path.exists(hp):
+    height_path = os.path.join(out, rec["split"], f"{rec['id']}_h.png")
+    if os.path.exists(height_path):
         return dict(rec, rgb=os.path.join(rec["split"], f"{rec['id']}_rgb.jpg"),
                     height=os.path.join(rec["split"], f"{rec['id']}_h.png"),
                     cls=None, gsd=px), None
@@ -313,35 +272,35 @@ def work(rec, out, tile_m, px, quality):
 
 
 def main():
-    ap = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
-    ap.add_argument("--out", default=None)
-    ap.add_argument("--per-region", type=int, default=35)
-    ap.add_argument("--tile-m", type=float, default=512.0)
-    ap.add_argument("--px", type=float, default=0.5)
-    ap.add_argument("--exclude-km", type=float, default=3.0)
-    ap.add_argument("--sources", default="ahn,swisstopo")
-    ap.add_argument("--workers", type=int, default=6)
-    ap.add_argument("--seed", type=int, default=0)
-    ap.add_argument("--jpeg-quality", type=int, default=95)
-    ap.add_argument("--list", action="store_true")
-    a = ap.parse_args()
+    parser = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
+    parser.add_argument("--out", default=None)
+    parser.add_argument("--per-region", type=int, default=35)
+    parser.add_argument("--tile-m", type=float, default=512.0)
+    parser.add_argument("--px", type=float, default=0.5)
+    parser.add_argument("--exclude-km", type=float, default=3.0)
+    parser.add_argument("--sources", default="ahn,swisstopo")
+    parser.add_argument("--workers", type=int, default=6)
+    parser.add_argument("--seed", type=int, default=0)
+    parser.add_argument("--jpeg-quality", type=int, default=95)
+    parser.add_argument("--list", action="store_true")
+    args = parser.parse_args()
 
-    srcs = {s.strip() for s in a.sources.split(",")}
+    srcs = {s.strip() for s in args.sources.split(",")}
     regions = {k: v for k, v in REGIONS.items() if v[0] in srcs}
-    recs = sample_centres(regions, a.per_region, a.tile_m, a.exclude_km, a.seed)
-    if a.list or not a.out:
+    records = sample_centres(regions, args.per_region, args.tile_m, args.exclude_km, args.seed)
+    if args.list or not args.out:
         for name, (src, cx, cy, rad, land, split) in regions.items():
-            n = sum(r["region"] == name for r in recs)
+            n = sum(r["region"] == name for r in records)
             print(f"  {name:22s} {src:9s} {land:7s} {split:5s} {n:3d} tiles  ({cx}, {cy}) r={rad} m")
-        print(f"{len(recs)} tile centres; benchmark scenes excluded within {a.exclude_km:g} km")
+        print(f"{len(records)} tile centres; benchmark scenes excluded within {args.exclude_km:g} km")
         return
-    os.makedirs(a.out, exist_ok=True)
-    print(f"[lidar] {len(recs)} tiles of {a.tile_m:g} m at {a.px:g} m/px from "
+    os.makedirs(args.out, exist_ok=True)
+    print(f"[lidar] {len(records)} tiles of {args.tile_m:g} m at {args.px:g} m/px from "
           f"{len(regions)} regions", flush=True)
     entries, rejected, failed = [], {}, 0
     t0 = time.time()
-    with ThreadPoolExecutor(a.workers) as ex:
-        futs = {ex.submit(work, r, a.out, a.tile_m, a.px, a.jpeg_quality): r for r in recs}
+    with ThreadPoolExecutor(args.workers) as ex:
+        futs = {ex.submit(work, r, args.out, args.tile_m, args.px, args.jpeg_quality): r for r in records}
         for n, f in enumerate(as_completed(futs), 1):
             r = futs[f]
             try:
@@ -354,13 +313,13 @@ def main():
                 failed += 1
                 print(f"[lidar] FAILED {r['id']}: {type(ex_).__name__}: {str(ex_)[:160]}",
                       flush=True)
-            if n % 25 == 0 or n == len(recs):
+            if n % 25 == 0 or n == len(records):
                 rate = n / max(time.time() - t0, 1e-6)
-                print(f"[lidar] {n}/{len(recs)}  kept {len(entries)}  rejected "
+                print(f"[lidar] {n}/{len(records)}  kept {len(entries)}  rejected "
                       f"{sum(rejected.values())}  failed {failed}  "
-                      f"eta {(len(recs) - n) / max(rate, 1e-6) / 60:.0f} min", flush=True)
-                D.save_index(a.out, entries, dataset="AHN4 + swisstopo")
-    D.save_index(a.out, sorted(entries, key=lambda e: e["id"]), dataset="AHN4 + swisstopo")
+                      f"eta {(len(records) - n) / max(rate, 1e-6) / 60:.0f} min", flush=True)
+                D.save_index(args.out, entries, dataset="AHN4 + swisstopo")
+    D.save_index(args.out, sorted(entries, key=lambda e: e["id"]), dataset="AHN4 + swisstopo")
     by = {}
     for e in entries:
         k = f"{e['source']}/{e['landscape']}/{e['split']}"

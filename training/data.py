@@ -1,29 +1,4 @@
-"""
-data.py - training tiles on disk, and the Dataset that feeds HeightNet.
-
-TILE FORMAT (written by prepare_gamus.py and prepare_lidar.py)
-    <root>/index.json            {"format": "depthwizard-tiles-v1", "tiles": [...]}
-    <root>/<split>/<id>_rgb.jpg  8-bit RGB
-    <root>/<split>/<id>_h.png    16-bit, height above ground in CENTIMETRES,
-                                 65535 = no data
-    <root>/<split>/<id>_cls.png  8-bit class index (GAMUS order), 255 = none
-                                 (optional - LiDAR tiles have no labels)
-Each tile record: id, split, rgb, height, cls (or null), gsd (m/px), source,
-region, landscape.
-
-WHAT THE TRAINING DATASET DOES TO EACH SAMPLE
-    1. pick a tile, weighted by source (--mix) so GAMUS cannot drown the
-       forest and mountain tiles
-    2. pick a ground sample distance log-uniformly in [0.30, 1.20] m and
-       resample the tile to it - the model sees every GSD and is TOLD which
-    3. random 518 px crop, random 90-degree rotation and flip
-    4. photometric: brightness, contrast, saturation, gamma, haze, blur,
-       sensor noise, JPEG, occasional greyscale - aerial orthophotos made to
-       look like the satellite images the app will actually get
-    5. half the time, the pipeline's own conditioning (preprocess.condition:
-       band stretch + CLAHE) so the model is at home with what inference
-       hands it
-"""
+"""Training tiles on disk, and the Dataset that feeds HeightNet."""
 
 import json
 import math
@@ -40,25 +15,23 @@ NODATA_CM = 65535
 cv2.setNumThreads(0)
 
 
-# ----------------------------------------------------------------------------
 # reading / writing tiles
-# ----------------------------------------------------------------------------
 def write_tile(root, split, tid, rgb, height_m, cls=None, jpeg_q=95):
-    """rgb uint8 HxWx3, height_m float (nan = no data), cls uint8 or None."""
+    """Rgb uint8 HxWx3, height_m float (nan = no data), cls uint8 or None."""
     d = os.path.join(root, split)
     os.makedirs(d, exist_ok=True)
-    rp = os.path.join(split, f"{tid}_rgb.jpg")
-    hp = os.path.join(split, f"{tid}_h.png")
-    cv2.imwrite(os.path.join(root, rp), cv2.cvtColor(rgb, cv2.COLOR_RGB2BGR),
+    rgb_path = os.path.join(split, f"{tid}_rgb.jpg")
+    height_path = os.path.join(split, f"{tid}_h.png")
+    cv2.imwrite(os.path.join(root, rgb_path), cv2.cvtColor(rgb, cv2.COLOR_RGB2BGR),
                 [cv2.IMWRITE_JPEG_QUALITY, int(jpeg_q)])
     h = np.where(np.isfinite(height_m), np.clip(height_m, 0, 655.0) * 100.0, NODATA_CM)
-    cv2.imwrite(os.path.join(root, hp), np.round(h).astype(np.uint16),
+    cv2.imwrite(os.path.join(root, height_path), np.round(h).astype(np.uint16),
                 [cv2.IMWRITE_PNG_COMPRESSION, 6])
     cp = None
     if cls is not None:
         cp = os.path.join(split, f"{tid}_cls.png")
         cv2.imwrite(os.path.join(root, cp), cls.astype(np.uint8))
-    return rp, hp, cp
+    return rgb_path, height_path, cp
 
 
 def read_rgb(path):
@@ -112,9 +85,7 @@ def gather(roots, splits):
     return out
 
 
-# ----------------------------------------------------------------------------
 # augmentation
-# ----------------------------------------------------------------------------
 def resize_height(h, size):
     """Nodata-aware area/linear resize of a float height map to (w, h) size."""
     valid = np.isfinite(h).astype(np.float32)
@@ -129,29 +100,29 @@ def resize_height(h, size):
 
 def photometric(img, rng):
     x = img.astype(np.float32)
-    # brightness / contrast
+    # Brightness / contrast
     a = rng.uniform(0.75, 1.25)
     b = rng.uniform(-20, 20)
     x = x * a + b + (x.mean() * (1 - a)) * rng.uniform(0, 1)
-    # saturation / hue
+    # Saturation / hue
     if rng.random() < 0.8:
         hsv = cv2.cvtColor(np.clip(x, 0, 255).astype(np.uint8), cv2.COLOR_RGB2HSV).astype(np.float32)
         hsv[..., 1] *= rng.uniform(0.6, 1.3)
         hsv[..., 0] = (hsv[..., 0] + rng.uniform(-6, 6)) % 180
         x = cv2.cvtColor(np.clip(hsv, 0, 255).astype(np.uint8), cv2.COLOR_HSV2RGB).astype(np.float32)
-    # gamma
+    # Gamma
     if rng.random() < 0.5:
         g = rng.uniform(0.8, 1.25)
         x = 255.0 * (np.clip(x, 0, 255) / 255.0) ** g
-    # haze (atmosphere seen from orbit)
+    # Haze (atmosphere seen from orbit)
     if rng.random() < 0.25:
         t = rng.uniform(0.05, 0.35)
         x = x * (1 - t) + t * rng.uniform(170, 235)
-    # blur (lower effective resolution than the GSD claims)
+    # Blur (lower effective resolution than the GSD claims)
     if rng.random() < 0.35:
         s = rng.uniform(0.3, 1.3)
         x = cv2.GaussianBlur(x, (0, 0), s)
-    # sensor noise
+    # Sensor noise
     if rng.random() < 0.3:
         x = x + rng.normal(0, rng.uniform(1, 6), x.shape)
     x = np.clip(x, 0, 255).astype(np.uint8)
@@ -186,11 +157,9 @@ def parse_mix(s):
     return out
 
 
-# ----------------------------------------------------------------------------
 # datasets
-# ----------------------------------------------------------------------------
 class TrainTiles(torch.utils.data.Dataset):
-    """Random crops, random GSD, heavy augmentation. Length = samples per 'epoch'."""
+    """Random crops, random GSD, heavy augmentation."""
 
     def __init__(self, tiles, length=10000, crop=HN.TILE, gsd_range=(HN.GSD_MIN, HN.GSD_MAX),
                  mix=None, condition_p=0.5, max_upsample=1.5, seed=0):
@@ -199,8 +168,6 @@ class TrainTiles(torch.utils.data.Dataset):
         self.tiles, self.length, self.crop = tiles, int(length), int(crop)
         self.gsd_range, self.condition_p = gsd_range, condition_p
         self.max_upsample, self.seed = max_upsample, seed
-        # per-tile sampling weight: the source share from `mix`, split evenly
-        # across that source's tiles (and across landscapes inside a source)
         mix = mix or {}
         by_src = {}
         for i, t in enumerate(tiles):
@@ -227,7 +194,7 @@ class TrainTiles(torch.utils.data.Dataset):
             t = self.tiles[rng.choice(len(self.tiles), p=self.p)]
             try:
                 return self._sample(t, rng)
-            except Exception as e:          # a corrupt tile must not kill a 10 h run
+            except Exception as e:
                 print(f"[data] skipping {t.get('id')}: {e}")
         raise RuntimeError("five unreadable tiles in a row - check the data")
 

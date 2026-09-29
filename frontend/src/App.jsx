@@ -1,36 +1,3 @@
-/* ===========================================================================
- * App.jsx - the whole interface. Left panel sets up a run, right panel shows it.
- * ===========================================================================
- *
- * READ THIS FIRST. There is one piece of state that matters, `job`, and one
- * path through the file:
- *
- *   1. <Dropzone>          the user picks an image            -> file
- *   2. the control panel   scale source, geometry, advanced   -> params
- *   3. run()               POST /api/jobs, then pollJob() asks the server for
- *                          status about once a second until it says done
- *   4. job.result arrives  -> <Viewer> loads terrain.glb and you can fly
- *                          -> the layer switcher swaps the photo for height,
- *                             slope, uncertainty or (after validation) error
- *                          -> two probe pins -> <Profile>, exact heights along
- *                             the line, read from the GeoTIFFs by the server
- *                          -> <Results> lists the numbers and the downloads
- *                          -> <Validation> optionally scores it against LiDAR
- *
- * Everything that talks to the backend is in api.js. Everything that draws 3D
- * is in Viewer.jsx. This file is the wiring between them.
- *
- * THE ONE RULE THE UI ENFORCES: a georeferenced image never runs on a made-up
- * scale, because alpha (metres per model unit) is one number that sets every
- * elevation in the scene. With the height left empty the server looks up
- * GHSL's building height at the image's coordinates and labels the result as
- * a prior; only if that fails too does it stop and ask. See server.py.
- *
- * LAYOUT, top to bottom: <AmbientBackground> (decoration only) -> a sticky
- * nav bar -> the hero -> a two-column grid, controls on the left and output
- * on the right. The hero is a headline and one sentence; there is deliberately
- * no marketing strip of feature pills, because the panel below it is the demo.
- */
 import { useCallback, useEffect, useRef, useState } from 'react'
 import Viewer from './Viewer.jsx'
 import Dropzone from './components/Dropzone.jsx'
@@ -41,14 +8,6 @@ import AmbientBackground from './components/AmbientBackground.jsx'
 import Profile from './components/Profile.jsx'
 import { createJob, pollJob, fileUrl, validateJob, getLayers, getProfile, getProbe } from './api.js'
 
-/* Every key here is sent to the backend verbatim as the job's params, so this
- * object doubles as the list of what the API accepts - server.py reads the
- * same names.
- *
- * known_height_m starts EMPTY on purpose. alpha is metres per model unit and
- * this one number sets it for the whole scene, so it is never defaulted here:
- * empty means "use the GHSL building height for this place" (auto_prior),
- * and a person's number always overrides that. */
 const DEFAULTS = {
   style: 'city',
   gsd_m: 0.5,
@@ -66,33 +25,22 @@ const DEFAULTS = {
   target_grid: 256
 }
 
-/* [id, button label, the hint shown under the segmented control] */
+// [id, button label, the hint shown under the segmented control]
 const STYLES = [
   ['city', 'City', 'Footprints extruded as separate prisms'],
   ['stepped', 'Stepped', 'One surface with real vertical walls'],
   ['smooth', 'Smooth', 'Plain heightfield grid']
 ]
 
-/* All three of these are in the backend and in run_geotiff.py; only the first
- * used to be reachable from here, which made the other two invisible to anyone
- * who never opened the CLI. They are independent of each other - shadow length
- * is photogrammetry, control points are survey, a landmark height is human
- * knowledge - and the run cross-checks whichever ones it can. */
 const SCALE_SOURCES = [
   ['known_height', 'Landmark', 'One number: how tall the tallest structure you can identify is'],
   ['gcps', 'Control points', 'Two or more pixels whose height above ground you know'],
   ['sun', 'Shadows', 'Sun angles — read from the GeoTIFF tags when the file carries them']
 ]
 
-/* The validator writes these five files AFTER result.json was saved, so they
- * are not in job.result.files and have to be added to the download list by
- * hand once a report exists. See onReference() below. */
 const VALIDATION_ARTEFACTS = ['validation.md', 'validation.json',
                               'error_map.png', 'scatter.png', 'stability.png']
 
-/* One labelled control: title on the left, live value on the right, the input
- * itself, then the explanation. Every setting in the left panel uses it, which
- * is why they all line up. */
 function Field ({ label, value, hint, required, children }) {
   return (
     <label className={`field${required ? ' required' : ''}`}>
@@ -106,9 +54,7 @@ function Field ({ label, value, hint, required, children }) {
   )
 }
 
-/* The ground-control-point table. Rows are held as STRINGS while being typed
- * (an empty cell has to stay empty rather than becoming 0) and are converted
- * to numbers once, in run(), where incomplete rows are dropped. */
+// The ground-control-point table.
 function GcpEditor ({ gcps, onChange, disabled }) {
   const set = (i, k) => (e) => {
     const v = e.target.value
@@ -142,7 +88,7 @@ export default function App () {
   const [params, setParams] = useState(DEFAULTS)
   const [gcps, setGcps] = useState([{ row: '', col: '', height_m: '' },
                                     { row: '', col: '', height_m: '' }])
-  const [job, setJob] = useState(null)         // the whole server-side job record
+  const [job, setJob] = useState(null)
   const [busy, setBusy] = useState(false)      // a run is in flight
   const [error, setError] = useState('')
   const [report, setReport] = useState(null)   // validation result, if scored
@@ -158,24 +104,17 @@ export default function App () {
   const [probes, setProbes] = useState(null)   // exact values at each pin
   const [profile, setProfile] = useState(null) // exact values along A -> B
   const [hoverIdx, setHoverIdx] = useState(null)
-  const [clearPins, setClearPins] = useState(0) // bumped to tell the viewer to drop its pins
+  const [clearPins, setClearPins] = useState(0)
   const layersRef = useRef([])
 
-  /* The top bar has no chrome until you scroll: at rest it sits straight on the
-   * paper, and the moment the page moves it becomes a white card with a border
-   * and a shadow, so it stays readable over whatever scrolls underneath it.
-   * Passive listener - this never calls preventDefault, and saying so lets the
-   * browser scroll without waiting on us. */
   useEffect(() => {
     const onScroll = () => setScrolled(window.scrollY > 8)
-    onScroll()                                  // correct on a restored scroll position
+    onScroll()
     window.addEventListener('scroll', onScroll, { passive: true })
     return () => window.removeEventListener('scroll', onScroll)
   }, [])
 
-  /* One change handler for every input. Checkboxes give booleans, number and
-   * range inputs give numbers (but an empty string stays empty, so a cleared
-   * box does not silently become 0), everything else gives its string. */
+  // One change handler for every input.
   const set = (k) => (e) => {
     const t = e.target
     const v = t.type === 'checkbox' ? t.checked
@@ -185,22 +124,17 @@ export default function App () {
     setParams((p) => ({ ...p, [k]: v }))
   }
 
-  // stop polling if the component goes away mid-run
+  // Stop polling if the component goes away mid-run
   useEffect(() => () => { if (stopRef.current) stopRef.current() }, [])
 
-  /* Which engine the server will use. With the trained HeightNet installed the
-   * height field is optional - the model measures metres itself - and the form
-   * says so instead of promising a GHSL prior that is now only a cross-check. */
+  // Which engine the server will use.
   const [engine, setEngine] = useState(null)
   useEffect(() => {
     fetch('/api/health').then((r) => r.json()).then((h) => setEngine(h.engine || null))
       .catch(() => setEngine(null))
   }, [])
 
-  /* ?job=<id> reopens a run. The id is written into the address bar the moment
-   * a run starts, so a reload - or a crashed tab mid-demo - comes straight back
-   * to the same result instead of an empty page, and a finished run can be
-   * bookmarked. The server recovers finished jobs from disk after a restart. */
+  // ?job=<id> reopens a run.
   useEffect(() => {
     const id = new URLSearchParams(window.location.search).get('job')
     if (!id || !/^[A-Za-z0-9_-]+$/.test(id)) return
@@ -216,7 +150,7 @@ export default function App () {
 
   const run = useCallback(async () => {
     if (!file) { setError('Choose an image first.'); return }
-    // strings -> numbers, and half-filled rows are dropped rather than sent
+    // Strings -> numbers, and half-filled rows are dropped rather than sent
     const clean = gcps
       .filter((g) => g.row !== '' && g.col !== '' && g.height_m !== '')
       .map((g) => [Number(g.row), Number(g.col), Number(g.height_m)])
@@ -234,7 +168,7 @@ export default function App () {
         u.searchParams.set('job', job_id)
         window.history.replaceState(null, '', u)
       } catch { /* an address bar we cannot write is not worth failing a run for */ }
-      // pollJob calls back on every status change and returns its own stopper
+      // PollJob calls back on every status change and returns its own stopper
       stopRef.current = pollJob(job_id, (j) => {
         setJob(j)
         if (j.status === 'done' || j.status === 'error') {
@@ -252,11 +186,6 @@ export default function App () {
     setValidating(true); setValError('')
     try {
       setReport(await validateJob(job.id, ref))
-      // The validator writes five more files into the job folder, but the file
-      // list came from result.json, which was written before they existed - so
-      // the report and its figures were undownloadable until a page reload.
-      // The same URLs are also re-used on a second validation, so they carry a
-      // version stamp or the browser serves the first run's figures.
       setStamp(Date.now())
     } catch (e) { setValError(`Validation failed: ${e.message || e}`) }
     finally { setValidating(false) }
@@ -266,8 +195,7 @@ export default function App () {
   const jobId = res ? job.id : null
   const glb = res ? fileUrl(job.id, 'terrain.glb') : null
 
-  // The layer list. Fetched when a run finishes, and again after a validation,
-  // which adds the error layer.
+  // The layer list.
   useEffect(() => {
     if (!jobId) return
     let live = true
@@ -275,8 +203,7 @@ export default function App () {
     return () => { live = false }
   }, [jobId, stamp])
 
-  // Pins -> exact values. One pin gets a probe, two get a probe each and the
-  // profile between them. Re-asked after a validation so LiDAR joins in.
+  // Pins -> exact values.
   useEffect(() => {
     if (!jobId || !pins.length) { setProbes(null); setProfile(null); return }
     let live = true
@@ -305,10 +232,7 @@ export default function App () {
   const legend = layer && layer.id !== 'photo' ? layer : null
   const heightMap = res ? fileUrl(job.id, 'height16.png') : null
 
-  /* The datum badge. This is the single most important thing on the screen for
-   * a judge: it says whether the numbers are metres above SEA LEVEL, metres
-   * above LOCAL GROUND, or not metres at all. See Results.jsx for the long
-   * version and inference.py for where the datum is decided. */
+  // The datum badge.
   const chip = !res
     ? null
     : res.datum === 'sea level' ? { cls: 'on', text: 'absolute · sea level' }
@@ -317,15 +241,8 @@ export default function App () {
 
   return (
     <div className="app">
-      {/* decoration only - drifting dots and a cursor spotlight, pointer-events
-          off, and it draws a single static frame under prefers-reduced-motion */}
       <AmbientBackground />
 
-      {/* One wide bar: identity on the left, state on the right. The datum
-          lives here rather than in the hero because the bar is sticky - once a
-          run finishes, the one thing you must not misread stays on screen
-          however far down the page you scroll. `is-stuck` is what gives it its
-          card once the page has moved; see the scroll effect above. */}
       <nav className="site-nav">
         <div className={`nav-bar${scrolled ? ' is-stuck' : ''}`}>
           <a href="#" className="nav-brand">
@@ -358,16 +275,13 @@ export default function App () {
       </header>
 
       <div className="layout">
-        {/* ------------------------------------------------------- controls */}
+        {/* controls */}
         <aside>
           <div className="panel">
             <p className="section-label">Source image</p>
             <Dropzone file={file} disabled={busy}
                       onFile={(f) => { setFile(f); setReport(null); setError('') }} />
 
-            {/* ---------------------------------------------------- scale --
-                Where metres come from. Picking a source swaps the inputs
-                below it, because each calibrator needs different evidence. */}
             <p className="section-label" style={{ marginTop: 24 }}>Scale</p>
             <Field label="Where metres come from"
                    hint={SCALE_SOURCES.find((s) => s[0] === params.scale_source)?.[2]}>
@@ -399,9 +313,6 @@ export default function App () {
               </Field>
             )}
 
-            {/* These two are PRE-FILLED from the GeoTIFF's own sun tags by the
-                backend when the file carries them; what is typed here is the
-                fallback for imagery that does not. See inference.py. */}
             {params.scale_source === 'sun' && (
               <>
                 <Field label="Sun azimuth" value={`${params.sun_azimuth}°`}
@@ -423,7 +334,7 @@ export default function App () {
                      value={params.gsd_m} onChange={set('gsd_m')} />
             </Field>
 
-            {/* ------------------------------------------------- geometry -- */}
+            {/* geometry */}
             <p className="section-label" style={{ marginTop: 24 }}>Geometry</p>
             <Field label="Style" hint={STYLES.find((s) => s[0] === params.style)?.[2]}>
               <div className="seg" role="group" aria-label="Mesh style">
@@ -439,9 +350,6 @@ export default function App () {
                      value={params.z_exaggeration} onChange={set('z_exaggeration')} />
             </Field>
 
-            {/* Collapsed by default: everything below changes the maths rather
-                than the framing, and a first-time user should not have to read
-                it to get a result. */}
             <details className="adv">
               <summary>Advanced</summary>
               <div className="body">
@@ -465,7 +373,7 @@ export default function App () {
                   <input type="range" min="0.4" max="2.5" step="0.02"
                          value={params.alpha_gain} onChange={set('alpha_gain')} />
                 </Field>
-                {/* inverse-variance fusion, inference.py::fuse_scale_estimates */}
+                {/* Inverse-variance fusion, inference.py::fuse_scale_estimates */}
                 <label className="check">
                   <input type="checkbox" checked={params.fuse_scale}
                          onChange={set('fuse_scale')} />
@@ -481,7 +389,7 @@ export default function App () {
                     </span>
                   </span>
                 </label>
-                {/* this checkbox is what decides the datum badge at the top */}
+                {/* This checkbox is what decides the datum badge at the top */}
                 <label className="check">
                   <input type="checkbox" checked={params.use_dem} onChange={set('use_dem')} />
                   <span>
@@ -506,11 +414,6 @@ export default function App () {
           </div>
         </aside>
 
-        {/* --------------------------------------------------------- output --
-            The stage shows exactly one of three things: the elevation map, the
-            3D viewer, or - before any run - the explanation of what the tool
-            is for. Below it, progress then results then validation appear as
-            they become available. */}
         <main>
           <div className="stage-bar">
             <div className="tabs" role="tablist">
@@ -519,9 +422,7 @@ export default function App () {
               <button role="tab" aria-selected={tab === 'map'} disabled={!heightMap}
                       onClick={() => setTab('map')}>Elevation map</button>
             </div>
-            {/* What is draped on the terrain. The photo is the default; each
-                other layer is a colour-mapped raster on the same UVs, with its
-                legend in the viewer's top-right corner. L cycles while flying. */}
+            {/* What is draped on the terrain. */}
             {glb && tab === '3d' && layers.length > 1 && (
               <div className="layer-seg">
                 <span className="lbl">Layer</span>

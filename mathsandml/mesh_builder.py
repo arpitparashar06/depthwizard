@@ -1,66 +1,4 @@
-"""
-mesh_builder.py - height map + photo -> a 3D model you can fly through.
-
-===========================================================================
-READ THIS FIRST
-===========================================================================
-Two entry points. Both take the elevation map and the original image and
-return something trimesh can write as a .glb:
-
-    build_mesh(height, rgb, style=...)      ONE surface, three flavours
-        style="smooth"    a plain grid. Every roof edge becomes a 45-degree
-                          ramp, because a shared-vertex grid cannot represent
-                          a vertical face
-        style="stepped"   _stepped_geometry(): every cell gets its own four
-                          corners at its own height, and the gap between two
-                          cells is closed by a real vertical wall
-
-    build_city(dsm, ndsm, rgb)              THE ONE THE UI USES
-        1. buildings.extract_footprints()   find the buildings
-        2. buildings.flatten_ground()       remove them from the ground
-        3. build_mesh() on that ground      the terrain, photo-textured
-        4. buildings.building_meshes()      the buildings, put back as
-                                            separate prisms
-        -> one glTF scene, three materials: ground and roofs wear the
-           satellite photo, walls wear a generated facade
-
-THREE THINGS TO KNOW:
-
-  * DOWNSAMPLING. A 1024x614 image is 628k vertices and 1.25M triangles, which
-    crawls in a browser. Everything is block-reduced to a target grid (~256)
-    first. _block_reduce() takes the median of each block rather than sampling
-    one pixel, because a sharp roofline is 2-3 px wide and stride sampling
-    either lands on it or misses it.
-
-  * VERTICAL EXAGGERATION. At true 1:1 a city looks flat from above - a 30 m
-    building across a 1 km scene is 3% of the width. The mesh is stretched by
-    z_exaggeration and its base is moved to zero, so mesh Z is NOT metres. The
-    numbers needed to undo that ride along in mesh.metadata, and the viewer
-    divides them back out before showing any height:
-        true_metres = mesh_z / z_exaggeration + base_m
-
-  * GLB, not OBJ. One binary file carries geometry AND texture, so three.js
-    loads it with no extra plumbing. OBJ needs a sidecar .mtl plus the image
-    and silently loses the texture if any of the three go missing.
-
-===========================================================================
-
-Design notes for the demo:
-
-  * A full-resolution grid is far too heavy. A 1024x614 image is 628k vertices
-    and 1.25M triangles, which will crawl in a browser. We downsample to a
-    target grid (default 320) -> ~100k tris, which loads instantly and still
-    looks detailed once the photo is on it.
-
-  * GLB is the format to use. It packs geometry AND texture into ONE binary
-    file, so gr.Model3D and three.js can load it with no extra plumbing.
-    OBJ needs a sidecar .mtl plus the image and will silently lose the texture
-    if any of the three go missing.
-
-  * Vertical exaggeration matters. At true 1:1 scale a city looks almost flat
-    from above, because a 30 m building across a 1 km scene is 3% of the width.
-    Expose it as a slider; 2-3x reads best.
-"""
+"""Height map + photo -> a 3D model you can fly through."""
 
 import os
 import numpy as np
@@ -68,9 +6,7 @@ from PIL import Image
 import trimesh
 
 
-
 def _block_reduce(a, step, stat="median"):
-    """Downsample by whole blocks rather than point sampling."""
     if step <= 1:
         return a
     H, W = a.shape
@@ -84,23 +20,8 @@ def _block_reduce(a, step, stat="median"):
     return np.nanmedian(flat, axis=2)
 
 
-
 def _stepped_geometry(z, gsd, wall_min_m=0.25):
-    """One flat quad per cell, plus a vertical wall wherever neighbours differ.
-
-    A shared-vertex grid interpolates between cell centres, so a roof edge
-    becomes a 45-degree ramp no matter how sharp the height map is. That single
-    fact is most of why the render reads as hills instead of buildings. Here
-    every cell gets its own four corners at its own height, and the gap between
-    two cells is closed by an actual vertical face.
-
-    Costs roughly 4x the vertices of the smooth grid, so drop target_grid when
-    using it. Returns (verts, faces, uv).
-    """
-    # Quantise to the wall step. Two neighbours are then either exactly equal
-    # (no gap, no wall needed) or differ by a full step (wall emitted), so the
-    # surface has no hairline cracks to see through. Terracing at 0.1-0.2 m is
-    # far below what reads on screen.
+    # Quantise to the wall step.
     if wall_min_m > 0:
         z = np.round(z / wall_min_m) * wall_min_m
 
@@ -111,7 +32,7 @@ def _stepped_geometry(z, gsd, wall_min_m=0.25):
     x0 = np.repeat(xs[:-1][None, :], h, 0); x1 = np.repeat(xs[1:][None, :], h, 0)
     y0 = np.repeat(ys[:-1][:, None], w, 1); y1 = np.repeat(ys[1:][:, None], w, 1)
 
-    # corner order A(top-left) B(top-right) C(bottom-left) D(bottom-right)
+    # Corner order A(top-left) B(top-right) C(bottom-left) D(bottom-right)
     corners = np.stack([np.stack([x0, y0], -1), np.stack([x1, y0], -1),
                         np.stack([x0, y1], -1), np.stack([x1, y1], -1)], axis=2)
     zc = np.repeat(z[:, :, None], 4, axis=2)
@@ -131,22 +52,20 @@ def _stepped_geometry(z, gsd, wall_min_m=0.25):
              np.column_stack([C.ravel(), B.ravel(), A.ravel()])]
 
     vlist, flist, uvlist = [verts], faces, [uv]
-    nxt = verts.shape[0]
+    next_idx = verts.shape[0]
 
     def wall(pa, pb, za, zb, uva, uvb):
-        """Vertical quad from edge (pa,pb) spanning za..zb."""
         n = pa.shape[0]
         vs = np.concatenate([np.column_stack([pa, za]), np.column_stack([pb, za]),
                              np.column_stack([pa, zb]), np.column_stack([pb, zb])], axis=0)
-        # order: 0=a@za 1=b@za 2=a@zb 3=b@zb
-        i = nxt + np.arange(n)
+        # Order: 0=a@za 1=b@za 2=a@zb 3=b@zb
+        i = next_idx + np.arange(n)
         i0, i1, i2, i3 = i, i + n, i + 2 * n, i + 3 * n
         fs = [np.column_stack([i0, i1, i3]), np.column_stack([i0, i3, i2])]
         uvs = np.concatenate([uva, uvb, uva, uvb], axis=0)
         return vs, fs, uvs
 
     eps = float(wall_min_m) * 0.5
-    # --- walls between horizontal neighbours (shared edge at x = xs[j+1]) ---
     d = z[:, 1:] - z[:, :-1]
     m = np.abs(d) > eps
     if m.any():
@@ -154,15 +73,14 @@ def _stepped_geometry(z, gsd, wall_min_m=0.25):
         xe = xs[jj + 1]
         pa = np.column_stack([xe, ys[ii]]); pb = np.column_stack([xe, ys[ii + 1]])
         za, zb = z[ii, jj], z[ii, jj + 1]
-        # take UV from the higher cell so the wall inherits the roof edge
+        # Take UV from the higher cell so the wall inherits the roof edge
         hi = np.where(zb > za, jj + 1, jj)
         uu = (hi + 0.5) / w
         uva = np.column_stack([uu, 1 - ii / h])
         uvb = np.column_stack([uu, 1 - (ii + 1) / h])
         vs, fs, uvs = wall(pa, pb, za, zb, uva, uvb)
-        vlist.append(vs); flist += fs; uvlist.append(uvs); nxt += vs.shape[0]
+        vlist.append(vs); flist += fs; uvlist.append(uvs); next_idx += vs.shape[0]
 
-    # --- walls between vertical neighbours (shared edge at y = ys[i+1]) ---
     d = z[1:, :] - z[:-1, :]
     m = np.abs(d) > eps
     if m.any():
@@ -175,7 +93,7 @@ def _stepped_geometry(z, gsd, wall_min_m=0.25):
         uva = np.column_stack([jj / w, vv])
         uvb = np.column_stack([(jj + 1) / w, vv])
         vs, fs, uvs = wall(pa, pb, za, zb, uva, uvb)
-        vlist.append(vs); flist += fs; uvlist.append(uvs); nxt += vs.shape[0]
+        vlist.append(vs); flist += fs; uvlist.append(uvs); next_idx += vs.shape[0]
 
     return (np.concatenate(vlist, 0), np.concatenate(flist, 0),
             np.concatenate(uvlist, 0))
@@ -184,48 +102,26 @@ def _stepped_geometry(z, gsd, wall_min_m=0.25):
 def build_mesh(height, rgb, px_size_m=None, target_grid=320,
                z_exaggeration=2.0, relative_height_m=60.0, style="stepped",
                wall_min_m=0.25, is_relative=None):
-    """
-    height : 2D array. Metres (absolute mode) or 0..1 (relative mode).
-    rgb    : HxWx3 uint8, draped as the texture.
-    px_size_m : ground sampling distance. If None, 1 unit = 1 pixel.
-    relative_height_m : in relative mode, what 0..1 should map to in metres.
-                        Purely for a plausible-looking demo.
-
-    Returns a trimesh.Trimesh with UV texture.
-    """
+    """Height : 2D array."""
     H, W = height.shape
 
-    # ---- 1. downsample to a manageable grid ----
-    # z[::step, ::step] point-samples, which aliases badly: a sharp roofline is
-    # 2-3 px wide after refinement, so stride sampling either lands on it or
-    # misses it entirely and the edge turns into a ramp. Block median keeps the
-    # step and is robust to the odd spike.
     step = max(1, int(round(max(H, W) / target_grid)))
     z = _block_reduce(np.asarray(height, np.float64), step)
     h, w = z.shape
 
-    # fill holes so the mesh has no spikes
+    # Fill holes so the mesh has no spikes
     if not np.isfinite(z).all():
         z = np.where(np.isfinite(z), z, np.nanmedian(z[np.isfinite(z)]))
 
-    # ---- 2. put Z into metres ----
-    # Sniffing the range for "is this 0..1?" is fragile: any upstream step that
-    # nudges the max to 1.0001 skips the x60 stretch, and the whole scene
-    # flattens to 1 m of relief with no error anywhere. Callers that know the
-    # mode should pass is_relative explicitly; the sniff is only a fallback.
     if is_relative is None:
         is_relative = (np.nanmax(height) <= 1.0 + 1e-6
                        and np.nanmin(height) >= -1e-6)
     if is_relative:
-        z = z * relative_height_m           # relative mode: stretch to a sane range
+        z = z * relative_height_m
     z_base = float(z.min())
     z = (z - z_base) * z_exaggeration       # zero the base, then exaggerate
 
-    # Anything reading a height off this mesh must undo both steps, or it reports
-    # exaggerated metres. Carried in metadata so the viewer can invert it:
-    #     true_metres = mesh_z / z_exaggeration + base_m
 
-    # ---- 3. X/Y in metres so slopes are geometrically meaningful ----
     gsd = (px_size_m or 1.0) * step
 
     if style == "stepped":
@@ -239,14 +135,13 @@ def build_mesh(height, rgb, px_size_m=None, target_grid=320,
     # Y is flipped: image rows go down, world Y goes up
     verts = np.column_stack([xx.ravel(), (ys.max() - yy).ravel(), z.ravel()])
 
-    # ---- 4. two triangles per grid cell ----
+    # 4. two triangles per grid cell
     idx = np.arange(h * w).reshape(h, w)
     tl, tr = idx[:-1, :-1].ravel(), idx[:-1, 1:].ravel()
     bl, br = idx[1:, :-1].ravel(), idx[1:, 1:].ravel()
     faces = np.vstack([np.column_stack([tl, bl, tr]),
                        np.column_stack([tr, bl, br])])
 
-    # ---- 5. UVs: straight linear map, so the photo lands exactly on the terrain ----
     u = (xx / max(xs.max(), 1e-9)).ravel()
     v = 1.0 - (yy / max(ys.max(), 1e-9)).ravel()     # flip V for image convention
     uv = np.column_stack([u, v])
@@ -256,14 +151,10 @@ def build_mesh(height, rgb, px_size_m=None, target_grid=320,
 
 def _finish(verts, faces, uv, rgb, z_exaggeration, z_base, gsd, step,
             max_texture=4096):
-    """Texture, material and metadata. Shared by both mesh styles."""
     tex = Image.fromarray(np.asarray(rgb, np.uint8)).convert("RGB")
     if max(tex.size) > max_texture:
         tex.thumbnail((max_texture, max_texture), Image.LANCZOS)
 
-    # doubleSided: the wall quads' winding depends on which neighbour is higher,
-    # and a back-facing wall is an invisible wall. Cheaper to let the renderer
-    # draw both sides than to get every case right.
     mat = trimesh.visual.material.PBRMaterial(
         baseColorTexture=tex, doubleSided=True,
         metallicFactor=0.0, roughnessFactor=0.95)
@@ -271,14 +162,14 @@ def _finish(verts, faces, uv, rgb, z_exaggeration, z_base, gsd, step,
     mesh = trimesh.Trimesh(
         vertices=verts, faces=faces,
         visual=trimesh.visual.TextureVisuals(uv=uv, image=tex, material=mat),
-        process=False)          # process=True would weld vertices and break the UVs
+        process=False)
     mesh.metadata.update(z_exaggeration=float(z_exaggeration), base_m=z_base,
                          gsd_m=float(gsd), downsample_step=int(step))
     return mesh
 
 
 def export_mesh(mesh, out_path):
-    """GLB by default. Returns the path actually written."""
+    """GLB by default."""
     ext = os.path.splitext(out_path)[1].lower()
     if ext not in (".glb", ".obj", ".ply"):
         out_path += ".glb"
@@ -294,7 +185,7 @@ def export_mesh(mesh, out_path):
           f"-> {out_path} ({os.path.getsize(out_path)/1e6:.1f} MB)")
     print(f"[mesh] relief {relief:.1f} over {ground:.0f} of ground ({pct:.1f}%)")
     if pct < 1.0:
-        # a silently flat mesh cost a lot of debugging once; say so out loud
+        # A silently flat mesh cost a lot of debugging once; say so out loud
         print("[mesh] WARNING: under 1% relief - this will render as a flat "
               "plane. Check is_relative and the height units.")
     return out_path
@@ -306,14 +197,13 @@ def height_to_mesh_file(height, rgb, out_path="outputs/terrain.glb", **kw):
 
 
 def slope_map(height, px_size_m=1.0):
-    """Slope in degrees. The PS asks for slope analysis, and this is the whole
-    implementation: gradient magnitude in metres per metre, then arctan."""
+    """Slope in degrees."""
     gy, gx = np.gradient(np.asarray(height, float), px_size_m, px_size_m)
     return np.degrees(np.arctan(np.hypot(gx, gy)))
 
 
 if __name__ == "__main__":
-    # smoke test with a synthetic hill + blocks
+    # Smoke test with a synthetic hill + blocks
     H = W = 256
     yy, xx = np.mgrid[0:H, 0:W]
     z = 30 + 12 * np.sin(xx / 40.) + 9 * np.cos(yy / 35.)
@@ -325,36 +215,15 @@ if __name__ == "__main__":
     print("slope max:", slope_map(z, 0.5).max().round(1), "deg")
 
 
-# ---------------------------------------------------------------------------
 def build_city(dsm, ndsm, rgb, px_size_m=None, target_grid=256,
                z_exaggeration=1.5, style="stepped", wall_min_m=0.25,
                is_relative=False, relative_height_m=60.0,
                facade_tile_m=(12.0, 24.0), **kw):
-    """Ground surface + extruded buildings, as one glTF scene.
-
-    The heightfield alone is why the render reads as terrain: a tower is a bump
-    and its sides are stretched roof pixels. Here the buildings are lifted out
-    of the surface and put back as separate prisms with their own material, so
-    walls are vertical, flat, and textured with something that looks like a
-    building instead of a smear of roof.
-
-    Three geometries, three materials:
-        ground - the heightfield with buildings removed, satellite photo
-        roofs  - flat caps, also the satellite photo, so they stay real
-        walls  - procedural facade; a nadir image never saw one
-
-    Returns (scene, info).
-    """
+    """Ground surface + extruded buildings, as one glTF scene."""
     import trimesh
     import buildings as B
 
     if is_relative:
-        # Stretch BOTH surfaces here, then hand build_mesh something already in
-        # metres. Left to build_mesh, only the ground would be stretched (and
-        # base_m recorded in stretched units) while the prisms below are built
-        # from the raw 0..1 dsm/ndsm - every building would sink into the
-        # terrain by a factor of relative_height_m. Both callers happen to pass
-        # is_relative=False today, which is the only reason this never bit.
         dsm = np.asarray(dsm, np.float64) * float(relative_height_m)
         ndsm = np.asarray(ndsm, np.float64) * float(relative_height_m)
         is_relative = False
@@ -370,7 +239,7 @@ def build_city(dsm, ndsm, rgb, px_size_m=None, target_grid=256,
     md = dict(ground.metadata)
     step = md["downsample_step"]
     gsd = md["gsd_m"]
-    # must match _stepped_geometry's ys exactly or the buildings sit off-grid
+    # Must match _stepped_geometry's ys exactly or the buildings sit off-grid
     y_top = (ground_z.shape[0] // step) * gsd
 
     rv, rf, ruv, wv, wf, wuv = B.building_meshes(

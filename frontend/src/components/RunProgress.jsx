@@ -1,9 +1,5 @@
 import { useEffect, useRef } from 'react'
 
-/* The backend already reports honest progress: _set() moves the number at real
- * checkpoints and _log() names what it is doing. So the stepper reads that,
- * rather than animating a guess. Each stage is "live" when the run has reached
- * it and "done" once the run has moved past it. */
 const STAGES = [
   { key: 'read',  label: 'Read',      at: 0.05 },
   { key: 'depth', label: 'Depth',     at: 0.15 },

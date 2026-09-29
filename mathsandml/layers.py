@@ -1,30 +1,4 @@
-"""
-layers.py - colour layers for the 3D viewer, and exact readouts off the rasters.
-
-===========================================================================
-READ THIS FIRST
-===========================================================================
-The viewer drapes the satellite photo over the mesh. Everything here makes
-OTHER things drapeable, on exactly the same UVs, so the viewer can swap the
-photo for an analysis layer without touching the geometry:
-
-    write_layers()      height, slope and uncertainty as PNGs the size of the
-                        texture, plus layers.json with each legend
-    add_error_layer()   after a validation: estimate - reference, diverging
-    profile()           exact values along a line between two pixels, read
-                        from the GeoTIFFs rather than off the downsampled mesh
-    probe()             the same at one pixel
-
-Colour follows the job the data does, and only that:
-    magnitude (height, slope, uncertainty)  ONE hue, light -> dark
-    signed error                            blue <- neutral grey -> red
-Never a rainbow: a rainbow invents boundaries where the data has none, and a
-viewer reading heights off colour would read those boundaries as terraces.
-
-Why readouts come from the rasters: the mesh is block-reduced to ~256 cells a
-side and quantised for watertight walls, so a height read off it is a
-presentation of the answer, not the answer. The GeoTIFFs are what is scored.
-"""
+"""Colour layers for the 3D viewer, and exact readouts off the rasters."""
 import json
 import os
 from functools import lru_cache
@@ -32,9 +6,6 @@ from functools import lru_cache
 import numpy as np
 from PIL import Image
 
-# One-hue ramps, light -> dark, sharing the same OKLCH lightness steps so no
-# layer looks heavier than another. Blue is the reference sequential ramp; the
-# others hold its lightness and chroma profile at their own hue.
 RAMPS = {
     "blue":   "#cde2fb #b7d3f6 #9ec5f4 #86b6ef #6da7ec #5598e7 #3987e5 #2a78d6 "
               "#256abf #1c5cab #184f95 #104281 #0d366b",
@@ -46,9 +17,8 @@ RAMPS = {
               "#bb3032 #a72528 #911e22 #7e1519 #681014",
 }
 RAMPS = {k: v.split() for k, v in RAMPS.items()}
-NEUTRAL = "#f0efec"          # the diverging midpoint: "no error" reads as nothing
-# estimate too LOW -> blue arm, too HIGH -> red arm. Six steps a side, equal
-# lightness at equal distance from zero, so neither sign looks worse.
+NEUTRAL = "#f0efec"
+# Estimate too low -> blue arm, too high -> red arm.
 _ARM = (2, 3, 5, 7, 9, 10)
 DIVERGING = ([RAMPS["blue"][i] for i in reversed(_ARM)] + [NEUTRAL]
              + [RAMPS["red"][i] for i in _ARM])
@@ -61,7 +31,7 @@ def _hex(h):
 
 
 def colorize(a, stops, vmin, vmax):
-    """float array -> uint8 RGB through a piecewise-linear ramp. NaN -> mid grey."""
+    """Float array -> uint8 RGB through a piecewise-linear ramp."""
     a = np.asarray(a, np.float64)
     cols = np.stack([_hex(h) for h in stops])
     t = (a - vmin) / max(vmax - vmin, 1e-9)
@@ -75,13 +45,12 @@ def colorize(a, stops, vmin, vmax):
 
 def _save(rgb, path):
     im = Image.fromarray(rgb)
-    if max(im.size) > MAX_TEXTURE:            # same cap the mesh texture takes
+    if max(im.size) > MAX_TEXTURE:
         im.thumbnail((MAX_TEXTURE, MAX_TEXTURE), Image.LANCZOS)
     im.save(path)
 
 
 def _read(path):
-    """(array, px) or (None, None). Cached on path + mtime."""
     if not os.path.exists(path):
         return None, None
     return _read_cached(path, os.path.getmtime(path))
@@ -111,7 +80,7 @@ def slope_deg(h, px):
 
 
 def write_layers(outdir, dsm, px_size_m, uncertainty=None, units="m"):
-    """Height / slope / uncertainty PNGs + layers.json. Returns the layer list."""
+    """Height / slope / uncertainty PNGs + layers.json."""
     dsm = np.asarray(dsm, np.float64)
     px = float(px_size_m or 1.0)
     layers = [dict(id="photo", label="Photo", file="texture.png")]
@@ -140,7 +109,7 @@ def write_layers(outdir, dsm, px_size_m, uncertainty=None, units="m"):
                            kind="sequential", stops=RAMPS["violet"], vmin=0.0, vmax=umax,
                            unit=units, note="disagreement between the four rotated passes"))
 
-    # keep an error layer from an earlier validation of the same run
+    # Keep an error layer from an earlier validation of the same run
     old = _load_json(os.path.join(outdir, "layers.json"), {}).get("layers", [])
     layers += [l for l in old if l.get("id") == "error"]
     with open(os.path.join(outdir, "layers.json"), "w") as f:
@@ -178,17 +147,16 @@ def write_reference_grid(outdir, ref, like="dsm.tif"):
         ds.write(np.asarray(ref, np.float32), 1)
 
 
-# ---------------------------------------------------------------------------
 _SERIES = (("dsm", "dsm.tif"), ("ndsm", "ndsm.tif"), ("dtm", "dtm.tif"),
            ("uncertainty", "uncertainty.tif"), ("reference", "reference_grid.tif"))
 
 
 def _bilinear(a, rows, cols):
     from scipy.ndimage import map_coordinates
-    ok = np.isfinite(a)
-    filled = np.where(ok, a, np.nanmedian(a[ok]) if ok.any() else 0.0)
+    valid = np.isfinite(a)
+    filled = np.where(valid, a, np.nanmedian(a[valid]) if valid.any() else 0.0)
     v = map_coordinates(filled, [rows, cols], order=1, mode="nearest")
-    hole = map_coordinates((~ok).astype(np.float64), [rows, cols], order=1,
+    hole = map_coordinates((~valid).astype(np.float64), [rows, cols], order=1,
                            mode="nearest") > 0.5
     v[hole] = np.nan
     return v
@@ -223,7 +191,7 @@ def profile(outdir, r0, c0, r1, c1, n=256, px_size_m=1.0):
         out.update(dh_m=dh, grade_deg=float(np.degrees(np.arctan2(dh, max(length, 1e-9)))))
     if n > 2 and length > 0:
         step = length / (n - 1)
-        # steepest sustained stretch, over ~2 m so a roof edge is a wall, not noise
+        # Steepest sustained stretch, over ~2 m so a roof edge is a wall, not noise
         k = max(1, int(round(2.0 / max(step, 1e-9))))
         if n > k:
             s = np.degrees(np.arctan(np.abs(z[k:] - z[:-k]) / (k * step)))
@@ -231,30 +199,30 @@ def profile(outdir, r0, c0, r1, c1, n=256, px_size_m=1.0):
                 out["max_slope_deg"] = float(np.nanmax(s))
     if "reference" in out:
         r = np.array([np.nan if v is None else v for v in out["reference"]], float)
-        m = np.isfinite(r) & np.isfinite(z)
-        if m.sum() >= 3:
-            d = z[m] - r[m]
+        valid = np.isfinite(r) & np.isfinite(z)
+        if valid.sum() >= 3:
+            d = z[valid] - r[valid]
             off = float(np.median(d))
             out["vs_reference"] = dict(
                 rmse_m=float(np.sqrt(np.mean(d ** 2))),
                 rmse_shift_m=float(np.sqrt(np.mean((d - off) ** 2))),
-                median_offset_m=off, n=int(m.sum()))
+                median_offset_m=off, n=int(valid.sum()))
     return out
 
 
 def probe(outdir, r, c):
     """Every raster of the run at one pixel (bilinear)."""
-    res = {}
+    result = {}
     dsm, _ = _read(os.path.join(outdir, "dsm.tif"))
     if dsm is None:
         raise FileNotFoundError("dsm.tif")
     H, W = dsm.shape
     r = float(np.clip(r, 0, H - 1)); c = float(np.clip(c, 0, W - 1))
-    res.update(row=r, col=c)
+    result.update(row=r, col=c)
     for key, fname in _SERIES:
         a, _ = _read(os.path.join(outdir, fname))
         if a is None or a.shape != dsm.shape:
             continue
         v = float(_bilinear(a, np.array([r]), np.array([c]))[0])
-        res[key] = None if not np.isfinite(v) else round(v, 3)
-    return res
+        result[key] = None if not np.isfinite(v) else round(v, 3)
+    return result

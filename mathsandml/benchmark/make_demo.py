@@ -1,18 +1,5 @@
 #!/usr/bin/env python3
-"""make_demo.py - cut a demo-sized GeoTIFF out of a large open image.
-
-    python mathsandml/benchmark/make_demo.py            # the built-in Indian scene
-    python mathsandml/benchmark/make_demo.py --url <cog.tif> --out demo/x.tif \\
-           --center 83.55,18.254 --size-m 600 --px 0.5
-
-Reads only the window it needs from a cloud-optimised GeoTIFF, resamples it to
-the benchmark's 0.5 m, and writes an RGB GeoTIFF in the scene's own UTM zone
-with the licence and attribution in its tags. A 10 cm drone mosaic is 150 MP;
-the depth model at 0.5 m over 600 m is 16 tiles - minutes, not an hour.
-
-There is no LiDAR under these scenes, so they are for the demo and the 3D
-flythrough, never for the accuracy table.
-"""
+"""Cut a demo-sized GeoTIFF out of a large open image."""
 import argparse
 import json
 import math
@@ -22,8 +9,7 @@ import sys
 import numpy as np
 
 DEMOS = {
-    # OpenAerialMap, CC-BY 4.0. The only openly licensed sub-metre image inside
-    # India in the OAM catalogue when this was written (Sep 2026).
+    # OpenAerialMap, CC-BY 4.0.
     "india_andhra": dict(
         url="https://oin-hotosm-temp.s3.us-east-1.amazonaws.com/"
             "685624e7e319ef725277456f/0/685624e7e319ef7252774570.tif",
@@ -39,18 +25,18 @@ def utm_epsg(lon, lat):
 
 
 def main():
-    ap = argparse.ArgumentParser()
-    ap.add_argument("--name", default="india_andhra", choices=sorted(DEMOS))
-    ap.add_argument("--url", default=None)
-    ap.add_argument("--out", default=None)
-    ap.add_argument("--center", default=None, help="lon,lat - default: image centre")
-    ap.add_argument("--size-m", type=float, default=600.0)
-    ap.add_argument("--px", type=float, default=0.5)
-    a = ap.parse_args()
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--name", default="india_andhra", choices=sorted(DEMOS))
+    parser.add_argument("--url", default=None)
+    parser.add_argument("--out", default=None)
+    parser.add_argument("--center", default=None, help="lon,lat - default: image centre")
+    parser.add_argument("--size-m", type=float, default=600.0)
+    parser.add_argument("--px", type=float, default=0.5)
+    args = parser.parse_args()
 
-    cfg = dict(DEMOS[a.name])
-    url = a.url or cfg["url"]
-    out = a.out or os.path.join("demo", a.name + ".tif")
+    config = dict(DEMOS[args.name])
+    url = args.url or config["url"]
+    out = args.out or os.path.join("demo", args.name + ".tif")
     os.makedirs(os.path.dirname(out) or ".", exist_ok=True)
 
     import rasterio
@@ -62,19 +48,19 @@ def main():
     with rasterio.Env(GDAL_DISABLE_READDIR_ON_OPEN="EMPTY_DIR", VSI_CACHE="TRUE"):
         with rasterio.open(src_path) as ds:
             w, s, e, n = transform_bounds(ds.crs, "EPSG:4326", *ds.bounds, densify_pts=21)
-            if a.center:
-                lon, lat = (float(v) for v in a.center.split(","))
+            if args.center:
+                lon, lat = (float(v) for v in args.center.split(","))
             else:
                 lon, lat = (w + e) / 2, (s + n) / 2
             crs = f"EPSG:{utm_epsg(lon, lat)}"
             xs, ys = transform("EPSG:4326", crs, [lon], [lat])
-            npx = int(round(a.size_m / a.px))
-            half = npx * a.px / 2
-            dst_tr = from_origin(xs[0] - half, ys[0] + half, a.px, a.px)
+            npx = int(round(args.size_m / args.px))
+            half = npx * args.px / 2
+            dst_tr = from_origin(xs[0] - half, ys[0] + half, args.px, args.px)
             bands = [b for b in range(1, min(ds.count, 3) + 1)]
             dst = np.zeros((len(bands), npx, npx), np.float32)
             print(f"[demo] {os.path.basename(url)}: {ds.width}x{ds.height} px, "
-                  f"{ds.count} bands, {ds.crs} -> {npx}x{npx} at {a.px} m in {crs}")
+                  f"{ds.count} bands, {ds.crs} -> {npx}x{npx} at {args.px} m in {crs}")
             reproject(rasterio.band(ds, bands), dst, dst_transform=dst_tr, dst_crs=crs,
                       resampling=Resampling.average, src_nodata=ds.nodata, dst_nodata=0)
             valid = float((dst.max(axis=0) > 0).mean())
@@ -89,12 +75,12 @@ def main():
                        dtype="uint8", crs=crs, transform=dst_tr, compress="deflate",
                        photometric="RGB") as o:
         o.write(rgb)
-        o.update_tags(ATTRIBUTION=cfg.get("attribution", url), LICENSE=cfg.get("license", ""),
-                      SOURCE=url, NOTE=cfg.get("note", ""))
+        o.update_tags(ATTRIBUTION=config.get("attribution", url), LICENSE=config.get("license", ""),
+                      SOURCE=url, NOTE=config.get("note", ""))
     with open(os.path.splitext(out)[0] + ".json", "w") as f:
-        json.dump(dict(cfg, url=url, center=[lon, lat], size_m=a.size_m, px_size_m=a.px,
+        json.dump(dict(config, url=url, center=[lon, lat], size_m=args.size_m, px_size_m=args.px,
                        crs=crs, footprint_wgs84=[w, s, e, n], valid_fraction=valid), f, indent=2)
-    print(f"[demo] wrote {out} ({valid:.0%} covered) - {cfg.get('attribution', '')}")
+    print(f"[demo] wrote {out} ({valid:.0%} covered) - {config.get('attribution', '')}")
     return 0
 
 

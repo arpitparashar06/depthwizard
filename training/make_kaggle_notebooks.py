@@ -1,14 +1,5 @@
 #!/usr/bin/env python3
-"""
-make_kaggle_notebooks.py - build the two Kaggle notebooks from the source files
-in this repo, so the code that runs on Kaggle is always the code in git.
-
-    python training/make_kaggle_notebooks.py      -> training/kaggle/*.ipynb
-
-Each notebook writes the DepthWizard modules it needs with %%writefile cells,
-then runs them. Upload the .ipynb to Kaggle (Create -> New Notebook -> File ->
-Import Notebook); nothing else has to be uploaded.
-"""
+"""Build the two Kaggle notebooks from the source files in this repo, so the"""
 
 import json
 import os
@@ -47,10 +38,10 @@ def code(text):
 def writefile_cells(files):
     cells = [code("import os\nfor d in ('dw/mathsandml/benchmark', 'dw/training'):\n"
                   "    os.makedirs(d, exist_ok=True)\nprint('folders ready')")]
-    for rel in files:
-        with open(os.path.join(REPO, rel)) as f:
+    for relative in files:
+        with open(os.path.join(REPO, relative)) as f:
             src = f.read()
-        cells.append(code(f"%%writefile dw/{rel}\n" + src))
+        cells.append(code(f"%%writefile dw/{relative}\n" + src))
     return cells
 
 

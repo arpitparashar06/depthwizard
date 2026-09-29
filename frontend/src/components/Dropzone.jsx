@@ -9,9 +9,6 @@ function human (bytes) {
   return `${(bytes / KB / KB).toFixed(1)} MB`
 }
 
-/* A .tif may or may not carry a CRS, and only the backend can say for sure -
- * load_image checks the coordinate system, the transform and the pixel width
- * before it commits. So the chip promises nothing it cannot know yet. */
 function formatOf (name) {
   const ext = (name.split('.').pop() || '').toLowerCase()
   if (ext === 'tif' || ext === 'tiff') return { label: 'GeoTIFF', hint: 'metres if it carries a CRS' }
@@ -23,8 +20,6 @@ export default function Dropzone ({ file, onFile, disabled }) {
   const [preview, setPreview] = useState(null)
   const inputRef = useRef(null)
 
-  // Browsers cannot decode a GeoTIFF, so those get the placeholder tile rather
-  // than a broken image icon.
   useEffect(() => {
     if (!file || !/\.(png|jpe?g)$/i.test(file.name)) { setPreview(null); return }
     const url = URL.createObjectURL(file)
